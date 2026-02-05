@@ -11,7 +11,7 @@ class Database:
     def __init__(self):
         self.client: Client = create_client(
             settings.SUPABASE_URL,
-            settings.SUPABASE_KEY
+            settings.SUPABASE_SERVICE_ROLE_KEY
         )
     
     def get_client(self) -> Client:

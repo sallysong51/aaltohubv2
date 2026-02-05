@@ -10,8 +10,8 @@ class Settings(BaseSettings):
     
     # Supabase
     SUPABASE_URL: str
-    SUPABASE_KEY: str
-    SUPABASE_JWT_SECRET: str
+    SUPABASE_SERVICE_ROLE_KEY: str  # Used as SUPABASE_KEY
+    JWT_SECRET: str  # Used as SUPABASE_JWT_SECRET
     
     # Telegram API
     TELEGRAM_API_ID: int
@@ -22,10 +22,10 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str = "chaeyeonsally"
     
     # Encryption
-    SESSION_ENCRYPTION_KEY: str
+    ENCRYPTION_KEY: str  # Used as SESSION_ENCRYPTION_KEY
     
     # JWT
-    JWT_SECRET_KEY: str
+    # JWT_SECRET is already defined above
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = 30

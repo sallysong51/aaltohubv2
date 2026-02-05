@@ -15,7 +15,7 @@ class SessionEncryption:
     
     def __init__(self):
         # Derive 32-byte key from settings
-        self.key = self._derive_key(settings.SESSION_ENCRYPTION_KEY)
+        self.key = self._derive_key(settings.ENCRYPTION_KEY)
         self.aesgcm = AESGCM(self.key)
     
     def _derive_key(self, password: str) -> bytes:
