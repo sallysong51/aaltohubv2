@@ -62,7 +62,6 @@ class UserCreate(UserBase):
 
 
 class UserResponse(UserBase):
-    id: str
     role: UserRole
     created_at: datetime
     updated_at: datetime
@@ -128,14 +127,13 @@ class TelegramGroupInfo(TelegramGroupBase):
 
 class TelegramGroupCreate(TelegramGroupBase):
     visibility: GroupVisibility = GroupVisibility.PUBLIC
-    registered_by: str
+    registered_by: int  # telegram_id of the user
 
 
 class TelegramGroupResponse(TelegramGroupBase):
-    id: str
     visibility: GroupVisibility
     invite_link: Optional[str] = None
-    registered_by: Optional[str] = None
+    registered_by: Optional[int] = None  # telegram_id
     admin_invited: bool = False
     admin_invite_error: Optional[str] = None
     created_at: datetime
@@ -162,7 +160,7 @@ class RegisterGroupsResponse(BaseModel):
 
 class MessageBase(BaseModel):
     telegram_message_id: int
-    group_id: str
+    group_id: int  # telegram_group_id
     sender_id: Optional[int] = None
     sender_name: Optional[str] = None
     sender_username: Optional[str] = None
@@ -181,7 +179,7 @@ class MessageCreate(MessageBase):
 
 
 class MessageResponse(MessageBase):
-    id: str
+    id: str  # UUID for messages
     is_deleted: bool = False
     edited_at: Optional[datetime] = None
     edit_count: int = 0
