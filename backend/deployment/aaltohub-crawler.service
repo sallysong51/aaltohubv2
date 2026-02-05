@@ -1,0 +1,24 @@
+[Unit]
+Description=AaltoHub v2 Telegram Message Crawler
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/aaltohubv2/backend
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+ExecStart=/usr/bin/python3 -m scripts.crawler_enhanced
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/aaltohub-crawler.log
+StandardError=append:/var/log/aaltohub-crawler-error.log
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/aaltohubv2/backend
+
+[Install]
+WantedBy=multi-user.target

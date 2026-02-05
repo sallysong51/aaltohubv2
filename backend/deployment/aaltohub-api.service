@@ -1,0 +1,24 @@
+[Unit]
+Description=AaltoHub v2 FastAPI Backend
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/aaltohubv2/backend
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+ExecStart=/usr/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/aaltohub-api.log
+StandardError=append:/var/log/aaltohub-api-error.log
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/aaltohubv2/backend
+
+[Install]
+WantedBy=multi-user.target
