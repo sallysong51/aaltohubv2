@@ -22,7 +22,7 @@ async def get_all_groups(
 ):
     """Get all registered groups (admin only)"""
     try:
-        groups = db.table("telegram_groups").select("*").order("created_at", desc=True).execute()
+        groups = db.table("groups").select("*").order("created_at", desc=True).execute()
         return [TelegramGroupResponse(**g) for g in groups.data] if groups.data else []
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -72,7 +72,7 @@ async def get_failed_invites(
 ):
     """Get groups where admin invite failed (admin only)"""
     try:
-        failed = db.table("telegram_groups").select("*").eq("admin_invited", False).is_("admin_invite_error", "not.null").execute()
+        failed = db.table("groups").select("*").eq("admin_invited", False).is_("admin_invite_error", "not.null").execute()
         
         result = []
         for group in failed.data if failed.data else []:
@@ -101,11 +101,11 @@ async def get_stats(
         total_users = users_response.count if hasattr(users_response, 'count') else 0
         
         # Count groups
-        groups_response = db.table("telegram_groups").select("id", count="exact").execute()
+        groups_response = db.table("groups").select("id", count="exact").execute()
         total_groups = groups_response.count if hasattr(groups_response, 'count') else 0
         
         # Count public groups
-        public_groups_response = db.table("telegram_groups").select("id", count="exact").eq("visibility", "public").execute()
+        public_groups_response = db.table("groups").select("id", count="exact").eq("visibility", "public").execute()
         total_public_groups = public_groups_response.count if hasattr(public_groups_response, 'count') else 0
         
         # Count messages
@@ -135,7 +135,7 @@ async def get_crawler_status(
 ):
     """Get crawler status for all groups (admin only)"""
     try:
-        # Join crawler_status with telegram_groups
+        # Join crawler_status with groups
         result = db.rpc("get_crawler_status_with_groups").execute()
         return result.data if result.data else []
     except Exception as e:

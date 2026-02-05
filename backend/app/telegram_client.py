@@ -7,7 +7,6 @@ from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.tl.types import InputUser
 from typing import Optional, List, Dict
-import asyncio
 from app.config import settings
 from app.encryption import session_encryption
 from app.database import get_db

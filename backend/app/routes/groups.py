@@ -18,7 +18,7 @@ router = APIRouter(prefix="/groups", tags=["Groups"])
 
 
 @router.get("/my-telegram-groups", response_model=List[TelegramGroupInfo])
-async def get_my_telegram_groups(
+async def get_my_groups(
     current_user: UserResponse = Depends(get_current_user),
     db = Depends(get_db)
 ):
@@ -28,7 +28,7 @@ async def get_my_telegram_groups(
         groups = await telegram_manager.get_user_groups(current_user.id)
         
         # Get registered groups from database
-        registered_response = db.table("telegram_groups").select("telegram_id").execute()
+        registered_response = db.table("groups").select("telegram_id").execute()
         registered_ids = {g["telegram_id"] for g in registered_response.data} if registered_response.data else set()
         
         # Mark registered groups
@@ -69,14 +69,14 @@ async def register_groups(
             }
             
             # Check if group already exists
-            existing = db.table("telegram_groups").select("*").eq("telegram_id", group_data["telegram_id"]).execute()
+            existing = db.table("groups").select("*").eq("telegram_id", group_data["telegram_id"]).execute()
             
             if existing.data and len(existing.data) > 0:
                 # Group already registered, skip
                 continue
             
             # Insert new group
-            new_group = db.table("telegram_groups").insert(group_insert).execute()
+            new_group = db.table("groups").insert(group_insert).execute()
             group_id = new_group.data[0]["id"]
             
             # Add to user's follows
@@ -91,12 +91,12 @@ async def register_groups(
                 
                 if invite_result["success"]:
                     # Update admin_invited status
-                    db.table("telegram_groups").update({
+                    db.table("groups").update({
                         "admin_invited": True
                     }).eq("id", group_id).execute()
                 else:
                     # Store error
-                    db.table("telegram_groups").update({
+                    db.table("groups").update({
                         "admin_invited": False,
                         "admin_invite_error": invite_result["error"]
                     }).eq("id", group_id).execute()
@@ -108,7 +108,7 @@ async def register_groups(
                     })
             
             # Get updated group data
-            updated_group = db.table("telegram_groups").select("*").eq("id", group_id).execute()
+            updated_group = db.table("groups").select("*").eq("id", group_id).execute()
             registered_groups.append(TelegramGroupResponse(**updated_group.data[0]))
         
         return RegisterGroupsResponse(
@@ -136,7 +136,7 @@ async def get_registered_groups(
         group_ids = [f["group_id"] for f in follows.data]
         
         # Get group details
-        groups = db.table("telegram_groups").select("*").in_("id", group_ids).execute()
+        groups = db.table("groups").select("*").in_("id", group_ids).execute()
         
         return [TelegramGroupResponse(**g) for g in groups.data] if groups.data else []
     except Exception as e:
@@ -189,7 +189,7 @@ async def retry_invite_admin(
     """Retry inviting admin to a group (admin only)"""
     try:
         # Get group
-        group_response = db.table("telegram_groups").select("*").eq("id", group_id).execute()
+        group_response = db.table("groups").select("*").eq("id", group_id).execute()
         
         if not group_response.data or len(group_response.data) == 0:
             raise HTTPException(status_code=404, detail="Group not found")
@@ -201,7 +201,7 @@ async def retry_invite_admin(
         
         if invite_result["success"]:
             # Update status
-            db.table("telegram_groups").update({
+            db.table("groups").update({
                 "admin_invited": True,
                 "admin_invite_error": None
             }).eq("id", group_id).execute()
@@ -209,7 +209,7 @@ async def retry_invite_admin(
             return {"success": True, "message": "Admin invited successfully"}
         else:
             # Update error
-            db.table("telegram_groups").update({
+            db.table("groups").update({
                 "admin_invited": False,
                 "admin_invite_error": invite_result["error"]
             }).eq("id", group_id).execute()
@@ -230,7 +230,7 @@ async def get_group(
     """Get a single group by ID"""
     try:
         # Check if user has access to this group
-        group_response = db.table("telegram_groups").select("*").eq("id", group_id).execute()
+        group_response = db.table("groups").select("*").eq("id", group_id).execute()
         
         if not group_response.data or len(group_response.data) == 0:
             raise HTTPException(status_code=404, detail="Group not found")
@@ -261,7 +261,7 @@ async def get_invite_links(
     """Get all invite links for a group"""
     try:
         # Check if user owns this group
-        group = db.table("telegram_groups").select("*").eq("id", group_id).eq("registered_by", current_user.id).single().execute()
+        group = db.table("groups").select("*").eq("id", group_id).eq("registered_by", current_user.id).single().execute()
         
         if not group.data:
             raise HTTPException(status_code=404, detail="Group not found or you don't have permission")
@@ -290,7 +290,7 @@ async def create_invite_link(
     
     try:
         # Check if user owns this group
-        group = db.table("telegram_groups").select("*").eq("id", group_id).eq("registered_by", current_user.id).single().execute()
+        group = db.table("groups").select("*").eq("id", group_id).eq("registered_by", current_user.id).single().execute()
         
         if not group.data:
             raise HTTPException(status_code=404, detail="Group not found or you don't have permission")
@@ -396,7 +396,7 @@ async def revoke_invite_link(
     
     try:
         # Check if user owns this group
-        group = db.table("telegram_groups").select("*").eq("id", group_id).eq("registered_by", current_user.id).single().execute()
+        group = db.table("groups").select("*").eq("id", group_id).eq("registered_by", current_user.id).single().execute()
         
         if not group.data:
             raise HTTPException(status_code=404, detail="Group not found or you don't have permission")
@@ -429,13 +429,13 @@ async def update_group_visibility(
     
     try:
         # Check if user owns this group
-        group = db.table("telegram_groups").select("*").eq("id", group_id).eq("registered_by", current_user.id).single().execute()
+        group = db.table("groups").select("*").eq("id", group_id).eq("registered_by", current_user.id).single().execute()
         
         if not group.data:
             raise HTTPException(status_code=404, detail="Group not found or you don't have permission")
         
         # Update visibility
-        result = db.table("telegram_groups").update({
+        result = db.table("groups").update({
             "visibility": visibility,
             "updated_at": datetime.utcnow().isoformat()
         }).eq("id", group_id).execute()
@@ -444,12 +444,12 @@ async def update_group_visibility(
         if visibility == "public":
             try:
                 await telegram_manager.invite_admin_to_group(group.data["telegram_id"])
-                db.table("telegram_groups").update({
+                db.table("groups").update({
                     "admin_invited": True,
                     "admin_invite_error": None
                 }).eq("id", group_id).execute()
             except Exception as e:
-                db.table("telegram_groups").update({
+                db.table("groups").update({
                     "admin_invited": False,
                     "admin_invite_error": str(e)
                 }).eq("id", group_id).execute()
@@ -470,7 +470,7 @@ async def delete_group(
     """Delete a group (private groups: owner only, public groups: admin only)"""
     try:
         # Get group
-        group = db.table("telegram_groups").select("*").eq("id", group_id).single().execute()
+        group = db.table("groups").select("*").eq("id", group_id).single().execute()
         
         if not group.data:
             raise HTTPException(status_code=404, detail="Group not found")
@@ -486,7 +486,7 @@ async def delete_group(
                 raise HTTPException(status_code=403, detail="Only admins can delete public groups")
         
         # Delete group (cascade will handle related records)
-        db.table("telegram_groups").delete().eq("id", group_id).execute()
+        db.table("groups").delete().eq("id", group_id).execute()
         
         return {"success": True}
     except HTTPException:
