@@ -62,10 +62,11 @@ class UserCreate(UserBase):
 
 
 class UserResponse(UserBase):
+    id: int  # BIGSERIAL from Supabase
     role: UserRole
     created_at: datetime
     updated_at: datetime
-    
+
     class Config:
         from_attributes = True
 
@@ -118,6 +119,7 @@ class TelegramGroupBase(BaseModel):
     username: Optional[str] = None
     member_count: Optional[int] = None
     group_type: Optional[GroupType] = None
+    photo_url: Optional[str] = None  # Group profile photo URL
 
 
 class TelegramGroupInfo(TelegramGroupBase):
@@ -133,25 +135,30 @@ class TelegramGroupCreate(TelegramGroupBase):
 class TelegramGroupResponse(TelegramGroupBase):
     visibility: GroupVisibility
     invite_link: Optional[str] = None
-    registered_by: Optional[int] = None  # telegram_id
-    admin_invited: bool = False
-    admin_invite_error: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
-    
+    registered_by: Optional[int] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
     class Config:
         from_attributes = True
 
 
+class RegisterGroupItem(BaseModel):
+    telegram_id: int
+    title: str
+    username: Optional[str] = None
+    member_count: Optional[int] = None
+    group_type: Optional[str] = "group"
+    visibility: Optional[str] = "public"
+
+
 class RegisterGroupsRequest(BaseModel):
-    groups: List[dict] = Field(..., description="List of groups to register")
-    # Each group: { telegram_id, title, username, member_count, group_type, visibility }
+    groups: List[RegisterGroupItem] = Field(..., description="List of groups to register")
 
 
 class RegisterGroupsResponse(BaseModel):
     success: bool
     registered_groups: List[TelegramGroupResponse]
-    failed_invites: List[dict] = []
 
 
 # ============================================================
@@ -195,50 +202,6 @@ class MessagesListResponse(BaseModel):
     page: int
     page_size: int
     has_more: bool
-
-
-# ============================================================
-# Crawler Models
-# ============================================================
-
-class CrawlerStatusResponse(BaseModel):
-    group_id: str
-    is_active: bool
-    last_message_id: Optional[int] = None
-    last_crawled_at: Optional[datetime] = None
-    error_count: int = 0
-    last_error: Optional[str] = None
-
-
-class StartCrawlerRequest(BaseModel):
-    group_ids: Optional[List[str]] = None  # None = all public groups
-
-
-class StopCrawlerRequest(BaseModel):
-    group_ids: Optional[List[str]] = None  # None = all groups
-
-
-# ============================================================
-# Private Group Invite Models
-# ============================================================
-
-class CreateInviteRequest(BaseModel):
-    group_id: str
-    expires_at: Optional[datetime] = None
-    max_uses: Optional[int] = None
-
-
-class InviteResponse(BaseModel):
-    id: str
-    group_id: str
-    invite_code: str
-    invite_url: str
-    created_by: str
-    expires_at: Optional[datetime] = None
-    max_uses: Optional[int] = None
-    current_uses: int = 0
-    is_active: bool = True
-    created_at: datetime
 
 
 # ============================================================
