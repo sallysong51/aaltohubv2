@@ -24,9 +24,13 @@ export default async function handler(req, res) {
     const pathArray = req.query.path || [];
     const path = Array.isArray(pathArray) ? `/${pathArray.join('/')}` : `/${pathArray}`;
     
-    // Construct target URL with query string
-    const queryString = new URLSearchParams(req.query).toString();
-    const targetUrl = `${BACKEND_URL}${path}${queryString ? `?${queryString}` : ''}`;
+    // Build query string excluding the 'path' parameter
+    const queryParams = { ...req.query };
+    delete queryParams.path;
+    const queryString = new URLSearchParams(queryParams).toString();
+    
+    // Construct target URL
+    const targetUrl = `${BACKEND_URL}/api${path}${queryString ? `?${queryString}` : ''}`;
 
     console.log(`[Proxy] ${req.method} ${targetUrl}`);
 

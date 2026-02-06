@@ -2,7 +2,12 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "http://63.180.156.219:8000/api/:path*"
+      "destination": "/api/:path*"
     }
-  ]
+  ],
+  "functions": {
+    "api/[...path].js": {
+      "runtime": "nodejs18.x"
+    }
+  }
 }
