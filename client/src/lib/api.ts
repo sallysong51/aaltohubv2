@@ -4,7 +4,7 @@
 import axios, { AxiosInstance, AxiosError } from 'axios';
 
 // API base URL - update this to your backend URL
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://63.180.156.219:8000';
 
 // Create axios instance
 const apiClient: AxiosInstance = axios.create({
