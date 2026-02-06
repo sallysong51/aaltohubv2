@@ -4,7 +4,8 @@
 import axios, { AxiosInstance, AxiosError } from 'axios';
 
 // API base URL - update this to your backend URL
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://63.180.156.219:8000';
+// Use relative URL for Vercel proxy - requests to /api/* are proxied to EC2 backend
+const API_BASE_URL = '';
 
 // Create axios instance
 const apiClient: AxiosInstance = axios.create({
