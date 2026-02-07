@@ -24,10 +24,42 @@ from app.config import settings
 
 security = HTTPBearer()
 
-# In-memory rate limiter for send_code
+# In-memory rate limiters
 _send_code_attempts: dict[str, list[float]] = defaultdict(list)
 _RATE_LIMIT_WINDOW = 60  # seconds
 _RATE_LIMIT_MAX = 3  # max attempts per window per key
+
+_verify_code_attempts: dict[str, list[float]] = defaultdict(list)
+_VERIFY_RATE_LIMIT_WINDOW = 300  # 5 minutes
+_VERIFY_RATE_LIMIT_MAX = 5  # max attempts per 5 min per key
+
+_RATE_LIMIT_CLEANUP_INTERVAL = 300  # cleanup stale entries every 5 min
+_last_cleanup = 0.0
+
+
+def _cleanup_stale_rate_limits():
+    """Remove expired entries from rate limit dicts to prevent memory leak."""
+    global _last_cleanup
+    now = time.time()
+    if now - _last_cleanup < _RATE_LIMIT_CLEANUP_INTERVAL:
+        return
+    _last_cleanup = now
+    for store, window in [(_send_code_attempts, _RATE_LIMIT_WINDOW), (_verify_code_attempts, _VERIFY_RATE_LIMIT_WINDOW)]:
+        stale_keys = [k for k, v in store.items() if not v or now - v[-1] > window]
+        for k in stale_keys:
+            del store[k]
+
+
+def _check_verify_rate_limit(key: str):
+    """Rate limit check for verify-code and verify-2fa endpoints."""
+    _cleanup_stale_rate_limits()
+    now = time.time()
+    _verify_code_attempts[key] = [
+        t for t in _verify_code_attempts[key] if now - t < _VERIFY_RATE_LIMIT_WINDOW
+    ]
+    if len(_verify_code_attempts[key]) >= _VERIFY_RATE_LIMIT_MAX:
+        raise HTTPException(status_code=429, detail="Too many verification attempts. Please try again later.")
+    _verify_code_attempts[key].append(now)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -98,6 +130,7 @@ async def _upsert_user_and_create_tokens(db, user_info: dict, session_string: st
 async def send_code(request: SendCodeRequest, req: Request):
     """Send authentication code to Telegram"""
     # Rate limiting
+    _cleanup_stale_rate_limits()
     client_ip = req.client.host if req.client else "unknown"
     rate_key = f"{client_ip}:{request.phone_or_username}"
     now = time.time()
@@ -122,8 +155,11 @@ async def send_code(request: SendCodeRequest, req: Request):
 
 
 @router.post("/verify-code", response_model=AuthResponse)
-async def verify_code(request: VerifyCodeRequest, db=Depends(get_db)):
+async def verify_code(request: VerifyCodeRequest, req: Request, db=Depends(get_db)):
     """Verify authentication code and sign in"""
+    # Rate limit: 5 attempts per phone per 5 minutes
+    client_ip = req.client.host if req.client else "unknown"
+    _check_verify_rate_limit(f"{client_ip}:{request.phone_or_username}")
     try:
         result = await telegram_manager.verify_code(
             request.phone_or_username,
@@ -160,8 +196,11 @@ async def verify_code(request: VerifyCodeRequest, db=Depends(get_db)):
 
 
 @router.post("/verify-2fa", response_model=AuthResponse)
-async def verify_2fa(request: Verify2FARequest, db=Depends(get_db)):
+async def verify_2fa(request: Verify2FARequest, req: Request, db=Depends(get_db)):
     """Verify 2FA password and complete sign in"""
+    # Rate limit: 5 attempts per phone per 5 minutes
+    client_ip = req.client.host if req.client else "unknown"
+    _check_verify_rate_limit(f"{client_ip}:{request.phone_or_username}")
     try:
         result = await telegram_manager.verify_2fa(
             request.phone_or_username,
@@ -194,7 +233,7 @@ async def verify_2fa(request: Verify2FARequest, db=Depends(get_db)):
 async def refresh_token(request: RefreshTokenRequest, db=Depends(get_db)):
     """Refresh access token using refresh token"""
     try:
-        payload = verify_refresh_token(request.refresh_token, db=db)
+        payload = await verify_refresh_token(request.refresh_token, db=db)
         user_id = payload.get("sub")
 
         user_response = await asyncio.to_thread(

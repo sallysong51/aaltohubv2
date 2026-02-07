@@ -66,7 +66,7 @@ class UserResponse(UserBase):
 # ============================================================
 
 class SendCodeRequest(BaseModel):
-    phone_or_username: str = Field(..., description="Phone number (+358...) or username")
+    phone_or_username: str = Field(..., description="Phone number (+358...) or username", max_length=64)
 
 
 class SendCodeResponse(BaseModel):
@@ -77,15 +77,15 @@ class SendCodeResponse(BaseModel):
 
 
 class VerifyCodeRequest(BaseModel):
-    phone_or_username: str
-    code: str
-    phone_code_hash: str
+    phone_or_username: str = Field(..., max_length=64)
+    code: str = Field(..., max_length=10)
+    phone_code_hash: str = Field(..., max_length=256)
 
 
 class Verify2FARequest(BaseModel):
-    phone_or_username: str
-    password: str
-    phone_code_hash: str
+    phone_or_username: str = Field(..., max_length=64)
+    password: str = Field(..., max_length=256)
+    phone_code_hash: str = Field(..., max_length=256)
 
 
 class AuthResponse(BaseModel):
@@ -135,11 +135,11 @@ class TelegramGroupResponse(TelegramGroupBase):
 
 class RegisterGroupItem(BaseModel):
     telegram_id: int
-    title: str
-    username: Optional[str] = None
+    title: str = Field(..., max_length=256)
+    username: Optional[str] = Field(None, max_length=64)
     member_count: Optional[int] = None
-    group_type: Optional[str] = "group"
-    visibility: Optional[str] = "public"
+    group_type: Optional[GroupType] = GroupType.GROUP
+    visibility: Optional[GroupVisibility] = GroupVisibility.PUBLIC
 
 
 class RegisterGroupsRequest(BaseModel):

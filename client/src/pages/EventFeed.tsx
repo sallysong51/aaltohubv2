@@ -73,7 +73,7 @@ function EventFeedContent() {
   useEffect(() => {
     if (groups.length === 0) return;
 
-    const groupIds = new Set(groups.map(g => g.id));
+    const groupIds = new Set(groups.map(g => String(g.id)));
 
     const channel = supabase
       .channel('messages')
@@ -83,9 +83,9 @@ function EventFeedContent() {
         ({ payload: newMsg }: { payload: Message }) => {
           if (!newMsg || !newMsg.group_id) return;
           // Only add if it belongs to one of the user's groups
-          if (!groupIds.has(newMsg.group_id)) return;
+          if (!groupIds.has(String(newMsg.group_id))) return;
           // Filter by selected group
-          if (selectedGroupIdRef.current && newMsg.group_id !== selectedGroupIdRef.current) return;
+          if (selectedGroupIdRef.current && String(newMsg.group_id) !== String(selectedGroupIdRef.current)) return;
           // Filter by selected topic
           if (selectedTopicIdRef.current !== null && newMsg.topic_id !== selectedTopicIdRef.current) return;
           // Skip deleted messages
@@ -104,7 +104,7 @@ function EventFeedContent() {
         'broadcast',
         { event: 'update' },
         ({ payload: updated }: { payload: Message }) => {
-          if (!updated || !groupIds.has(updated.group_id)) return;
+          if (!updated || !groupIds.has(String(updated.group_id))) return;
 
           setMessages(prev =>
             updated.is_deleted

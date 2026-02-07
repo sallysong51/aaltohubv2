@@ -30,6 +30,9 @@ httpx>=0.27.0
 # Retry
 tenacity>=8.2.0
 
+# Structured logging
+python-json-logger>=2.0.0
+
 # Error tracking
 sentry-sdk>=2.0.0
 

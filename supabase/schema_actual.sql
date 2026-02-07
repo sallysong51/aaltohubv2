@@ -113,6 +113,8 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE(telegram_message_id, group_id)
 );
 
+CREATE INDEX IF NOT EXISTS idx_messages_sender_id ON messages(sender_id) WHERE sender_id IS NOT NULL;
+
 -- Primary query pattern: WHERE group_id = X AND is_deleted = FALSE ORDER BY sent_at DESC
 CREATE INDEX IF NOT EXISTS idx_messages_not_deleted ON messages(group_id, sent_at DESC) WHERE is_deleted = FALSE;
 -- For retention cleanup: DELETE WHERE sent_at < threshold
@@ -140,6 +142,7 @@ CREATE TABLE IF NOT EXISTS private_group_invites (
 
 CREATE INDEX IF NOT EXISTS idx_private_group_invites_token ON private_group_invites(token);
 CREATE INDEX IF NOT EXISTS idx_private_group_invites_group_id ON private_group_invites(group_id);
+CREATE INDEX IF NOT EXISTS idx_private_group_invites_expires_at ON private_group_invites(expires_at) WHERE expires_at IS NOT NULL;
 
 -- ============================================================
 -- Crawler Error Logs Table
@@ -195,12 +198,13 @@ CREATE TABLE IF NOT EXISTS entity_cache (
 CREATE TABLE IF NOT EXISTS failed_messages (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     telegram_message_id BIGINT,
-    group_id BIGINT,  -- Fixed: was TEXT, now matches groups.id type
+    group_id BIGINT REFERENCES groups(id) ON DELETE CASCADE,
     payload JSONB NOT NULL,
     error_message TEXT,
     retry_count INTEGER DEFAULT 0,
     resolved BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
     resolved_at TIMESTAMPTZ
 );
 
@@ -262,12 +266,21 @@ CREATE TRIGGER update_entity_cache_updated_at BEFORE UPDATE ON entity_cache
 CREATE OR REPLACE FUNCTION cleanup_old_messages()
 RETURNS INTEGER AS $$
 DECLARE
-    deleted_count INTEGER;
+    deleted_count INTEGER := 0;
+    batch_deleted INTEGER;
 BEGIN
-    DELETE FROM messages
-    WHERE sent_at < NOW() - INTERVAL '14 days';
-
-    GET DIAGNOSTICS deleted_count = ROW_COUNT;
+    LOOP
+        DELETE FROM messages
+        WHERE id IN (
+            SELECT id FROM messages
+            WHERE sent_at < NOW() - INTERVAL '14 days'
+            LIMIT 5000
+        );
+        GET DIAGNOSTICS batch_deleted = ROW_COUNT;
+        deleted_count := deleted_count + batch_deleted;
+        EXIT WHEN batch_deleted = 0;
+        PERFORM pg_sleep(0.1);  -- yield between batches to reduce lock contention
+    END LOOP;
     RETURN deleted_count;
 END;
 $$ LANGUAGE plpgsql;

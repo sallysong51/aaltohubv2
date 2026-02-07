@@ -98,7 +98,7 @@ function CrawlerManagementContent() {
     setIsLoadingLogs(true);
     try {
       const response = await apiClient.get('/admin/error-logs', {
-        params: groupId ? { group_id: groupId } : undefined,
+        params: { ...(groupId ? { group_id: groupId } : {}), page: 1, page_size: 100 },
       });
       setErrorLogs(response.data);
     } catch (error) {

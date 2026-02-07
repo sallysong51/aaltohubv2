@@ -38,6 +38,7 @@ function AdminDashboardContent() {
     messages_received: number; historical_crawl_running: boolean;
     crawled_groups: number; uptime_seconds: number;
   } | null>(null);
+  const [realtimeConnected, setRealtimeConnected] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
@@ -57,8 +58,14 @@ function AdminDashboardContent() {
     const channel = supabase
       .channel('messages')
       .on('broadcast', { event: 'insert' }, ({ payload: newMessage }: { payload: Message }) => {
-        if (newMessage.group_id !== selectedGroup.id) return;
-        setMessages((prev) => [...prev, newMessage]);
+        if (!newMessage || String(newMessage.group_id) !== String(selectedGroup.id)) return;
+        // Filter by selected topic if active
+        if (selectedTopicId !== null && newMessage.topic_id !== selectedTopicId) return;
+        setMessages((prev) => {
+          // Deduplicate by telegram_message_id + group_id
+          if (prev.some(m => m.telegram_message_id === newMessage.telegram_message_id && String(m.group_id) === String(newMessage.group_id))) return prev;
+          return [...prev, newMessage];
+        });
 
         // Auto-scroll to bottom
         requestAnimationFrame(() => {
@@ -66,19 +73,24 @@ function AdminDashboardContent() {
         });
       })
       .on('broadcast', { event: 'update' }, ({ payload: updated }: { payload: Message }) => {
-        if (updated.group_id !== selectedGroup.id) return;
+        if (!updated || String(updated.group_id) !== String(selectedGroup.id)) return;
         setMessages((prev) =>
-          prev.map((m) =>
-            m.telegram_message_id === updated.telegram_message_id ? { ...m, ...updated } : m
-          )
+          updated.is_deleted
+            ? prev.filter((m) => !(m.telegram_message_id === updated.telegram_message_id && String(m.group_id) === String(updated.group_id)))
+            : prev.map((m) =>
+                m.telegram_message_id === updated.telegram_message_id ? { ...m, ...updated } : m
+              )
         );
       })
-      .subscribe();
+      .subscribe((status) => {
+        setRealtimeConnected(status === 'SUBSCRIBED');
+      });
 
     return () => {
       supabase.removeChannel(channel);
+      setRealtimeConnected(false);
     };
-  }, [selectedGroup]);
+  }, [selectedGroup, selectedTopicId]);
 
   const loadLiveCrawlerStatus = async () => {
     try {
@@ -143,7 +155,7 @@ function AdminDashboardContent() {
   const loadMessages = async (groupId: string, pageNum: number = 1) => {
     setIsLoadingMessages(true);
     try {
-      const response = await adminApi.getGroupMessages(groupId, pageNum, 50, 30);
+      const response = await adminApi.getGroupMessages(groupId, pageNum, 50, 30, selectedTopicId);
       
       if (pageNum === 1) {
         setMessages(response.data.messages);
@@ -271,6 +283,18 @@ function AdminDashboardContent() {
                       : '크롤러 비활성'
                     }
                     {liveCrawlerStatus.historical_crawl_running && ' | 역사 수집 중...'}
+                  </Badge>
+                )}
+                {selectedGroup && (
+                  <Badge
+                    variant="outline"
+                    className={realtimeConnected
+                      ? 'border-green-500 text-green-600'
+                      : 'border-yellow-500 text-yellow-600'
+                    }
+                  >
+                    <Circle className={`h-2 w-2 mr-1 ${realtimeConnected ? 'fill-green-500' : 'fill-yellow-500'}`} />
+                    {realtimeConnected ? '실시간 연결됨' : '연결 중...'}
                   </Badge>
                 )}
               </div>

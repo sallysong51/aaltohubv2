@@ -82,7 +82,7 @@ export default function MessageBubble({ message, onReplyClick }: MessageBubblePr
       {/* Media preview */}
       {message.media_type && (
         <div className="mb-2">
-          {message.media_url && message.media_type === 'photo' && (
+          {message.media_url && message.media_type === 'photo' && /^https?:\/\//i.test(message.media_url) && (
             <img
               src={message.media_url}
               alt="Media"
@@ -101,7 +101,7 @@ export default function MessageBubble({ message, onReplyClick }: MessageBubblePr
                    message.media_type === 'voice' ? '음성 메시지' :
                    message.media_type === 'sticker' ? '스티커' : '미디어'}
                 </div>
-                {message.media_url && (
+                {message.media_url && /^https?:\/\//i.test(message.media_url) && (
                   <a
                     href={message.media_url}
                     target="_blank"

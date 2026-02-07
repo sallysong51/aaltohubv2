@@ -55,16 +55,30 @@ async def get_current_user(
     """Get current authenticated user from JWT token"""
     token = credentials.credentials
     payload = decode_token(token)
-    
+
     # Check token type
     if payload.get("type") != "access":
         raise HTTPException(status_code=401, detail="Invalid token type")
-    
+
     # Get user ID from payload
     user_id: str = payload.get("sub")
     if user_id is None:
         raise HTTPException(status_code=401, detail="Invalid token payload")
-    
+
+    # Check access token revocation (P0-1.7: logout must actually revoke)
+    jti = payload.get("jti")
+    if jti:
+        try:
+            revoked = await asyncio.to_thread(
+                lambda: db.table("revoked_tokens").select("id").eq("jti", jti).execute()
+            )
+            if revoked.data:
+                raise HTTPException(status_code=401, detail="Token has been revoked")
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # DB error should not block auth
+
     # Fetch user from database
     try:
         response = await asyncio.to_thread(
@@ -90,7 +104,7 @@ async def get_current_admin_user(
     return current_user
 
 
-def verify_refresh_token(refresh_token: str, db=None) -> Dict:
+async def verify_refresh_token(refresh_token: str, db=None) -> Dict:
     """Verify refresh token and return payload. Checks revocation if db provided."""
     payload = decode_token(refresh_token)
 
@@ -98,12 +112,14 @@ def verify_refresh_token(refresh_token: str, db=None) -> Dict:
     if payload.get("type") != "refresh":
         raise HTTPException(status_code=401, detail="Invalid token type")
 
-    # Check revocation
+    # Check revocation (P1-1.11: wrapped in asyncio.to_thread to avoid blocking)
     if db:
         jti = payload.get("jti")
         if jti:
             try:
-                revoked = db.table("revoked_tokens").select("id").eq("jti", jti).execute()
+                revoked = await asyncio.to_thread(
+                    lambda: db.table("revoked_tokens").select("id").eq("jti", jti).execute()
+                )
                 if revoked.data:
                     raise HTTPException(status_code=401, detail="Token has been revoked")
             except HTTPException:

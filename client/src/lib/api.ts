@@ -64,7 +64,9 @@ apiClient.interceptors.response.use(
 
       try {
         // If a refresh is already in progress, wait for it instead of
-        // firing a second refresh request.
+        // firing a second refresh request. The promise is kept alive until
+        // all waiters have consumed the new token to prevent redundant
+        // refresh cycles that could invalidate single-use refresh tokens.
         if (!refreshPromise) {
           refreshPromise = (async () => {
             const refreshToken = localStorage.getItem('refresh_token');
@@ -79,6 +81,13 @@ apiClient.interceptors.response.use(
             localStorage.setItem('refresh_token', newRefreshToken);
             return access_token;
           })();
+
+          // Clear the shared promise after a short delay so concurrent
+          // requests reuse the same result, but future requests after the
+          // window will trigger a fresh refresh if needed.
+          refreshPromise.finally(() => {
+            setTimeout(() => { refreshPromise = null; }, 2000);
+          });
         }
 
         const newAccessToken = await refreshPromise;
@@ -86,13 +95,12 @@ apiClient.interceptors.response.use(
         return apiClient(originalRequest);
       } catch (refreshError) {
         // Refresh failed, logout user
+        refreshPromise = null;
         localStorage.removeItem('access_token');
         localStorage.removeItem('refresh_token');
         localStorage.removeItem('user');
         window.location.href = '/login';
         return Promise.reject(refreshError);
-      } finally {
-        refreshPromise = null;
       }
     }
 
@@ -314,9 +322,9 @@ export interface AdminStats {
 export const adminApi = {
   getAllGroups: () => apiClient.get<RegisteredGroup[]>('/admin/groups'),
 
-  getGroupMessages: (groupId: string, page: number = 1, pageSize: number = 50, days: number = 30) =>
+  getGroupMessages: (groupId: string, page: number = 1, pageSize: number = 50, days: number = 30, topicId?: number | null) =>
     apiClient.get<MessagesListResponse>(`/admin/groups/${groupId}/messages`, {
-      params: { page, page_size: pageSize, days },
+      params: { page, page_size: pageSize, days, ...(topicId != null ? { topic_id: topicId } : {}) },
     }),
 
   getStats: () => apiClient.get<AdminStats>('/admin/stats'),
@@ -366,7 +374,11 @@ export const getStoredUser = (): User | null => {
   const userStr = localStorage.getItem('user');
   if (userStr) {
     try {
-      return JSON.parse(userStr);
+      const parsed = JSON.parse(userStr);
+      if (parsed && typeof parsed === 'object' && parsed.id && parsed.role) {
+        return parsed as User;
+      }
+      return null;
     } catch {
       return null;
     }

@@ -41,8 +41,12 @@ class Settings(BaseSettings):
     # Resend
     RESEND_API_KEY: str = ""
     
-    # Environment
+    # Environment (normalized to lowercase)
     ENVIRONMENT: str = "development"
+
+    def model_post_init(self, __context) -> None:
+        # Normalize ENVIRONMENT to lowercase to avoid case-sensitivity issues
+        object.__setattr__(self, "ENVIRONMENT", self.ENVIRONMENT.strip().lower())
     
     @property
     def cors_origins_list(self) -> List[str]:

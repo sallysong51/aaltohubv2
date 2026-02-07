@@ -230,8 +230,36 @@ class MessageCrawler:
 
 async def main():
     """Main entry point"""
-    crawler = MessageCrawler()
-    await crawler.run()
+    import warnings
+    import fcntl
+    warnings.warn(
+        "DEPRECATED: crawler.py is superseded by live_crawler.py (integrated into the FastAPI app). "
+        "Running this standalone script alongside the API service will cause Telegram session conflicts. "
+        "Use the API service instead: systemctl start aaltohub-api",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    print("WARNING: This crawler is DEPRECATED. Use the live_crawler integrated in the API service.")
+    print("Continuing in 5 seconds... (Ctrl+C to abort)")
+    await asyncio.sleep(5)
+
+    # Acquire file lock (same path as live_crawler) to prevent session conflicts
+    lock_dir = Path(__file__).resolve().parent.parent  # backend/
+    lock_path = str(lock_dir / "aaltohub-crawler.lock")
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        print(f"ERROR: Another crawler is already running (lock: {lock_path}). Aborting.")
+        lock_file.close()
+        return
+
+    try:
+        crawler = MessageCrawler()
+        await crawler.run()
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 if __name__ == "__main__":

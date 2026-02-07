@@ -16,9 +16,11 @@ import fcntl
 import io
 import json
 import logging
+import os
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import (
@@ -63,6 +65,24 @@ GAP_FILL_LOOKBACK_HOURS = 1  # re-check last 1 hour of messages
 GAP_FILL_MAX_MESSAGES = 500  # max messages per group during gap-fill
 DIALOGS_COOLDOWN = 600  # 10 minutes — minimum interval between get_dialogs() calls
 QUEUE_DRAIN_TIMEOUT = 60  # seconds — max wait for queue to drain after historical crawl
+MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB — skip media larger than this
+ENTITY_CACHE_MAX_SIZE = 5000  # max entries before LRU-style eviction
+ENABLED_CACHE_MAX_SIZE = 1000  # max entries before eviction
+
+
+def _safe_create_task(coro, *, name: str | None = None) -> asyncio.Task:
+    """Create an asyncio task with automatic exception logging (prevents silent failures)."""
+    task = asyncio.create_task(coro, name=name)
+
+    def _log_exception(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc:
+            logger.error("Background task %s failed: %s", name or t.get_name(), exc)
+
+    task.add_done_callback(_log_exception)
+    return task
 
 # Circuit breaker settings
 CB_FAILURE_THRESHOLD = 5  # failures before opening
@@ -164,11 +184,15 @@ class LiveCrawlerService:
 
         # Acquire file lock to prevent concurrent crawlers (live + legacy)
         # sharing the same Telegram session, which causes forced disconnects.
-        lock_path = "/tmp/aaltohub-crawler.lock"
+        # Use /run if writable (systemd RuntimeDirectory), else app directory.
+        lock_dir = Path("/run/aaltohub")
+        if not lock_dir.exists():
+            lock_dir = Path(__file__).resolve().parent.parent  # backend/
+        lock_path = str(lock_dir / "aaltohub-crawler.lock")
         try:
             self._lock_file = open(lock_path, "w")
             fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._lock_file.write(str(time.time()))
+            self._lock_file.write(str(os.getpid()))
             self._lock_file.flush()
         except (IOError, OSError):
             logger.error("Another crawler instance is already running (lock: %s). Aborting.", lock_path)
@@ -287,8 +311,7 @@ class LiveCrawlerService:
                 )
 
             # Initialize async HTTP client for broadcasts
-            import httpx as _httpx
-            self._http_client = _httpx.AsyncClient(timeout=5.0)
+            await self._ensure_http_client()
 
             # Restore previously crawled groups to avoid re-crawling on restart
             try:
@@ -503,18 +526,25 @@ class LiveCrawlerService:
     def _db_update(self, data: dict, record_id: str) -> None:
         self.supabase.table("messages").update(data).eq("id", record_id).execute()
 
+    async def _ensure_http_client(self):
+        """Lazily create or recreate the httpx.AsyncClient."""
+        if self._http_client is None:
+            import httpx as _httpx
+            self._http_client = _httpx.AsyncClient(timeout=5.0)
+        return self._http_client
+
     async def _broadcast(self, event: str, payload: dict) -> None:
         """Send a Supabase Broadcast message to the 'messages' channel.
 
         Uses the Supabase Realtime HTTP broadcast endpoint instead of
         Postgres Changes (WAL) to avoid single-thread WAL replication bottleneck.
         Uses async httpx client for non-blocking I/O.
+        Recreates the client on connection errors for resilience.
         """
-        if not self._http_client:
-            return
         try:
+            client = await self._ensure_http_client()
             url = f"{settings.SUPABASE_URL}/realtime/v1/api/broadcast"
-            await self._http_client.post(
+            await client.post(
                 url,
                 json={
                     "channel": "messages",
@@ -528,7 +558,16 @@ class LiveCrawlerService:
                 },
             )
         except Exception as e:
-            logger.warning("Broadcast failed for event=%s: %s", event, e)
+            logger.warning("Broadcast failed for event=%s: %s — recreating HTTP client", event, e)
+            # Close stale client and let _ensure_http_client recreate on next call
+            if self._http_client:
+                try:
+                    await self._http_client.aclose()
+                except Exception:
+                    pass
+                self._http_client = None
+
+    _DEAD_LETTER_FILE_MAX_BYTES = 50 * 1024 * 1024  # 50 MB cap
 
     def _write_to_dead_letter(self, row: dict, error: str) -> None:
         """Write a failed message to the dead letter table for later retry.
@@ -546,7 +585,12 @@ class LiveCrawlerService:
         except Exception as e:
             logger.error("Dead letter DB write failed: %s — writing to local file", e)
             try:
-                with open("/tmp/aaltohub-dead-letters.jsonl", "a") as f:
+                # Use persistent path (not /tmp which may be private-namespaced by systemd)
+                dl_path = Path(__file__).resolve().parent.parent / "dead-letters.jsonl"
+                if dl_path.exists() and dl_path.stat().st_size > self._DEAD_LETTER_FILE_MAX_BYTES:
+                    logger.error("Dead letter file exceeds %d MB — dropping message", self._DEAD_LETTER_FILE_MAX_BYTES // (1024 * 1024))
+                    return
+                with open(dl_path, "a") as f:
                     f.write(json.dumps({"row": row, "error": str(error)[:500], "ts": time.time()}) + "\n")
             except Exception as e2:
                 logger.error("Local dead letter file write also failed: %s", e2)
@@ -704,9 +748,10 @@ class LiveCrawlerService:
                 self._msg_queue.put_nowait(queue_item)
             except asyncio.QueueFull:
                 logger.warning("Message queue full (size=%d), sending msg %d to dead letter", MSG_QUEUE_MAXSIZE, message.id)
-                asyncio.create_task(asyncio.to_thread(
-                    self._write_to_dead_letter, message_data, "queue_full"
-                ))
+                _safe_create_task(
+                    asyncio.to_thread(self._write_to_dead_letter, message_data, "queue_full"),
+                    name=f"dead-letter-{message.id}",
+                )
 
         except Exception as e:
             logger.error("Enqueue message %d error: %s", message.id, e)
@@ -831,9 +876,15 @@ class LiveCrawlerService:
 
     def _save_entity_to_cache(self, gid: int, access_hash: int, entity_type: str) -> None:
         """Persist a single entity cache entry to memory + fire-and-forget DB write."""
+        # Evict oldest entries if cache exceeds max size
+        if len(self._entity_cache) >= ENTITY_CACHE_MAX_SIZE:
+            keys_to_remove = list(self._entity_cache.keys())[:len(self._entity_cache) - ENTITY_CACHE_MAX_SIZE + 1]
+            for k in keys_to_remove:
+                del self._entity_cache[k]
         self._entity_cache[gid] = (access_hash, entity_type)
-        asyncio.create_task(
-            asyncio.to_thread(self._save_entity_to_cache_sync, gid, access_hash, entity_type)
+        _safe_create_task(
+            asyncio.to_thread(self._save_entity_to_cache_sync, gid, access_hash, entity_type),
+            name=f"entity-cache-{gid}",
         )
 
     def _cache_entity(self, entity) -> None:
@@ -914,11 +965,17 @@ class LiveCrawlerService:
         raise ValueError(f"Could not resolve entity for group ID {gid}. Is the admin a member of this group?")
 
     async def _get_entity_for_group(self, gid: int):
-        """Resolve using the first available client."""
+        """Resolve by iterating all available admin clients until one succeeds."""
         if not self.clients:
             raise ValueError("No admin clients available")
-        client = next(iter(self.clients.values()))
-        return await self._get_entity_for_group_with_client(gid, client)
+        last_err = None
+        for client in self.clients.values():
+            try:
+                return await self._get_entity_for_group_with_client(gid, client)
+            except Exception as e:
+                last_err = e
+                continue
+        raise ValueError(f"Could not resolve entity for group {gid} with any client: {last_err}")
 
     async def _periodic_group_refresh(self) -> None:
         """Refresh groups every 5 minutes. Trigger historical crawl for new groups."""
@@ -1198,6 +1255,11 @@ class LiveCrawlerService:
         if cached and (now - cached[1]) < ENABLED_CACHE_TTL:
             return cached[0]
         enabled = await asyncio.to_thread(self._fetch_group_enabled, group_uuid)
+        # Evict oldest entries if cache exceeds max size
+        if len(self._enabled_cache) >= ENABLED_CACHE_MAX_SIZE:
+            oldest = sorted(self._enabled_cache, key=lambda k: self._enabled_cache[k][1])
+            for k in oldest[:len(self._enabled_cache) - ENABLED_CACHE_MAX_SIZE + 1]:
+                del self._enabled_cache[k]
         self._enabled_cache[group_uuid] = (enabled, now)
         return enabled
 
@@ -1342,11 +1404,17 @@ class LiveCrawlerService:
             if not file_bytes:
                 return None, None
 
+            if len(file_bytes) > MAX_MEDIA_BYTES:
+                logger.info("Media for msg %d too large (%d bytes), skipping upload", message.id, len(file_bytes))
+                return None, None
+
             file_ext = "jpg" if "jpeg" in content_type or "jpg" in content_type else "bin"
             file_path = f"{group_uuid}/{message.id}.{file_ext}"
 
-            self.supabase.storage.from_("message-media").upload(
-                file_path, file_bytes, {"content-type": content_type}
+            await asyncio.to_thread(
+                lambda: self.supabase.storage.from_("message-media").upload(
+                    file_path, file_bytes, {"content-type": content_type}
+                )
             )
             public_url = self.supabase.storage.from_("message-media").get_public_url(file_path)
 
