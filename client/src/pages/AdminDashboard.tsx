@@ -11,8 +11,8 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
-import { Loader2, Users, AlertCircle, RefreshCw, LogOut, Circle, Hash } from 'lucide-react';
-import { adminApi, RegisteredGroup, Message } from '@/lib/api';
+import { Loader2, Users, AlertCircle, RefreshCw, LogOut, Circle, Hash, Plus, ChevronRight, ExternalLink, UserCog, BarChart3, ArrowLeft, Zap, Download } from 'lucide-react';
+import { adminApi, RegisteredGroup, Message, getApiErrorMessage } from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
 import ProtectedRoute from '@/components/ProtectedRoute';
 import supabase from '@/lib/supabase';
@@ -23,7 +23,7 @@ import TopicFilter from '@/components/TopicFilter';
 function AdminDashboardContent() {
   const [, setLocation] = useLocation();
   const { user, logout } = useAuth();
-  
+
   const [groups, setGroups] = useState<RegisteredGroup[]>([]);
   const [groupMessages, setGroupMessages] = useState<Map<string, Message>>(new Map());
   const [selectedGroup, setSelectedGroup] = useState<RegisteredGroup | null>(null);
@@ -33,13 +33,22 @@ function AdminDashboardContent() {
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(false);
   const [selectedTopicId, setSelectedTopicId] = useState<number | null>(null);
-  
+  const [crawlerStatusMap, setCrawlerStatusMap] = useState<Map<string, string>>(new Map());
+  const [liveCrawlerStatus, setLiveCrawlerStatus] = useState<{
+    running: boolean; connected: boolean; groups_count: number;
+    messages_received: number; historical_crawl_running: boolean;
+    crawled_groups: number; uptime_seconds: number;
+  } | null>(null);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
 
   // Load groups on mount
   useEffect(() => {
     loadGroups();
+    loadLiveCrawlerStatus();
+    const interval = setInterval(loadLiveCrawlerStatus, 30_000);
+    return () => clearInterval(interval);
   }, []);
 
   // Subscribe to realtime messages when group is selected
@@ -48,24 +57,23 @@ function AdminDashboardContent() {
 
     const channel = supabase
       .channel('messages')
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'messages',
-          filter: `group_id=eq.${selectedGroup.id}`,
-        },
-        (payload) => {
-          const newMessage = payload.new as Message;
-          setMessages((prev) => [...prev, newMessage]);
-          
-          // Auto-scroll to bottom
-          setTimeout(() => {
-            messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-          }, 100);
-        }
-      )
+      .on('broadcast', { event: 'insert' }, ({ payload: newMessage }: { payload: Message }) => {
+        if (newMessage.group_id !== selectedGroup.id) return;
+        setMessages((prev) => [...prev, newMessage]);
+
+        // Auto-scroll to bottom
+        requestAnimationFrame(() => {
+          messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+        });
+      })
+      .on('broadcast', { event: 'update' }, ({ payload: updated }: { payload: Message }) => {
+        if (updated.group_id !== selectedGroup.id) return;
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.telegram_message_id === updated.telegram_message_id ? { ...m, ...updated } : m
+          )
+        );
+      })
       .subscribe();
 
     return () => {
@@ -73,32 +81,77 @@ function AdminDashboardContent() {
     };
   }, [selectedGroup]);
 
+  const loadLiveCrawlerStatus = async () => {
+    try {
+      const res = await adminApi.getLiveCrawlerStatus();
+      setLiveCrawlerStatus(res.data);
+    } catch {
+      // Non-critical
+    }
+  };
+
+  const handleRestartCrawler = async () => {
+    try {
+      await adminApi.restartLiveCrawler();
+      toast.success('라이브 크롤러가 재시작되었습니다');
+      loadLiveCrawlerStatus();
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '크롤러 재시작에 실패했습니다'));
+    }
+  };
+
+  const handleTriggerCrawl = async (groupId: string) => {
+    try {
+      await adminApi.triggerHistoricalCrawl(groupId);
+      toast.success('역사 크롤링이 시작되었습니다');
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '크롤링 시작에 실패했습니다'));
+    }
+  };
+
   const loadGroups = async () => {
     setIsLoadingGroups(true);
     try {
       const response = await adminApi.getAllGroups();
       setGroups(response.data);
-      
-      // Load latest message for each group
+
+      // Load latest message for each group (parallel)
       const messagesMap = new Map<string, Message>();
-      for (const group of response.data) {
+      const msgPromises = response.data.map(async (group) => {
         try {
           const msgResponse = await adminApi.getGroupMessages(group.id, 1, 1, 30);
           if (msgResponse.data.messages.length > 0) {
-            messagesMap.set(group.id, msgResponse.data.messages[0]);
+            return { groupId: group.id, message: msgResponse.data.messages[0] };
           }
         } catch (error) {
           // Ignore errors for individual groups
         }
-      }
+        return null;
+      });
+      const results = await Promise.all(msgPromises);
+      results.forEach((r) => {
+        if (r) messagesMap.set(r.groupId, r.message);
+      });
       setGroupMessages(messagesMap);
-      
+
+      // Load crawler statuses
+      try {
+        const statusResponse = await adminApi.getCrawlerStatus();
+        const statusMap = new Map<string, string>();
+        (statusResponse.data || []).forEach((s: { group_id: string; status?: string }) => {
+          statusMap.set(String(s.group_id), s.status || 'inactive');
+        });
+        setCrawlerStatusMap(statusMap);
+      } catch {
+        // Non-critical: leave map empty
+      }
+
       // Auto-select first group
       if (response.data.length > 0 && !selectedGroup) {
         setSelectedGroup(response.data[0]);
       }
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || '그룹 목록을 불러오는데 실패했습니다');
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '그룹 목록을 불러오는데 실패했습니다'));
     } finally {
       setIsLoadingGroups(false);
     }
@@ -112,17 +165,17 @@ function AdminDashboardContent() {
       if (pageNum === 1) {
         setMessages(response.data.messages);
         // Scroll to bottom for initial load
-        setTimeout(() => {
+        requestAnimationFrame(() => {
           messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
-        }, 100);
+        });
       } else {
         setMessages((prev) => [...response.data.messages, ...prev]);
       }
       
       setHasMore(response.data.has_more);
       setPage(pageNum);
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || '메시지를 불러오는데 실패했습니다');
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '메시지를 불러오는데 실패했습니다'));
     } finally {
       setIsLoadingMessages(false);
     }
@@ -157,9 +210,10 @@ function AdminDashboardContent() {
   };
 
   const getCrawlerStatus = (group: RegisteredGroup): 'active' | 'inactive' | 'error' => {
-    // TODO: Get actual crawler status from backend API
-    // For now, assume all groups are active
-    return 'active';
+    const status = crawlerStatusMap.get(String(group.telegram_id || group.id));
+    if (status === 'active') return 'active';
+    if (status === 'error') return 'error';
+    return 'inactive';
   };
 
   const formatDate = (dateString: string) => {
@@ -203,23 +257,92 @@ function AdminDashboardContent() {
   return (
     <div className="h-screen flex flex-col bg-background">
       {/* Header */}
-      <div className="border-b-4 border-border bg-card flex-shrink-0">
+      <div className="border-b border-border bg-card flex-shrink-0">
         <div className="container py-4">
+          {/* Breadcrumb */}
+          <div className="flex items-center gap-2 mb-3 text-sm text-muted-foreground">
+            <span>Admin</span>
+            <ChevronRight className="h-4 w-4" />
+            <span className="text-foreground font-medium">Dashboard</span>
+          </div>
+
+          {/* Main Header */}
           <div className="flex items-center justify-between">
             <div>
-              <h1 className="text-2xl font-bold">관리자 대시보드</h1>
-              <p className="text-sm text-muted-foreground">
-                {user?.first_name || 'Admin'} (@{user?.username})
-              </p>
+              <h1 className="text-4xl font-bold">관리자 대시보드</h1>
+              <div className="flex items-center gap-2 mt-1">
+                <p className="text-sm text-muted-foreground">
+                  {user?.first_name || 'Admin'} (@{user?.username})
+                </p>
+                {liveCrawlerStatus && (
+                  <Badge
+                    variant="outline"
+                    className={liveCrawlerStatus.running && liveCrawlerStatus.connected
+                      ? 'border-green-500 text-green-600'
+                      : 'border-red-500 text-red-600'
+                    }
+                  >
+                    <Zap className="h-3 w-3 mr-1" />
+                    {liveCrawlerStatus.running && liveCrawlerStatus.connected
+                      ? `크롤러 활성 (${liveCrawlerStatus.messages_received}건)`
+                      : '크롤러 비활성'
+                    }
+                    {liveCrawlerStatus.historical_crawl_running && ' | 역사 수집 중...'}
+                  </Badge>
+                )}
+              </div>
             </div>
-            <Button
-              variant="outline"
-              onClick={handleLogout}
-              className="border-2 border-border"
-            >
-              <LogOut className="mr-2 h-4 w-4" />
-              로그아웃
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                onClick={() => setLocation('/feed')}
+                className="border-2 border-border"
+              >
+                <ArrowLeft className="mr-2 h-4 w-4" />
+                피드로 돌아가기
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => setLocation('/groups/select')}
+                className="border-2 border-border"
+              >
+                <Plus className="mr-2 h-4 w-4" />
+                그룹 추가
+              </Button>
+              <Button
+                variant="outline"
+                onClick={handleRestartCrawler}
+                className="border-2 border-border"
+                title="라이브 크롤러 재시작"
+              >
+                <RefreshCw className="mr-2 h-4 w-4" />
+                크롤러 재시작
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => setLocation('/admin/crawler')}
+                className="border-2 border-border"
+              >
+                <BarChart3 className="mr-2 h-4 w-4" />
+                크롤러 관리
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => setLocation('/admin/users')}
+                className="border-2 border-border"
+              >
+                <UserCog className="mr-2 h-4 w-4" />
+                사용자 관리
+              </Button>
+              <Button
+                variant="outline"
+                onClick={handleLogout}
+                className="border-2 border-border"
+              >
+                <LogOut className="mr-2 h-4 w-4" />
+                로그아웃
+              </Button>
+            </div>
           </div>
         </div>
       </div>
@@ -227,8 +350,8 @@ function AdminDashboardContent() {
       {/* Main Content: Split Screen */}
       <div className="flex-1 flex overflow-hidden">
         {/* Left Sidebar: Groups List */}
-        <div className="w-80 border-r-4 border-border bg-sidebar flex-shrink-0 flex flex-col">
-          <div className="p-4 border-b-2 border-sidebar-border">
+        <div className="w-80 border-r border-border bg-sidebar flex-shrink-0 flex flex-col">
+          <div className="p-4 border-b border-sidebar-border">
             <h2 className="font-bold text-lg">등록된 그룹</h2>
             <p className="text-xs text-muted-foreground">{groups.length}개 그룹</p>
           </div>
@@ -261,14 +384,21 @@ function AdminDashboardContent() {
                         }`}
                       />
                     </div>
-                    {group.username && (
-                      <div className="text-xs text-muted-foreground truncate">
-                        @{group.username}
-                      </div>
+                    {group.invite_link && (
+                      <a
+                        href={group.invite_link}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={(e) => e.stopPropagation()}
+                        className="text-xs text-primary hover:underline truncate flex items-center gap-1"
+                      >
+                        <ExternalLink className="h-3 w-3 flex-shrink-0" />
+                        {group.username ? `@${group.username}` : '텔레그램 링크'}
+                      </a>
                     )}
                     {lastMessage && (
                       <div className="text-xs text-muted-foreground truncate mt-1">
-                        {lastMessage.sender_name}: {lastMessage.content || '[미디어]'}
+                        {lastMessage.sender_name}: {lastMessage.text || '[미디어]'}
                       </div>
                     )}
                     <div className="flex items-center justify-between mt-1">
@@ -278,11 +408,23 @@ function AdminDashboardContent() {
                           {group.member_count.toLocaleString()}
                         </Badge>
                       )}
-                      {lastMessage && (
-                        <span className="text-xs text-muted-foreground timestamp">
-                          {formatTimestamp(lastMessage.sent_at)}
-                        </span>
-                      )}
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleTriggerCrawl(group.id);
+                          }}
+                          className="text-xs text-primary hover:underline flex items-center gap-0.5"
+                          title="역사 크롤링 시작"
+                        >
+                          <Download className="h-3 w-3" />
+                        </button>
+                        {lastMessage && (
+                          <span className="text-xs text-muted-foreground timestamp">
+                            {formatTimestamp(lastMessage.sent_at)}
+                          </span>
+                        )}
+                      </div>
                     </div>
                   </button>
                 );
@@ -290,18 +432,6 @@ function AdminDashboardContent() {
             </div>
           </ScrollArea>
 
-          {/* Failed Invites Section */}
-          <div className="p-4 border-t-2 border-sidebar-border">
-            <Button
-              variant="outline"
-              className="w-full border-2 border-border"
-              size="sm"
-              onClick={() => toast.info('초대 실패 목록 기능 준비 중')}
-            >
-              <AlertCircle className="mr-2 h-4 w-4" />
-              초대 실패 목록
-            </Button>
-          </div>
         </div>
 
         {/* Right: Message Viewer */}
@@ -309,10 +439,10 @@ function AdminDashboardContent() {
           {selectedGroup ? (
             <>
               {/* Chat Header */}
-              <div className="p-4 border-b-2 border-border bg-card flex-shrink-0">
+              <div className="p-4 border-b border-border bg-card flex-shrink-0">
                 <div className="flex items-center justify-between mb-3">
                   <div>
-                    <h2 className="font-bold text-xl">{selectedGroup.title}</h2>
+                    <h2 className="font-bold text-2xl">{selectedGroup.title}</h2>
                     {selectedGroup.username && (
                       <p className="text-sm text-muted-foreground">@{selectedGroup.username}</p>
                     )}
@@ -321,17 +451,10 @@ function AdminDashboardContent() {
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={() => setLocation('/admin/crawler')}
-                      className="border-2 border-border"
-                    >
-                      <Hash className="h-4 w-4" />
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
                       onClick={() => loadMessages(selectedGroup.id, 1)}
                       disabled={isLoadingMessages}
                       className="border-2 border-border"
+                      title="메시지 새로고침"
                     >
                       <RefreshCw className={`h-4 w-4 ${isLoadingMessages ? 'animate-spin' : ''}`} />
                     </Button>
