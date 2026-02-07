@@ -714,7 +714,7 @@ class LiveCrawlerService:
 
             message_data = {
                 "telegram_message_id": message.id,
-                "group_id": group_uuid,
+                "group_id": int(group_uuid),  # Convert to int - DB expects BIGINT
                 "sender_id": sender_id,
                 "sender_name": sender_name,
                 "content": message.text,
@@ -757,7 +757,7 @@ class LiveCrawlerService:
         if not self.group_id_map:
             return
         args_list = [
-            (gid, "initializing", True, 0, 0, 0)
+            (int(gid), "initializing", True, 0, 0, 0)  # Convert to int - DB expects BIGINT
             for gid in self.group_id_map.values()
         ]
         try:
@@ -1235,7 +1235,7 @@ class LiveCrawlerService:
                 args.append(now)
                 idx += 1
 
-            args.append(group_uuid)
+            args.append(int(group_uuid))  # Convert to int - DB expects BIGINT
             query = f"UPDATE crawler_status SET {', '.join(sets)} WHERE group_id = ${idx}"
             await db.execute(query, *args)
         except Exception as e:
@@ -1260,7 +1260,7 @@ class LiveCrawlerService:
             return cached[0]
         try:
             val = await db.fetchval(
-                "SELECT is_enabled FROM crawler_status WHERE group_id = $1", group_uuid
+                "SELECT is_enabled FROM crawler_status WHERE group_id = $1", int(group_uuid)  # Convert to int - DB expects BIGINT
             )
             enabled = val if val is not None else True
         except Exception:
