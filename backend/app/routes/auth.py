@@ -1,7 +1,6 @@
 """
 Authentication routes
 """
-import asyncio
 import logging
 import time
 from collections import defaultdict
@@ -15,10 +14,10 @@ from app.models import (
     SendCodeRequest, SendCodeResponse,
     VerifyCodeRequest, Verify2FARequest,
     AuthResponse, RefreshTokenRequest,
-    UserCreate, UserResponse, UserRole
+    UserResponse, UserRole
 )
-from app.auth import create_access_token, create_refresh_token, decode_token, get_current_user, verify_refresh_token
-from app.database import get_db
+from app.auth import create_access_token, create_refresh_token, decode_token, get_current_user, verify_refresh_token, invalidate_revocation_cache, is_admin_credential
+from app.database import db
 from app.telegram_client import telegram_manager
 from app.config import settings
 
@@ -64,60 +63,65 @@ def _check_verify_rate_limit(key: str):
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
-async def _upsert_user_and_create_tokens(db, user_info: dict, session_string: str) -> tuple:
+async def _upsert_user_and_create_tokens(user_info: dict, session_string: str) -> tuple:
     """Shared logic: upsert user record, save Telethon session, return (AuthResponse fields).
     Returns (access_token, refresh_token, user).
     """
-    # Determine role
+    # Determine role (check admin_credentials table first, then fallback to env vars for backwards compatibility)
     phone = user_info.get("phone_number")
     username = user_info.get("username")
-    is_admin = settings.is_admin(phone=phone, username=username)
+    is_admin = await is_admin_credential(phone=phone, username=username)
+    # Fallback to env vars for backwards compatibility (during migration period)
+    if not is_admin:
+        is_admin = settings.is_admin(phone=phone, username=username)
     role = UserRole.ADMIN if is_admin else UserRole.USER
 
     logger.info("User role check: telegram_id=%s, is_admin=%s, role=%s",
                 user_info.get("telegram_id"), is_admin, role.value)
 
     # Check if user exists
-    existing_user = await asyncio.to_thread(
-        lambda: db.table("users").select("*").eq("telegram_id", user_info["telegram_id"]).execute()
+    existing_user = await db.fetchrow(
+        "SELECT * FROM users WHERE telegram_id = $1",
+        user_info["telegram_id"],
     )
 
-    if existing_user.data and len(existing_user.data) > 0:
-        user_data = existing_user.data[0]
-        user_id = user_data["id"]
+    if existing_user:
+        user_id = existing_user["id"]
 
         # Preserve existing role if manually changed (e.g. via admin panel)
         # Only upgrade to admin if settings say so; never downgrade an existing admin
-        existing_role = user_data.get("role", "user")
+        existing_role = existing_user.get("role", "user")
         if is_admin:
             effective_role = UserRole.ADMIN.value
         else:
             effective_role = existing_role  # keep whatever role was set
 
-        await asyncio.to_thread(lambda: db.table("users").update({
-            "phone_number": user_info.get("phone_number"),
-            "username": user_info.get("username"),
-            "first_name": user_info.get("first_name"),
-            "last_name": user_info.get("last_name"),
-            "role": effective_role
-        }).eq("id", user_id).execute())
+        await db.execute(
+            """UPDATE users SET phone_number = $1, username = $2, first_name = $3,
+               last_name = $4, role = $5 WHERE id = $6""",
+            user_info.get("phone_number"),
+            user_info.get("username"),
+            user_info.get("first_name"),
+            user_info.get("last_name"),
+            effective_role,
+            user_id,
+        )
     else:
-        new_user = await asyncio.to_thread(lambda: db.table("users").insert({
-            "telegram_id": user_info["telegram_id"],
-            "phone_number": user_info.get("phone_number"),
-            "username": user_info.get("username"),
-            "first_name": user_info.get("first_name"),
-            "last_name": user_info.get("last_name"),
-            "role": role.value
-        }).execute())
-
-        user_id = new_user.data[0]["id"]
+        row = await db.fetchrow(
+            """INSERT INTO users (telegram_id, phone_number, username, first_name, last_name, role)
+               VALUES ($1, $2, $3, $4, $5, $6) RETURNING id""",
+            user_info["telegram_id"],
+            user_info.get("phone_number"),
+            user_info.get("username"),
+            user_info.get("first_name"),
+            user_info.get("last_name"),
+            role.value,
+        )
+        user_id = row["id"]
 
     # Get updated user data
-    user_response = await asyncio.to_thread(
-        lambda: db.table("users").select("*").eq("id", user_id).execute()
-    )
-    user = UserResponse(**user_response.data[0])
+    user_row = await db.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+    user = UserResponse(**dict(user_row))
 
     # Create JWT tokens
     access_token = create_access_token({"sub": str(user_id)})
@@ -150,12 +154,12 @@ async def send_code(request: SendCodeRequest, req: Request):
             requires_2fa=result["requires_2fa"]
         )
     except Exception as e:
-        # Telegram manager already raises user-friendly Korean messages
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error("send_code error: %s", e)
+        raise HTTPException(status_code=400, detail="인증 코드 전송에 실패했습니다. 잠시 후 다시 시도해 주세요.")
 
 
 @router.post("/verify-code", response_model=AuthResponse)
-async def verify_code(request: VerifyCodeRequest, req: Request, db=Depends(get_db)):
+async def verify_code(request: VerifyCodeRequest, req: Request):
     """Verify authentication code and sign in"""
     # Rate limit: 5 attempts per phone per 5 minutes
     client_ip = req.client.host if req.client else "unknown"
@@ -177,7 +181,7 @@ async def verify_code(request: VerifyCodeRequest, req: Request, db=Depends(get_d
             raise HTTPException(status_code=400, detail="Verification failed")
 
         access_token, refresh_token, user, user_id = await _upsert_user_and_create_tokens(
-            db, result["user_info"], result["session_string"]
+            result["user_info"], result["session_string"]
         )
 
         # Save Telethon session
@@ -196,7 +200,7 @@ async def verify_code(request: VerifyCodeRequest, req: Request, db=Depends(get_d
 
 
 @router.post("/verify-2fa", response_model=AuthResponse)
-async def verify_2fa(request: Verify2FARequest, req: Request, db=Depends(get_db)):
+async def verify_2fa(request: Verify2FARequest, req: Request):
     """Verify 2FA password and complete sign in"""
     # Rate limit: 5 attempts per phone per 5 minutes
     client_ip = req.client.host if req.client else "unknown"
@@ -211,7 +215,7 @@ async def verify_2fa(request: Verify2FARequest, req: Request, db=Depends(get_db)
             raise HTTPException(status_code=400, detail="2FA verification failed")
 
         access_token, refresh_token, user, user_id = await _upsert_user_and_create_tokens(
-            db, result["user_info"], result["session_string"]
+            result["user_info"], result["session_string"]
         )
 
         # Save Telethon session
@@ -230,34 +234,38 @@ async def verify_2fa(request: Verify2FARequest, req: Request, db=Depends(get_db)
 
 
 @router.post("/refresh", response_model=AuthResponse)
-async def refresh_token(request: RefreshTokenRequest, db=Depends(get_db)):
+async def refresh_token_endpoint(request: RefreshTokenRequest):
     """Refresh access token using refresh token"""
     try:
-        payload = await verify_refresh_token(request.refresh_token, db=db)
+        payload = await verify_refresh_token(request.refresh_token)
         user_id = payload.get("sub")
 
-        user_response = await asyncio.to_thread(
-            lambda: db.table("users").select("*").eq("id", user_id).execute()
+        user_row = await db.fetchrow(
+            "SELECT * FROM users WHERE id = $1", int(user_id)
         )
-        if not user_response.data or len(user_response.data) == 0:
+        if not user_row:
             raise HTTPException(status_code=404, detail="User not found")
 
-        user = UserResponse(**user_response.data[0])
+        user = UserResponse(**dict(user_row))
 
-        access_token = create_access_token({"sub": str(user_id)})
-        new_refresh_token = create_refresh_token({"sub": str(user_id)})
-
-        # Revoke old refresh token (single-use)
+        # Revoke old refresh token BEFORE issuing new ones (single-use)
         old_jti = payload.get("jti")
         if old_jti:
             try:
-                await asyncio.to_thread(lambda: db.table("revoked_tokens").insert({
-                    "jti": old_jti,
-                    "user_id": str(user_id),
-                    "expires_at": datetime.fromtimestamp(payload.get("exp", 0), tz=timezone.utc).isoformat(),
-                }).execute())
-            except Exception:
-                pass  # Non-critical
+                await db.execute(
+                    """INSERT INTO revoked_tokens (jti, user_id, expires_at)
+                       VALUES ($1, $2, $3) ON CONFLICT (jti) DO NOTHING""",
+                    old_jti,
+                    str(user_id),
+                    datetime.fromtimestamp(payload.get("exp", 0), tz=timezone.utc),
+                )
+                invalidate_revocation_cache(old_jti)
+            except Exception as e:
+                logger.error("Failed to revoke old refresh token jti=%s: %s", old_jti, e)
+                raise HTTPException(status_code=500, detail="Token refresh failed")
+
+        access_token = create_access_token({"sub": str(user_id)})
+        new_refresh_token = create_refresh_token({"sub": str(user_id)})
 
         return AuthResponse(
             access_token=access_token,
@@ -280,7 +288,6 @@ async def get_me(current_user: UserResponse = Depends(get_current_user)):
 @router.post("/logout")
 async def logout(
     credentials: HTTPAuthorizationCredentials = Security(security),
-    db=Depends(get_db),
 ):
     """Logout — revoke current token server-side"""
     try:
@@ -288,11 +295,14 @@ async def logout(
         payload = decode_token(token)
         jti = payload.get("jti")
         if jti:
-            await asyncio.to_thread(lambda: db.table("revoked_tokens").insert({
-                "jti": jti,
-                "user_id": payload.get("sub"),
-                "expires_at": datetime.fromtimestamp(payload.get("exp", 0), tz=timezone.utc).isoformat(),
-            }).execute())
+            await db.execute(
+                """INSERT INTO revoked_tokens (jti, user_id, expires_at)
+                   VALUES ($1, $2, $3) ON CONFLICT (jti) DO NOTHING""",
+                jti,
+                payload.get("sub"),
+                datetime.fromtimestamp(payload.get("exp", 0), tz=timezone.utc),
+            )
+            invalidate_revocation_cache(jti)
     except Exception:
         pass  # Best effort revocation
     return {"success": True, "message": "Logged out successfully"}

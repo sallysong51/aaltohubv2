@@ -3,7 +3,7 @@
  * Design Philosophy: Telegram-Native Brutalism
  * - Split-screen layout (groups list + message viewer)
  * - Telegram-style message bubbles
- * - Realtime updates via Supabase
+ * - Realtime updates via SSE (Server-Sent Events)
  */
 import { useState, useEffect, useRef } from 'react';
 import { Button } from '@/components/ui/button';
@@ -12,10 +12,9 @@ import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
 import { Loader2, Users, AlertCircle, RefreshCw, LogOut, Circle, Hash, Plus, ChevronRight, ExternalLink, UserCog, BarChart3, ArrowLeft, Zap, Download } from 'lucide-react';
-import { adminApi, RegisteredGroup, Message, getApiErrorMessage } from '@/lib/api';
+import { adminApi, RegisteredGroup, Message, getApiErrorMessage, SSE_BASE_URL } from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
 import ProtectedRoute from '@/components/ProtectedRoute';
-import supabase from '@/lib/supabase';
 import { useLocation } from 'wouter';
 import MessageBubble from '@/components/MessageBubble';
 import TopicFilter from '@/components/TopicFilter';
@@ -39,6 +38,7 @@ function AdminDashboardContent() {
     crawled_groups: number; uptime_seconds: number;
   } | null>(null);
   const [realtimeConnected, setRealtimeConnected] = useState(false);
+  const [groupSearch, setGroupSearch] = useState('');
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
@@ -51,29 +51,40 @@ function AdminDashboardContent() {
     return () => clearInterval(interval);
   }, []);
 
-  // Subscribe to realtime messages when group is selected
+  // SSE subscription — single persistent connection for the selected group
+  // Replaces Supabase Realtime. EventSource auto-reconnects on disconnect.
   useEffect(() => {
     if (!selectedGroup) return;
 
-    const channel = supabase
-      .channel('messages')
-      .on('broadcast', { event: 'insert' }, ({ payload: newMessage }: { payload: Message }) => {
-        if (!newMessage || String(newMessage.group_id) !== String(selectedGroup.id)) return;
-        // Filter by selected topic if active
+    const token = localStorage.getItem('access_token');
+    if (!token) return;
+
+    const groupId = String(selectedGroup.id);
+    const url = `${SSE_BASE_URL}/api/events/stream?token=${encodeURIComponent(token)}&groups=${encodeURIComponent(groupId)}`;
+    const es = new EventSource(url);
+
+    es.addEventListener('insert', (e: MessageEvent) => {
+      try {
+        const newMessage: Message = JSON.parse(e.data);
+        if (!newMessage) return;
         if (selectedTopicId !== null && newMessage.topic_id !== selectedTopicId) return;
         setMessages((prev) => {
-          // Deduplicate by telegram_message_id + group_id
           if (prev.some(m => m.telegram_message_id === newMessage.telegram_message_id && String(m.group_id) === String(newMessage.group_id))) return prev;
-          return [...prev, newMessage];
+          const updated = [...prev, newMessage];
+          return updated.length > 500 ? updated.slice(-500) : updated;
         });
-
-        // Auto-scroll to bottom
         requestAnimationFrame(() => {
           messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
         });
-      })
-      .on('broadcast', { event: 'update' }, ({ payload: updated }: { payload: Message }) => {
-        if (!updated || String(updated.group_id) !== String(selectedGroup.id)) return;
+      } catch (err) {
+        console.error('[AdminDashboard] SSE insert handler error:', err);
+      }
+    });
+
+    es.addEventListener('update', (e: MessageEvent) => {
+      try {
+        const updated: Message = JSON.parse(e.data);
+        if (!updated) return;
         setMessages((prev) =>
           updated.is_deleted
             ? prev.filter((m) => !(m.telegram_message_id === updated.telegram_message_id && String(m.group_id) === String(updated.group_id)))
@@ -81,13 +92,31 @@ function AdminDashboardContent() {
                 m.telegram_message_id === updated.telegram_message_id ? { ...m, ...updated } : m
               )
         );
-      })
-      .subscribe((status) => {
-        setRealtimeConnected(status === 'SUBSCRIBED');
-      });
+      } catch (err) {
+        console.error('[AdminDashboard] SSE update handler error:', err);
+      }
+    });
+
+    es.addEventListener('delete', (e: MessageEvent) => {
+      try {
+        const deleted: { telegram_message_id: number; group_id: string } = JSON.parse(e.data);
+        if (!deleted) return;
+        setMessages((prev) =>
+          prev.filter((m) => !(m.telegram_message_id === deleted.telegram_message_id && String(m.group_id) === String(deleted.group_id)))
+        );
+      } catch (err) {
+        console.error('[AdminDashboard] SSE delete handler error:', err);
+      }
+    });
+
+    es.onopen = () => setRealtimeConnected(true);
+    es.onerror = () => {
+      setRealtimeConnected(false);
+      console.warn('[AdminDashboard] SSE connection error — will auto-reconnect');
+    };
 
     return () => {
-      supabase.removeChannel(channel);
+      es.close();
       setRealtimeConnected(false);
     };
   }, [selectedGroup, selectedTopicId]);
@@ -141,9 +170,9 @@ function AdminDashboardContent() {
         // Non-critical: leave map empty
       }
 
-      // Auto-select first group
-      if (response.data.length > 0 && !selectedGroup) {
-        setSelectedGroup(response.data[0]);
+      // Auto-select first group (use functional update to avoid stale closure — P2-4.8)
+      if (response.data.length > 0) {
+        setSelectedGroup((prev) => prev ?? response.data[0]);
       }
     } catch (error) {
       toast.error(getApiErrorMessage(error, '그룹 목록을 불러오는데 실패했습니다'));
@@ -185,6 +214,7 @@ function AdminDashboardContent() {
 
   const handleGroupSelect = (group: RegisteredGroup) => {
     setSelectedGroup(group);
+    setMessages([]);  // Clear stale messages immediately on group change (P2-3.4)
     setPage(1);
   };
 
@@ -361,11 +391,18 @@ function AdminDashboardContent() {
           <div className="p-4 border-b border-sidebar-border">
             <h2 className="font-bold text-lg">등록된 그룹</h2>
             <p className="text-xs text-muted-foreground">{groups.length}개 그룹</p>
+            <input
+              type="text"
+              placeholder="그룹 검색..."
+              value={groupSearch}
+              onChange={(e) => setGroupSearch(e.target.value)}
+              className="mt-2 w-full px-2 py-1 text-sm rounded border border-border bg-background"
+            />
           </div>
-          
+
           <ScrollArea className="flex-1">
             <div className="p-2">
-              {groups.map((group) => {
+              {groups.filter((g) => !groupSearch || g.title.toLowerCase().includes(groupSearch.toLowerCase())).map((group) => {
                 const crawlerStatus = getCrawlerStatus(group);
 
                 return (

@@ -13,8 +13,14 @@ Environment="PYTHONUNBUFFERED=1"
 ExecStart=/home/ubuntu/AALTOHUBv2/backend/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=5
-StandardOutput=append:/var/log/aaltohub/api.log
-StandardError=append:/var/log/aaltohub/api.error.log
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aaltohub-api
+
+# Restart limits
+StartLimitIntervalSec=3600
+StartLimitBurst=20
+TimeoutStopSec=30
 
 # Security settings
 NoNewPrivileges=true

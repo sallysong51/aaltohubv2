@@ -51,12 +51,16 @@ export default async function handler(req, res) {
       return res.status(200).end();
     }
 
-    // Forward request to backend
+    // Forward request to backend (15s timeout to prevent hanging)
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
     const response = await fetch(targetUrl, {
       method: req.method,
       headers,
       body: req.method !== 'GET' && req.method !== 'HEAD' ? JSON.stringify(req.body) : undefined,
+      signal: controller.signal,
     });
+    clearTimeout(timeout);
 
     // Set CORS headers
     setCorsHeaders(req, res);

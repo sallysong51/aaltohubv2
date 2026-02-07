@@ -6,7 +6,6 @@ DB `groups` table columns:
   has_topics, visibility, crawl_status, crawl_enabled, last_crawled_at,
   last_error, registered_by (FK users.id), created_at
 """
-import asyncio
 import logging
 import secrets
 from datetime import datetime, timezone
@@ -18,14 +17,45 @@ from app.models import (
     TelegramGroupInfo, TelegramGroupResponse,
     RegisterGroupsRequest, RegisterGroupsResponse,
     MessagesListResponse, MessageResponse,
-    UserResponse, GroupVisibility
+    UserResponse, GroupVisibility, UserRole
 )
 from app.auth import get_current_user, get_current_admin_user
-from app.database import get_db
+from app.database import db
 from app.telegram_client import telegram_manager
 
 
 router = APIRouter(prefix="/groups", tags=["Groups"])
+
+
+async def _filter_accessible_group_ids(group_ids: list, current_user: UserResponse) -> list:
+    """Return only group IDs the user is allowed to access (public or member of private)."""
+    if not group_ids:
+        return []
+    int_ids = [int(gid) for gid in group_ids]
+    rows = await db.fetch(
+        "SELECT id, visibility FROM groups WHERE id = ANY($1::bigint[])", int_ids
+    )
+    if not rows:
+        return []
+
+    public_ids = []
+    private_ids = []
+    for g in rows:
+        if g["visibility"] == GroupVisibility.PRIVATE.value:
+            private_ids.append(g["id"])
+        else:
+            public_ids.append(g["id"])
+
+    accessible = [str(gid) for gid in public_ids]
+
+    if private_ids:
+        membership_rows = await db.fetch(
+            "SELECT group_id FROM user_groups WHERE user_id = $1 AND group_id = ANY($2::bigint[])",
+            current_user.id, private_ids,
+        )
+        accessible.extend(str(m["group_id"]) for m in membership_rows)
+
+    return accessible
 
 
 def _db_group_to_api(g: Dict) -> Dict:
@@ -52,7 +82,6 @@ def _db_group_to_api(g: Dict) -> Dict:
 @router.get("/my-telegram-groups", response_model=List[TelegramGroupInfo])
 async def get_my_groups(
     current_user: UserResponse = Depends(get_current_user),
-    db = Depends(get_db)
 ):
     """Get all Telegram groups user is member of"""
     try:
@@ -60,8 +89,8 @@ async def get_my_groups(
         groups = await telegram_manager.get_user_groups(current_user.id)
 
         # Get registered group IDs from database (groups.id = telegram group ID)
-        registered_response = await asyncio.to_thread(lambda: db.table("groups").select("id").execute())
-        registered_ids = {g["id"] for g in registered_response.data} if registered_response.data else set()
+        rows = await db.fetch("SELECT id FROM groups")
+        registered_ids = {r["id"] for r in rows}
 
         # Mark registered groups
         result = []
@@ -82,7 +111,6 @@ async def get_my_groups(
 async def register_groups(
     request: RegisterGroupsRequest,
     current_user: UserResponse = Depends(get_current_user),
-    db = Depends(get_db)
 ):
     """Register selected groups"""
     try:
@@ -92,48 +120,42 @@ async def register_groups(
             telegram_id = group_data.telegram_id
 
             # Check if group already exists (groups.id = telegram group ID)
-            existing = await asyncio.to_thread(lambda tid=telegram_id: db.table("groups").select("id").eq("id", tid).execute())
-
-            if existing.data and len(existing.data) > 0:
+            existing = await db.fetchrow("SELECT id FROM groups WHERE id = $1", telegram_id)
+            if existing:
                 continue
 
-            # Insert group (map API fields → DB columns)
-            # DB uses: name, type (not title, group_type)
-            group_insert = {
-                "id": telegram_id,
-                "name": group_data.title,
-                "type": group_data.group_type or "group",
-                "member_count": group_data.member_count,
-                "visibility": group_data.visibility or GroupVisibility.PUBLIC.value,
-                "registered_by": current_user.id,
-                "crawl_enabled": True,
-            }
+            # Wrap all per-group DB ops in a transaction to prevent orphaned rows
+            async with db.pool.acquire() as conn:
+                async with conn.transaction():
+                    # Insert group (map API fields → DB columns)
+                    await conn.execute(
+                        """INSERT INTO groups (id, name, type, member_count, visibility, registered_by, crawl_enabled)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                        telegram_id,
+                        group_data.title,
+                        group_data.group_type or "group",
+                        group_data.member_count,
+                        group_data.visibility or GroupVisibility.PUBLIC.value,
+                        current_user.id,
+                        True,
+                    )
 
-            new_group = await asyncio.to_thread(lambda gi=group_insert: db.table("groups").insert(gi).execute())
-            group_id = new_group.data[0]["id"]
+                    # Add to user's group membership
+                    await conn.execute(
+                        "INSERT INTO user_groups (user_id, group_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                        current_user.id, telegram_id,
+                    )
 
-            # Add to user's group membership
-            await asyncio.to_thread(lambda uid=current_user.id, gid=group_id: db.table("user_groups").insert({
-                "user_id": uid,
-                "group_id": gid,
-            }).execute())
+                    # Create crawler_status row for this group
+                    await conn.execute(
+                        """INSERT INTO crawler_status (group_id, status, is_enabled, error_count, initial_crawl_progress, initial_crawl_total)
+                           VALUES ($1, 'inactive', TRUE, 0, 0, 0) ON CONFLICT (group_id) DO NOTHING""",
+                        telegram_id,
+                    )
 
-            # Create crawler_status row for this group
-            try:
-                await asyncio.to_thread(lambda gid=group_id: db.table("crawler_status").insert({
-                    "group_id": gid,
-                    "status": "inactive",
-                    "is_enabled": True,
-                    "error_count": 0,
-                    "initial_crawl_progress": 0,
-                    "initial_crawl_total": 0,
-                }).execute())
-            except Exception:
-                pass  # crawler_status table may not exist yet
-
-            # Build API response from the inserted row
-            updated = await asyncio.to_thread(lambda gid=group_id: db.table("groups").select("*").eq("id", gid).execute())
-            registered_groups.append(TelegramGroupResponse(**_db_group_to_api(updated.data[0])))
+            # Build API response from the inserted row (outside txn — read committed)
+            updated = await db.fetchrow("SELECT * FROM groups WHERE id = $1", telegram_id)
+            registered_groups.append(TelegramGroupResponse(**_db_group_to_api(dict(updated))))
 
         return RegisterGroupsResponse(
             success=True,
@@ -149,19 +171,21 @@ async def register_groups(
 @router.get("/registered", response_model=List[TelegramGroupResponse])
 async def get_registered_groups(
     current_user: UserResponse = Depends(get_current_user),
-    db = Depends(get_db)
 ):
     """Get user's registered groups"""
     try:
-        follows = await asyncio.to_thread(lambda: db.table("user_groups").select("group_id").eq("user_id", current_user.id).execute())
-
-        if not follows.data or len(follows.data) == 0:
+        follows = await db.fetch(
+            "SELECT group_id FROM user_groups WHERE user_id = $1", current_user.id
+        )
+        if not follows:
             return []
 
-        group_ids = [f["group_id"] for f in follows.data]
-        groups = await asyncio.to_thread(lambda: db.table("groups").select("*").in_("id", group_ids).execute())
+        group_ids = [f["group_id"] for f in follows]
+        groups = await db.fetch(
+            "SELECT * FROM groups WHERE id = ANY($1::bigint[])", group_ids
+        )
 
-        return [TelegramGroupResponse(**_db_group_to_api(g)) for g in groups.data] if groups.data else []
+        return [TelegramGroupResponse(**_db_group_to_api(dict(g))) for g in groups]
     except Exception as e:
         logger.error("Groups API error: %s", e)
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -174,7 +198,6 @@ async def get_aggregated_messages(
     page_size: int = Query(50, ge=1, le=100),
     topic_id: int = Query(None),
     current_user: UserResponse = Depends(get_current_user),
-    db = Depends(get_db)
 ):
     """Get messages from multiple groups in a single request."""
     try:
@@ -182,22 +205,38 @@ async def get_aggregated_messages(
         if not ids:
             return MessagesListResponse(messages=[], total=0, page=page, page_size=page_size, has_more=False)
 
+        # IDOR fix: filter out groups the user cannot access
+        ids = await _filter_accessible_group_ids(ids, current_user)
+        if not ids:
+            return MessagesListResponse(messages=[], total=0, page=page, page_size=page_size, has_more=False)
+
+        int_ids = [int(i) for i in ids]
         offset = (page - 1) * page_size
 
-        count_q = db.table("messages").select("id", count="exact").in_("group_id", ids).eq("is_deleted", False)
-        msg_q = db.table("messages").select("*").in_("group_id", ids).eq("is_deleted", False)
-
         if topic_id is not None:
-            count_q = count_q.eq("topic_id", topic_id)
-            msg_q = msg_q.eq("topic_id", topic_id)
+            total = await db.fetchval(
+                "SELECT COUNT(*) FROM messages WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE AND topic_id = $2",
+                int_ids, topic_id,
+            )
+            messages_rows = await db.fetch(
+                """SELECT * FROM messages
+                   WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE AND topic_id = $2
+                   ORDER BY sent_at DESC LIMIT $3 OFFSET $4""",
+                int_ids, topic_id, page_size, offset,
+            )
+        else:
+            total = await db.fetchval(
+                "SELECT COUNT(*) FROM messages WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE",
+                int_ids,
+            )
+            messages_rows = await db.fetch(
+                """SELECT * FROM messages
+                   WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE
+                   ORDER BY sent_at DESC LIMIT $2 OFFSET $3""",
+                int_ids, page_size, offset,
+            )
 
-        count_response, messages_response = await asyncio.gather(
-            asyncio.to_thread(lambda: count_q.execute()),
-            asyncio.to_thread(lambda: msg_q.order("sent_at", desc=True).range(offset, offset + page_size - 1).execute()),
-        )
-
-        total = count_response.count if hasattr(count_response, 'count') and count_response.count else 0
-        messages = [MessageResponse(**m) for m in messages_response.data] if messages_response.data else []
+        messages = [MessageResponse(**dict(m)) for m in messages_rows]
 
         return MessagesListResponse(
             messages=messages, total=total, page=page, page_size=page_size,
@@ -212,25 +251,37 @@ async def get_aggregated_messages(
 async def get_group_topics(
     group_id: str,
     current_user: UserResponse = Depends(get_current_user),
-    db = Depends(get_db)
 ):
     """Get topics/threads for a group (Telegram forum groups)"""
     try:
-        group_response = await asyncio.to_thread(lambda: db.table("groups").select("id").eq("id", group_id).execute())
-        if not group_response.data:
+        gid = int(group_id)
+        group = await db.fetchrow("SELECT id, visibility FROM groups WHERE id = $1", gid)
+        if not group:
             raise HTTPException(status_code=404, detail="Group not found")
 
-        # Query topics from recent messages (limit to 5000 to avoid memory issues on large groups)
-        topics_response = await asyncio.to_thread(lambda: db.table("messages").select(
-            "topic_id"
-        ).eq("group_id", group_id).eq("is_deleted", False).not_.is_("topic_id", "null").order("sent_at", desc=True).limit(5000).execute())
+        # IDOR fix: check private group membership
+        if group["visibility"] == GroupVisibility.PRIVATE.value:
+            access = await db.fetchrow(
+                "SELECT id FROM user_groups WHERE user_id = $1 AND group_id = $2",
+                current_user.id, gid,
+            )
+            if not access:
+                raise HTTPException(status_code=403, detail="Access denied: Private group")
 
-        if not topics_response.data:
+        # Query topics from recent messages (limit to 5000 to avoid memory issues)
+        topics_rows = await db.fetch(
+            """SELECT topic_id FROM messages
+               WHERE group_id = $1 AND is_deleted = FALSE AND topic_id IS NOT NULL
+               ORDER BY sent_at DESC LIMIT 5000""",
+            gid,
+        )
+
+        if not topics_rows:
             return []
 
         # Deduplicate and count messages per topic
         topic_map: Dict[int, dict] = {}
-        for row in topics_response.data:
+        for row in topics_rows:
             tid = row["topic_id"]
             if tid not in topic_map:
                 topic_map[tid] = {
@@ -255,42 +306,51 @@ async def get_group_messages(
     page_size: int = Query(50, ge=1, le=100),
     topic_id: int = Query(None, description="Filter by topic ID"),
     current_user: UserResponse = Depends(get_current_user),
-    db = Depends(get_db)
 ):
     """Get messages from a specific group"""
     try:
-        group_response = await asyncio.to_thread(lambda: db.table("groups").select("visibility").eq("id", group_id).execute())
-        if not group_response.data:
+        gid = int(group_id)
+        group = await db.fetchrow("SELECT visibility FROM groups WHERE id = $1", gid)
+        if not group:
             raise HTTPException(status_code=404, detail="Group not found")
 
-        group = group_response.data[0]
-
         if group["visibility"] == GroupVisibility.PRIVATE.value:
-            access_response = await asyncio.to_thread(lambda: db.table("user_groups").select("id").eq("user_id", current_user.id).eq("group_id", group_id).execute())
-            if not access_response.data:
+            access = await db.fetchrow(
+                "SELECT id FROM user_groups WHERE user_id = $1 AND group_id = $2",
+                current_user.id, gid,
+            )
+            if not access:
                 raise HTTPException(status_code=403, detail="Access denied: Private group")
 
         offset = (page - 1) * page_size
 
-        count_q = db.table("messages").select("id", count="exact").eq("group_id", group_id).eq("is_deleted", False)
-        msg_q = db.table("messages").select("*").eq("group_id", group_id).eq("is_deleted", False)
-
         if topic_id is not None:
-            count_q = count_q.eq("topic_id", topic_id)
-            msg_q = msg_q.eq("topic_id", topic_id)
+            total = await db.fetchval(
+                "SELECT COUNT(*) FROM messages WHERE group_id = $1 AND is_deleted = FALSE AND topic_id = $2",
+                gid, topic_id,
+            )
+            messages_rows = await db.fetch(
+                """SELECT * FROM messages
+                   WHERE group_id = $1 AND is_deleted = FALSE AND topic_id = $2
+                   ORDER BY sent_at DESC LIMIT $3 OFFSET $4""",
+                gid, topic_id, page_size, offset,
+            )
+        else:
+            total = await db.fetchval(
+                "SELECT COUNT(*) FROM messages WHERE group_id = $1 AND is_deleted = FALSE",
+                gid,
+            )
+            messages_rows = await db.fetch(
+                """SELECT * FROM messages
+                   WHERE group_id = $1 AND is_deleted = FALSE
+                   ORDER BY sent_at DESC LIMIT $2 OFFSET $3""",
+                gid, page_size, offset,
+            )
 
-        count_response = await asyncio.to_thread(lambda: count_q.execute())
-        total = count_response.count if hasattr(count_response, 'count') else 0
-
-        messages_response = await asyncio.to_thread(lambda: msg_q.order("sent_at", desc=True).range(offset, offset + page_size - 1).execute())
-
-        messages = [MessageResponse(**m) for m in messages_response.data] if messages_response.data else []
+        messages = [MessageResponse(**dict(m)) for m in messages_rows]
 
         return MessagesListResponse(
-            messages=messages,
-            total=total,
-            page=page,
-            page_size=page_size,
+            messages=messages, total=total, page=page, page_size=page_size,
             has_more=offset + page_size < total,
         )
     except HTTPException:
@@ -304,24 +364,25 @@ async def get_group_messages(
 async def get_group(
     group_id: str,
     current_user: UserResponse = Depends(get_current_user),
-    db = Depends(get_db)
 ):
     """Get a single group by ID"""
     try:
-        group_response = await asyncio.to_thread(lambda: db.table("groups").select("*").eq("id", group_id).execute())
-
-        if not group_response.data or len(group_response.data) == 0:
+        gid = int(group_id)
+        group = await db.fetchrow("SELECT * FROM groups WHERE id = $1", gid)
+        if not group:
             raise HTTPException(status_code=404, detail="Group not found")
 
-        group = group_response.data[0]
-
-        if group["visibility"] == GroupVisibility.PRIVATE.value:
-            if group["registered_by"] != current_user.id:
-                follow = await asyncio.to_thread(lambda: db.table("user_groups").select("id").eq("user_id", current_user.id).eq("group_id", group_id).execute())
-                if not follow.data:
+        g = dict(group)
+        if g["visibility"] == GroupVisibility.PRIVATE.value:
+            if g["registered_by"] != current_user.id:
+                follow = await db.fetchrow(
+                    "SELECT id FROM user_groups WHERE user_id = $1 AND group_id = $2",
+                    current_user.id, gid,
+                )
+                if not follow:
                     raise HTTPException(status_code=403, detail="Access denied")
 
-        return TelegramGroupResponse(**_db_group_to_api(group))
+        return TelegramGroupResponse(**_db_group_to_api(g))
     except HTTPException:
         raise
     except Exception as e:
@@ -333,18 +394,23 @@ async def get_group(
 async def get_invite_links(
     group_id: str,
     current_user: UserResponse = Depends(get_current_user),
-    db = Depends(get_db)
 ):
     """Get all invite links for a group"""
     try:
-        group = await asyncio.to_thread(lambda: db.table("groups").select("*").eq("id", group_id).eq("registered_by", current_user.id).execute())
-
-        if not group.data:
+        gid = int(group_id)
+        group = await db.fetchrow(
+            "SELECT id FROM groups WHERE id = $1 AND registered_by = $2",
+            gid, current_user.id,
+        )
+        if not group:
             raise HTTPException(status_code=404, detail="Group not found or you don't have permission")
 
-        invites = await asyncio.to_thread(lambda: db.table("private_group_invites").select("*").eq("group_id", group_id).order("created_at", desc=True).execute())
+        invites = await db.fetch(
+            "SELECT * FROM private_group_invites WHERE group_id = $1 ORDER BY created_at DESC",
+            gid,
+        )
 
-        return invites.data if invites.data else []
+        return [dict(i) for i in invites]
     except HTTPException:
         raise
     except Exception as e:
@@ -358,32 +424,31 @@ async def create_invite_link(
     expires_at: str = None,
     max_uses: int = None,
     current_user: UserResponse = Depends(get_current_user),
-    db = Depends(get_db)
 ):
     """Create an invite link for a private group"""
     try:
-        group = await asyncio.to_thread(lambda: db.table("groups").select("*").eq("id", group_id).eq("registered_by", current_user.id).execute())
-
-        if not group.data:
+        gid = int(group_id)
+        group = await db.fetchrow(
+            "SELECT id, visibility FROM groups WHERE id = $1 AND registered_by = $2",
+            gid, current_user.id,
+        )
+        if not group:
             raise HTTPException(status_code=404, detail="Group not found or you don't have permission")
 
-        group_data_row = group.data[0]
-
-        if group_data_row["visibility"] != GroupVisibility.PRIVATE.value:
+        if group["visibility"] != GroupVisibility.PRIVATE.value:
             raise HTTPException(status_code=400, detail="Can only create invite links for private groups")
 
         token = secrets.token_urlsafe(32)
 
-        invite_data = {
-            "group_id": group_id,
-            "token": token,
-            "created_by": current_user.id,
-            "expires_at": expires_at,
-            "max_uses": max_uses,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+        expires_ts = None
+        if expires_at:
+            expires_ts = datetime.fromisoformat(expires_at)
 
-        await asyncio.to_thread(lambda: db.table("private_group_invites").insert(invite_data).execute())
+        await db.execute(
+            """INSERT INTO private_group_invites (group_id, token, created_by, expires_at, max_uses)
+               VALUES ($1, $2, $3, $4, $5)""",
+            gid, token, current_user.id, expires_ts, max_uses,
+        )
 
         return {
             "success": True,
@@ -403,28 +468,25 @@ async def create_invite_link(
 async def accept_invite(
     token: str,
     current_user: UserResponse = Depends(get_current_user),
-    db = Depends(get_db)
 ):
     """Accept an invite link and gain access to private group"""
     try:
-        invite = await asyncio.to_thread(lambda: db.table("private_group_invites").select("*").eq("token", token).single().execute())
-
-        if not invite.data:
+        invite = await db.fetchrow(
+            "SELECT * FROM private_group_invites WHERE token = $1", token
+        )
+        if not invite:
             raise HTTPException(status_code=404, detail="Invite not found")
 
-        invite_data = invite.data
+        invite_data = dict(invite)
 
         if invite_data.get("is_revoked"):
             raise HTTPException(status_code=400, detail="Invite link has been revoked")
 
         if invite_data.get("expires_at"):
-            expires_at = datetime.fromisoformat(invite_data["expires_at"])
-            if datetime.now(timezone.utc) > expires_at:
+            if datetime.now(timezone.utc) > invite_data["expires_at"]:
                 raise HTTPException(status_code=400, detail="Invite link has expired")
 
         # Atomic increment: only increment used_count if below max_uses.
-        # This prevents TOCTOU race where two concurrent accepts both pass
-        # the max_uses check and both succeed.
         current_count = invite_data.get("used_count", 0)
         max_uses = invite_data.get("max_uses")
 
@@ -432,21 +494,20 @@ async def accept_invite(
             raise HTTPException(status_code=400, detail="Invite link has reached maximum uses")
 
         # Atomic conditional update: only succeeds if used_count hasn't changed
-        update_result = await asyncio.to_thread(lambda: db.table("private_group_invites").update({
-            "used_count": current_count + 1,
-        }).eq("id", invite_data["id"]).eq("used_count", current_count).execute())
+        update_result = await db.fetchrow(
+            """UPDATE private_group_invites SET used_count = $1
+               WHERE id = $2 AND used_count = $3 RETURNING id""",
+            current_count + 1, invite_data["id"], current_count,
+        )
 
-        if not update_result.data:
-            # Another request incremented first — retry check
+        if not update_result:
             raise HTTPException(status_code=409, detail="Invite was used concurrently, please try again")
 
-        existing = await asyncio.to_thread(lambda: db.table("user_groups").select("id").eq("user_id", current_user.id).eq("group_id", invite_data["group_id"]).execute())
-
-        if not existing.data:
-            await asyncio.to_thread(lambda: db.table("user_groups").insert({
-                "user_id": current_user.id,
-                "group_id": invite_data["group_id"],
-            }).execute())
+        # Add user to group if not already a member
+        await db.execute(
+            "INSERT INTO user_groups (user_id, group_id) VALUES ($1, $2) ON CONFLICT (user_id, group_id) DO NOTHING",
+            current_user.id, invite_data["group_id"],
+        )
 
         return {"success": True, "group_id": invite_data["group_id"]}
     except HTTPException:
@@ -461,21 +522,24 @@ async def revoke_invite_link(
     group_id: str,
     invite_id: str,
     current_user: UserResponse = Depends(get_current_user),
-    db = Depends(get_db)
 ):
     """Revoke an invite link"""
     try:
-        group = await asyncio.to_thread(lambda: db.table("groups").select("*").eq("id", group_id).eq("registered_by", current_user.id).execute())
-
-        if not group.data:
+        gid = int(group_id)
+        group = await db.fetchrow(
+            "SELECT id FROM groups WHERE id = $1 AND registered_by = $2",
+            gid, current_user.id,
+        )
+        if not group:
             raise HTTPException(status_code=404, detail="Group not found or you don't have permission")
 
-        result = await asyncio.to_thread(lambda: db.table("private_group_invites").update({
-            "is_revoked": True,
-            "revoked_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", invite_id).eq("group_id", group_id).execute())
+        result = await db.fetchrow(
+            """UPDATE private_group_invites SET is_revoked = TRUE, revoked_at = $1
+               WHERE id = $2 AND group_id = $3 RETURNING id""",
+            datetime.now(timezone.utc), invite_id, gid,
+        )
 
-        if not result.data:
+        if not result:
             raise HTTPException(status_code=404, detail="Invite not found")
 
         return {"success": True}
@@ -491,24 +555,22 @@ async def update_group_visibility(
     group_id: str,
     visibility: GroupVisibility = Query(...),
     current_user: UserResponse = Depends(get_current_user),
-    db = Depends(get_db)
 ):
     """Update group visibility (public/private)"""
     try:
-        # Allow owner or admin to change visibility
-        group = await asyncio.to_thread(lambda: db.table("groups").select("*").eq("id", group_id).execute())
-
-        if not group.data:
+        gid = int(group_id)
+        group = await db.fetchrow("SELECT * FROM groups WHERE id = $1", gid)
+        if not group:
             raise HTTPException(status_code=404, detail="Group not found")
 
-        group_row = group.data[0]
-
-        if group_row["registered_by"] != current_user.id and current_user.role != "admin":
+        g = dict(group)
+        if g["registered_by"] != current_user.id and current_user.role != UserRole.ADMIN:
             raise HTTPException(status_code=403, detail="Only the owner or an admin can change visibility")
 
-        await asyncio.to_thread(lambda: db.table("groups").update({
-            "visibility": visibility.value,
-        }).eq("id", group_id).execute())
+        await db.execute(
+            "UPDATE groups SET visibility = $1 WHERE id = $2",
+            visibility.value, gid,
+        )
 
         return {"success": True, "visibility": visibility.value}
     except HTTPException:
@@ -522,25 +584,23 @@ async def update_group_visibility(
 async def delete_group(
     group_id: str,
     current_user: UserResponse = Depends(get_current_user),
-    db = Depends(get_db)
 ):
     """Delete a group (private groups: owner only, public groups: admin only)"""
     try:
-        group = await asyncio.to_thread(lambda: db.table("groups").select("*").eq("id", group_id).execute())
-
-        if not group.data:
+        gid = int(group_id)
+        group = await db.fetchrow("SELECT * FROM groups WHERE id = $1", gid)
+        if not group:
             raise HTTPException(status_code=404, detail="Group not found")
 
-        group_row = group.data[0]
-
-        if group_row["visibility"] == GroupVisibility.PRIVATE.value:
-            if group_row["registered_by"] != current_user.id:
+        g = dict(group)
+        if g["visibility"] == GroupVisibility.PRIVATE.value:
+            if g["registered_by"] != current_user.id:
                 raise HTTPException(status_code=403, detail="Only the group owner can delete private groups")
         else:
-            if current_user.role != "admin":
+            if current_user.role != UserRole.ADMIN:
                 raise HTTPException(status_code=403, detail="Only admins can delete public groups")
 
-        await asyncio.to_thread(lambda: db.table("groups").delete().eq("id", group_id).execute())
+        await db.execute("DELETE FROM groups WHERE id = $1", gid)
 
         return {"success": True}
     except HTTPException:

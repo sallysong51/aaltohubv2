@@ -78,7 +78,7 @@ cp client/.env.example client/.env.local
 
 ### 3. 데이터베이스 스키마 적용
 
-Supabase Dashboard → SQL Editor에서 `supabase/schema.sql` 실행
+Supabase Dashboard → SQL Editor에서 `supabase/schema_actual.sql` 실행
 
 ### 4. 백엔드 실행
 
@@ -142,7 +142,7 @@ AALTOHUBv2/
 │   ├── index.html
 │   └── package.json
 ├── supabase/
-│   └── schema.sql          # 데이터베이스 스키마
+│   └── schema_actual.sql          # 데이터베이스 스키마
 ├── systemd/                # systemd 서비스 파일
 │   ├── aaltohub-api.service
 │   └── aaltohub-crawler.service

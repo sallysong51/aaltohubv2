@@ -69,6 +69,15 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     return () => { cancelled = true; };
   }, []);
 
+  // Listen for forced logout from API interceptor (avoids full page reload)
+  useEffect(() => {
+    const handleForcedLogout = () => {
+      setUser(null);
+    };
+    window.addEventListener('auth:logout', handleForcedLogout);
+    return () => window.removeEventListener('auth:logout', handleForcedLogout);
+  }, []);
+
   const login = (accessToken: string, refreshToken: string, userData: User) => {
     setAuthTokens(accessToken, refreshToken, userData);
     setUser(userData);

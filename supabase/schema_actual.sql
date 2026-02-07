@@ -5,6 +5,9 @@
 -- Key design decisions:
 --   - users.id is BIGSERIAL (not UUID) — matches application code
 --   - groups.id is the Telegram group ID directly (BIGINT)
+--     NOTE: Telegram supergroup migration changes group IDs. If this happens,
+--     a migration script must update groups.id and all FK references.
+--     Consider adding a stable internal UUID PK in a future schema revision.
 --   - messages table is NOT partitioned (single default partition had zero benefit)
 --   - RLS blocks all direct anon access (app uses custom JWT, not Supabase Auth)
 --   - Service role key (backend) bypasses RLS automatically
@@ -29,6 +32,43 @@ CREATE TABLE IF NOT EXISTS users (
 
 -- telegram_id already has a UNIQUE index; idx_users_telegram_id is redundant — removed
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+
+-- ============================================================
+-- Admin Credentials Table (Multi-Admin Support)
+-- Stores phone numbers and usernames that have admin access
+-- ============================================================
+CREATE TABLE IF NOT EXISTS admin_credentials (
+    id BIGSERIAL PRIMARY KEY,
+    phone_number TEXT UNIQUE,
+    username TEXT UNIQUE,
+    added_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT at_least_one_credential CHECK (
+        phone_number IS NOT NULL OR username IS NOT NULL
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_credentials_phone ON admin_credentials(phone_number) WHERE phone_number IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_admin_credentials_username ON admin_credentials(username) WHERE username IS NOT NULL;
+
+-- RLS and policies for admin_credentials
+ALTER TABLE admin_credentials ENABLE ROW LEVEL SECURITY;
+
+-- Policy: All authenticated users can read (needed for auth checks)
+CREATE POLICY IF NOT EXISTS "admin_credentials_readable" ON admin_credentials
+    FOR SELECT TO authenticated USING (true);
+
+-- Policy: Only admins can insert
+CREATE POLICY IF NOT EXISTS "admin_credentials_admin_insert" ON admin_credentials
+    FOR INSERT TO authenticated WITH CHECK (
+        EXISTS(SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin')
+    );
+
+-- Policy: Only admins can delete
+CREATE POLICY IF NOT EXISTS "admin_credentials_admin_delete" ON admin_credentials
+    FOR DELETE TO authenticated USING (
+        EXISTS(SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin')
+    );
 
 -- ============================================================
 -- Telethon Sessions Table (Encrypted)
@@ -121,8 +161,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_not_deleted ON messages(group_id, sent_a
 CREATE INDEX IF NOT EXISTS idx_messages_retention ON messages(sent_at) WHERE sent_at IS NOT NULL;
 -- For topic filtering
 CREATE INDEX IF NOT EXISTS idx_messages_topic_id ON messages(topic_id) WHERE topic_id IS NOT NULL;
--- Full-text search (handles NULL content safely)
-CREATE INDEX IF NOT EXISTS idx_messages_content_fts ON messages USING GIN (to_tsvector('english', COALESCE(content, '')));
+-- Full-text search index REMOVED — no query uses to_tsvector/@@, and the GIN
+-- index adds ~30% write overhead on every INSERT. Re-add when FTS is implemented:
+--   CREATE INDEX idx_messages_content_fts ON messages USING GIN (to_tsvector('english', COALESCE(content, '')));
 
 -- ============================================================
 -- Private Group Invites Table
@@ -211,6 +252,7 @@ CREATE TABLE IF NOT EXISTS failed_messages (
 CREATE INDEX IF NOT EXISTS idx_failed_messages_created_at ON failed_messages(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_failed_messages_resolved ON failed_messages(resolved) WHERE NOT resolved;
 CREATE INDEX IF NOT EXISTS idx_failed_messages_group_id ON failed_messages(group_id);
+CREATE INDEX IF NOT EXISTS idx_failed_messages_telegram_msg_id ON failed_messages(telegram_message_id);
 
 -- Standalone index on messages.group_id (for queries including deleted messages)
 CREATE INDEX IF NOT EXISTS idx_messages_group_id ON messages(group_id);
@@ -226,7 +268,8 @@ CREATE TABLE IF NOT EXISTS revoked_tokens (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_revoked_tokens_jti ON revoked_tokens(jti);
+-- idx_revoked_tokens_jti REMOVED — redundant with the UNIQUE constraint on jti,
+-- which already creates an implicit unique index.
 CREATE INDEX IF NOT EXISTS idx_revoked_tokens_expires_at ON revoked_tokens(expires_at);
 
 -- ============================================================
@@ -259,7 +302,8 @@ CREATE TRIGGER update_entity_cache_updated_at BEFORE UPDATE ON entity_cache
 -- ============================================================
 -- Message Retention Cleanup Function (14-day policy)
 -- ============================================================
--- Can be called via pg_cron if available:
+-- Cleanup is handled by the FastAPI backend (main.py cleanup_old_messages task).
+-- The pg_cron schedule below is optional redundancy if pg_cron is available:
 --   SELECT cron.schedule('cleanup-old-messages', '0 * * * *',
 --     $$SELECT cleanup_old_messages()$$);
 
@@ -330,5 +374,7 @@ ALTER TABLE revoked_tokens ENABLE ROW LEVEL SECURITY;
 -- ============================================================
 -- Messages use Supabase Broadcast API (pushed from backend), NOT Postgres Changes,
 -- to avoid single-thread WAL replication bottleneck.
--- Only crawler_status uses Postgres Changes for real-time status updates.
-ALTER PUBLICATION supabase_realtime ADD TABLE crawler_status;
+-- crawler_status is NOT published — the admin UI polls on a 30s interval,
+-- and Postgres Changes WAL traffic adds cost with no benefit.
+-- If you previously added crawler_status, remove it:
+--   ALTER PUBLICATION supabase_realtime DROP TABLE IF EXISTS crawler_status;

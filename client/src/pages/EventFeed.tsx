@@ -1,7 +1,7 @@
 /**
  * Event Feed Page
  * Shows aggregated messages from all registered groups
- * Uses Supabase Realtime for instant message updates + polling fallback
+ * Uses SSE (Server-Sent Events) via Postgres LISTEN/NOTIFY for instant updates + polling fallback
  */
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useLocation } from 'wouter';
@@ -10,17 +10,16 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { toast } from 'sonner';
 import { Loader2, Calendar, Users, Settings, MessageSquare, Globe, RefreshCw, Zap, LayoutDashboard } from 'lucide-react';
-import { groupsApi, RegisteredGroup, Message, getApiErrorMessage } from '@/lib/api';
+import { groupsApi, RegisteredGroup, Message, getApiErrorMessage, SSE_BASE_URL } from '@/lib/api';
 import ProtectedRoute from '@/components/ProtectedRoute';
 import { useAuth } from '@/contexts/AuthContext';
 import TopicFilter from '@/components/TopicFilter';
-import supabase from '@/lib/supabase';
 
 const FALLBACK_POLLING_INTERVAL = 60_000; // 60 seconds (Realtime is primary)
 
 function EventFeedContent() {
   const [, setLocation] = useLocation();
-  const { user, logout } = useAuth();
+  const { user, logout, isLoading: isAuthLoading } = useAuth();
   const [groups, setGroups] = useState<RegisteredGroup[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
@@ -69,63 +68,76 @@ function EventFeedContent() {
     [groups]
   );
 
-  // Supabase Realtime subscription for instant message updates
+  // SSE (Server-Sent Events) subscription — single persistent connection to backend
+  // Replaces Supabase Realtime per-group channels. Uses Postgres LISTEN/NOTIFY on backend.
+  // EventSource auto-reconnects on disconnect (browser built-in).
   useEffect(() => {
     if (groups.length === 0) return;
 
-    const groupIds = new Set(groups.map(g => String(g.id)));
+    const token = localStorage.getItem('access_token');
+    if (!token) return;
 
-    const channel = supabase
-      .channel('messages')
-      .on(
-        'broadcast',
-        { event: 'insert' },
-        ({ payload: newMsg }: { payload: Message }) => {
-          if (!newMsg || !newMsg.group_id) return;
-          // Only add if it belongs to one of the user's groups
-          if (!groupIds.has(String(newMsg.group_id))) return;
-          // Filter by selected group
-          if (selectedGroupIdRef.current && String(newMsg.group_id) !== String(selectedGroupIdRef.current)) return;
-          // Filter by selected topic
-          if (selectedTopicIdRef.current !== null && newMsg.topic_id !== selectedTopicIdRef.current) return;
-          // Skip deleted messages
-          if (newMsg.is_deleted) return;
+    const groupIds = groups.map(g => String(g.id)).join(',');
+    const url = `${SSE_BASE_URL}/api/events/stream?token=${encodeURIComponent(token)}&groups=${encodeURIComponent(groupIds)}`;
+    const es = new EventSource(url);
 
-          setMessages(prev => {
-            // Deduplicate by telegram_message_id + group_id (id may not be available from broadcast)
-            if (prev.some(m => m.telegram_message_id === newMsg.telegram_message_id && m.group_id === newMsg.group_id)) return prev;
-            // Insert at the top (newest first)
-            return [newMsg, ...prev];
-          });
-          setLastUpdated(new Date());
-        }
-      )
-      .on(
-        'broadcast',
-        { event: 'update' },
-        ({ payload: updated }: { payload: Message }) => {
-          if (!updated || !groupIds.has(String(updated.group_id))) return;
+    es.addEventListener('insert', (e: MessageEvent) => {
+      try {
+        const newMsg: Message = JSON.parse(e.data);
+        if (!newMsg || !newMsg.group_id) return;
+        if (selectedGroupIdRef.current && String(newMsg.group_id) !== String(selectedGroupIdRef.current)) return;
+        if (selectedTopicIdRef.current !== null && newMsg.topic_id !== selectedTopicIdRef.current) return;
+        if (newMsg.is_deleted) return;
 
-          setMessages(prev =>
-            updated.is_deleted
-              ? prev.filter(m => !(m.telegram_message_id === updated.telegram_message_id && m.group_id === updated.group_id))
-              : prev.map(m => (m.telegram_message_id === updated.telegram_message_id && m.group_id === updated.group_id) ? { ...m, ...updated } : m)
-          );
-        }
-      )
-      .subscribe((status) => {
-        setRealtimeConnected(status === 'SUBSCRIBED');
-      });
+        setMessages(prev => {
+          if (prev.some(m => m.telegram_message_id === newMsg.telegram_message_id && m.group_id === newMsg.group_id)) return prev;
+          const updated = [newMsg, ...prev];
+          return updated.length > 500 ? updated.slice(0, 500) : updated;
+        });
+        setLastUpdated(new Date());
+      } catch (err) {
+        console.error('[EventFeed] SSE insert handler error:', err);
+      }
+    });
+
+    es.addEventListener('update', (e: MessageEvent) => {
+      try {
+        const updated: Message = JSON.parse(e.data);
+        if (!updated) return;
+        setMessages(prev =>
+          updated.is_deleted
+            ? prev.filter(m => !(m.telegram_message_id === updated.telegram_message_id && String(m.group_id) === String(updated.group_id)))
+            : prev.map(m => (m.telegram_message_id === updated.telegram_message_id && String(m.group_id) === String(updated.group_id)) ? { ...m, ...updated } : m)
+        );
+      } catch (err) {
+        console.error('[EventFeed] SSE update handler error:', err);
+      }
+    });
+
+    es.addEventListener('delete', (e: MessageEvent) => {
+      try {
+        const deleted: { telegram_message_id: number; group_id: string } = JSON.parse(e.data);
+        if (!deleted) return;
+        setMessages(prev =>
+          prev.filter(m => !(m.telegram_message_id === deleted.telegram_message_id && String(m.group_id) === String(deleted.group_id)))
+        );
+      } catch (err) {
+        console.error('[EventFeed] SSE delete handler error:', err);
+      }
+    });
+
+    es.onopen = () => setRealtimeConnected(true);
+    es.onerror = () => setRealtimeConnected(false);
 
     return () => {
-      supabase.removeChannel(channel);
+      es.close();
       setRealtimeConnected(false);
     };
   }, [groupIdsKey]);
 
-  // Fallback polling (only when on page 1, less frequent since Realtime is primary)
+  // Fallback polling — disabled when realtime is connected to avoid redundant traffic (P2-4.15)
   useEffect(() => {
-    if (groups.length === 0 || page > 1) return;
+    if (groups.length === 0 || page > 1 || realtimeConnected) return;
 
     intervalRef.current = setInterval(() => {
       silentRefresh();
@@ -134,7 +146,7 @@ function EventFeedContent() {
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [groups, selectedGroupId, selectedTopicId, page]);
+  }, [groups, selectedGroupId, selectedTopicId, page, realtimeConnected]);
 
   const loadGroups = async () => {
     setIsLoading(true);
@@ -345,7 +357,7 @@ function EventFeedContent() {
               >
                 <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
               </Button>
-              {user?.role === 'admin' && (
+              {!isAuthLoading && user?.role === 'admin' && (
                 <Button
                   variant="outline"
                   onClick={() => setLocation('/admin')}
@@ -476,7 +488,7 @@ function EventFeedContent() {
                       </div>
                     )}
 
-                    {message.media_url && message.media_type === 'photo' && (
+                    {message.media_url && message.media_type === 'photo' && /^https?:\/\//i.test(message.media_url) && (
                       <div className="mt-2">
                         <img
                           src={message.media_url}

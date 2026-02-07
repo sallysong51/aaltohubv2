@@ -20,7 +20,7 @@ from telethon.tl.types import InputUser, Chat, Channel
 from typing import Optional, List, Dict
 from app.config import settings
 from app.encryption import session_encryption, ENCRYPTION_VERSION
-from app.database import get_db
+from app.database import db
 from app.models import UserRole
 
 
@@ -53,6 +53,7 @@ class TelegramClientManager:
         # Per-phone auth flow clients (send_code → verify_code → verify_2fa)
         self._auth_flows: Dict[str, _AuthFlow] = {}
         self.admin_client: Optional[TelegramClient] = None
+        self._admin_client_lock = asyncio.Lock()
         # In-memory session cache with TTL: user_id → _CachedSession
         self._session_cache: Dict[str, _CachedSession] = {}
         # Pre-warmed client for instant send_code (no TCP+TLS wait)
@@ -143,15 +144,15 @@ class TelegramClientManager:
                 pass
 
     def _cleanup_stale_auth_flows(self):
-        """Remove auth flow clients older than TTL."""
+        """Remove auth flow clients older than TTL or already disconnected (P2-1.27)."""
         now = time.monotonic()
-        expired = [
+        stale = [
             key for key, flow in self._auth_flows.items()
-            if now - flow.created_at > self.AUTH_FLOW_TTL
+            if now - flow.created_at > self.AUTH_FLOW_TTL or not flow.client.is_connected()
         ]
-        for key in expired:
+        for key in stale:
             flow = self._auth_flows.pop(key, None)
-            if flow:
+            if flow and flow.client.is_connected():
                 asyncio.create_task(self._safe_disconnect(flow.client))
 
     @staticmethod
@@ -296,34 +297,19 @@ class TelegramClientManager:
         Uses user_id as AAD (additional authenticated data) so the encrypted
         blob is bound to this specific user and cannot be swapped.
         """
-        import asyncio
-        db = get_db()
-
         aad = str(user_id)
         encrypted_session = session_encryption.encrypt(session_string, aad=aad)
         key_hash = session_encryption.get_key_hash()
 
         try:
-            existing = await asyncio.to_thread(
-                lambda: db.table("telethon_sessions").select("id").eq("user_id", user_id).execute()
+            # Atomic upsert — no TOCTOU race between check and insert
+            await db.execute(
+                """INSERT INTO telethon_sessions (user_id, session_data, key_hash)
+                   VALUES ($1, $2, $3)
+                   ON CONFLICT (user_id)
+                   DO UPDATE SET session_data = $2, key_hash = $3, updated_at = NOW()""",
+                int(user_id), encrypted_session, key_hash,
             )
-
-            if existing.data and len(existing.data) > 0:
-                await asyncio.to_thread(
-                    lambda: db.table("telethon_sessions").update({
-                        "session_data": encrypted_session,
-                        "key_hash": key_hash,
-                        "updated_at": "now()"
-                    }).eq("user_id", user_id).execute()
-                )
-            else:
-                await asyncio.to_thread(
-                    lambda: db.table("telethon_sessions").insert({
-                        "user_id": user_id,
-                        "session_data": encrypted_session,
-                        "key_hash": key_hash
-                    }).execute()
-                )
 
             # Update cache
             self._session_cache[user_id] = _CachedSession(session_string)
@@ -345,27 +331,29 @@ class TelegramClientManager:
             else:
                 del self._session_cache[user_id]
 
-        # Evict expired entries periodically (every 50th call)
+        # Evict expired entries and enforce max cache size
+        SESSION_CACHE_MAX = 200
         if len(self._session_cache) > 50:
             now = time.monotonic()
             expired = [k for k, v in self._session_cache.items() if now - v.cached_at > self.SESSION_CACHE_TTL]
             for k in expired:
                 del self._session_cache[k]
-
-        import asyncio
-        db = get_db()
+            # Hard cap: if still over max, evict oldest cached entries
+            if len(self._session_cache) >= SESSION_CACHE_MAX:
+                sorted_keys = sorted(self._session_cache, key=lambda k: self._session_cache[k].cached_at)
+                for k in sorted_keys[:len(self._session_cache) - SESSION_CACHE_MAX + 1]:
+                    del self._session_cache[k]
 
         try:
-            response = await asyncio.to_thread(
-                lambda: db.table("telethon_sessions").select("*").eq("user_id", user_id).execute()
+            row = await db.fetchrow(
+                "SELECT * FROM telethon_sessions WHERE user_id = $1", int(user_id)
             )
 
-            if not response.data or len(response.data) == 0:
+            if not row:
                 return None
 
-            session_data = response.data[0]
-            encrypted_session = session_data["session_data"]
-            key_hash = session_data.get("key_hash", "")
+            encrypted_session = row["session_data"]
+            key_hash = row.get("key_hash", "") if hasattr(row, 'get') else (row["key_hash"] or "")
             aad = str(user_id)
 
             session_string: Optional[str] = None
@@ -381,12 +369,10 @@ class TelegramClientManager:
 
                 # Re-encrypt with v2 and save back (migration)
                 new_encrypted = session_encryption.encrypt(session_string, aad=aad)
-                await asyncio.to_thread(
-                    lambda: db.table("telethon_sessions").update({
-                        "session_data": new_encrypted,
-                        "key_hash": ENCRYPTION_VERSION,
-                        "updated_at": "now()"
-                    }).eq("user_id", user_id).execute()
+                await db.execute(
+                    """UPDATE telethon_sessions SET session_data = $1, key_hash = $2, updated_at = NOW()
+                       WHERE user_id = $3""",
+                    new_encrypted, ENCRYPTION_VERSION, int(user_id),
                 )
 
             # Populate cache
@@ -400,7 +386,14 @@ class TelegramClientManager:
     # ------------------------------------------------------------------
 
     async def get_user_client(self, user_id: str) -> TelegramClient:
-        """Get or create Telethon client for user"""
+        """Create a Telethon client for user.
+
+        IMPORTANT: Caller is responsible for disconnecting the returned client
+        when done (e.g. via ``try/finally: await client.disconnect()``).
+        Each call creates a new connection — intended for short-lived operations
+        like get_dialogs(). For long-lived connections, use the live crawler's
+        admin client pool instead.
+        """
         session_string = await self.load_session(user_id)
         if not session_string:
             raise Exception("Session not found for user")
@@ -411,29 +404,32 @@ class TelegramClientManager:
         return client
 
     async def get_admin_client(self) -> TelegramClient:
-        """Get admin Telethon client (for inviting to groups)"""
-        if self.admin_client and self.admin_client.is_connected():
+        """Get admin Telethon client (for inviting to groups).
+
+        Protected by _admin_client_lock to prevent concurrent callers from
+        creating duplicate connections.
+        """
+        async with self._admin_client_lock:
+            if self.admin_client and self.admin_client.is_connected():
+                return self.admin_client
+
+            admin_row = await db.fetchrow(
+                "SELECT * FROM users WHERE role = $1 LIMIT 1", UserRole.ADMIN.value
+            )
+
+            if not admin_row:
+                raise Exception("Admin user not found")
+
+            admin_id = admin_row["id"]
+
+            session_string = await self.load_session(admin_id)
+            if not session_string:
+                raise Exception("Admin session not found")
+
+            self.admin_client = self._make_client(session_string)
+            await self.admin_client.connect()
+
             return self.admin_client
-
-        db = get_db()
-        admin_response = await asyncio.to_thread(
-            lambda: db.table("users").select("*").eq("role", UserRole.ADMIN.value).execute()
-        )
-
-        if not admin_response.data or len(admin_response.data) == 0:
-            raise Exception("Admin user not found")
-
-        admin_user = admin_response.data[0]
-        admin_id = admin_user["id"]
-
-        session_string = await self.load_session(admin_id)
-        if not session_string:
-            raise Exception("Admin session not found")
-
-        self.admin_client = self._make_client(session_string)
-        await self.admin_client.connect()
-
-        return self.admin_client
 
     async def get_user_groups(self, user_id: str) -> List[Dict]:
         """Get all groups/channels user is member of"""

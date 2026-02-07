@@ -159,10 +159,10 @@ class MessageBase(BaseModel):
     telegram_message_id: int
     group_id: int  # telegram_group_id
     sender_id: Optional[int] = None
-    sender_name: Optional[str] = None
-    content: Optional[str] = None
+    sender_name: Optional[str] = Field(None, max_length=256)
+    content: Optional[str] = Field(None, max_length=65536)  # ~64KB cap for message text
     media_type: Optional[str] = None  # DB enum: photo, video, document, audio, sticker, voice (NULL=text)
-    media_url: Optional[str] = None
+    media_url: Optional[str] = Field(None, max_length=2048)
     reply_to_message_id: Optional[int] = None
     topic_id: Optional[int] = None
     sent_at: datetime
@@ -232,7 +232,7 @@ class CrawlerErrorLogResponse(BaseModel):
 # ============================================================
 
 class PrivateGroupInviteCreate(BaseModel):
-    group_id: str
+    group_id: int  # BIGINT in DB — validated as int on input
     expires_at: Optional[datetime] = None
     max_uses: Optional[int] = None
 

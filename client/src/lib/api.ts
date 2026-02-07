@@ -17,6 +17,12 @@ export function getApiErrorMessage(error: unknown, fallback: string): string {
 // - Override: set VITE_API_URL to an absolute URL (e.g. http://localhost:8000)
 const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
+// SSE base URL — must point directly to the backend (SSE requires persistent connections
+// that cannot be proxied through Vercel serverless functions).
+// - Development: empty string → same origin → Vite dev proxy handles SSE
+// - Production: set VITE_SSE_URL to the backend's direct HTTPS URL (e.g. https://api.aaltohub.com)
+export const SSE_BASE_URL = import.meta.env.VITE_SSE_URL || API_BASE_URL;
+
 // Create axios instance
 const apiClient: AxiosInstance = axios.create({
   baseURL: `${API_BASE_URL}/api`,
@@ -82,12 +88,9 @@ apiClient.interceptors.response.use(
             return access_token;
           })();
 
-          // Clear the shared promise after a short delay so concurrent
-          // requests reuse the same result, but future requests after the
-          // window will trigger a fresh refresh if needed.
-          refreshPromise.finally(() => {
-            setTimeout(() => { refreshPromise = null; }, 2000);
-          });
+          // Clear the shared promise on resolution so future requests
+          // trigger a fresh refresh if needed.
+          refreshPromise = refreshPromise.finally(() => { refreshPromise = null; });
         }
 
         const newAccessToken = await refreshPromise;
@@ -99,6 +102,9 @@ apiClient.interceptors.response.use(
         localStorage.removeItem('access_token');
         localStorage.removeItem('refresh_token');
         localStorage.removeItem('user');
+        // Dispatch custom event so React components can clear auth state,
+        // then navigate to login page
+        window.dispatchEvent(new CustomEvent('auth:logout'));
         window.location.href = '/login';
         return Promise.reject(refreshError);
       }
@@ -135,6 +141,10 @@ export interface Verify2FARequest {
   phone_code_hash: string;
 }
 
+/**
+ * User model. `id` is string because DB uses BIGSERIAL which PostgREST
+ * serializes as string to avoid JS Number precision loss (>2^53).
+ */
 export interface User {
   id: string;
   telegram_id: number;
@@ -183,6 +193,10 @@ export interface TelegramGroup {
   photo_url?: string;  // Group profile photo URL (optional)
 }
 
+/**
+ * RegisteredGroup. `id` is string (BIGINT Telegram group ID serialized by PostgREST).
+ * Always use String() coercion when comparing with broadcast payload group_id values.
+ */
 export interface RegisteredGroup {
   id: string;
   telegram_id: number;
@@ -213,6 +227,10 @@ export interface RegisterGroupsResponse {
   registered_groups: RegisteredGroup[];
 }
 
+/**
+ * Message. `id` and `group_id` are strings (BIGINT serialized by PostgREST).
+ * Broadcast payloads may send numeric group_id — always use String() for comparisons.
+ */
 export interface Message {
   id: string;
   telegram_message_id: number;
