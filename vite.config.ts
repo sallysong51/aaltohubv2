@@ -48,5 +48,14 @@ export default defineConfig({
       strict: true,
       deny: ["**/.*"],
     },
+    middlewareMode: false,
+    middleware: (req, res, next) => {
+      // Set CSP headers with frame-ancestors (HTTP header only)
+      res.setHeader(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' https: data:; connect-src 'self' https://*.supabase.co wss://*.supabase.co https://fonts.googleapis.com; frame-ancestors 'none';"
+      );
+      next();
+    },
   },
 });
