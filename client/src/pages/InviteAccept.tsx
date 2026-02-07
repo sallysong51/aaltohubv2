@@ -9,9 +9,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { toast } from 'sonner';
 import { Loader2, CheckCircle, XCircle } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
-import axios from 'axios';
-
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+import { groupsApi, getApiErrorMessage } from '@/lib/api';
 
 export default function InviteAccept() {
   const [, params] = useRoute('/invite/:token');
@@ -21,7 +19,6 @@ export default function InviteAccept() {
   const [isLoading, setIsLoading] = useState(false);
   const [isAccepted, setIsAccepted] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [groupId, setGroupId] = useState<string | null>(null);
 
   const token = params?.token;
 
@@ -34,6 +31,8 @@ export default function InviteAccept() {
   const handleAcceptInvite = async () => {
     if (!isAuthenticated) {
       toast.info('로그인이 필요합니다');
+      // Store invite path so user can return after login
+      sessionStorage.setItem('redirect_after_login', `/invite/${token}`);
       setLocation('/login');
       return;
     }
@@ -47,20 +46,11 @@ export default function InviteAccept() {
     setError(null);
 
     try {
-      const accessToken = localStorage.getItem('access_token');
-      const response = await axios.post(
-        `${API_BASE_URL}/api/groups/invite/${token}/accept`,
-        {},
-        {
-          headers: { Authorization: `Bearer ${accessToken}` },
-        }
-      );
-
+      await groupsApi.acceptInvite(token);
       setIsAccepted(true);
-      setGroupId(response.data.group_id);
       toast.success('그룹에 성공적으로 참여했습니다!');
-    } catch (error: any) {
-      const errorMessage = error.response?.data?.detail || '초대 수락에 실패했습니다';
+    } catch (error) {
+      const errorMessage = getApiErrorMessage(error, '초대 수락에 실패했습니다');
       setError(errorMessage);
       toast.error(errorMessage);
     } finally {
@@ -161,7 +151,10 @@ export default function InviteAccept() {
               <p className="text-sm text-muted-foreground mb-4">
                 초대를 수락하려면 먼저 로그인해주세요.
               </p>
-              <Button onClick={() => setLocation('/login')} className="w-full">
+              <Button onClick={() => {
+                sessionStorage.setItem('redirect_after_login', `/invite/${token}`);
+                setLocation('/login');
+              }} className="w-full">
                 로그인
               </Button>
             </div>

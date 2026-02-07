@@ -2,7 +2,7 @@
 Configuration settings for AaltoHub v2 Backend
 """
 from pydantic_settings import BaseSettings
-from typing import List
+from typing import Callable, List, Optional
 
 
 class Settings(BaseSettings):
@@ -17,9 +17,9 @@ class Settings(BaseSettings):
     TELEGRAM_API_ID: int
     TELEGRAM_API_HASH: str
     
-    # Admin credentials
-    ADMIN_PHONE: str = "+358449598622"
-    ADMIN_USERNAME: str = "chaeyeonsally"
+    # Admin credentials (must be set in .env)
+    ADMIN_PHONE: str = ""
+    ADMIN_USERNAME: str = ""
     
     # Encryption
     ENCRYPTION_KEY: str  # Used as SESSION_ENCRYPTION_KEY
@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     SENTRY_DSN: str = ""
     
     # Resend
-    RESEND_API_KEY: str
+    RESEND_API_KEY: str = ""
     
     # Environment
     ENVIRONMENT: str = "development"
@@ -50,12 +50,12 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",")]
     
     @property
-    def is_admin(self) -> callable:
+    def is_admin(self) -> Callable[..., bool]:
         """Check if user is admin"""
-        def check(phone: str = None, username: str = None) -> bool:
-            if phone and phone == self.ADMIN_PHONE:
+        def check(phone: Optional[str] = None, username: Optional[str] = None) -> bool:
+            if phone and self.ADMIN_PHONE and phone == self.ADMIN_PHONE:
                 return True
-            if username and username == self.ADMIN_USERNAME:
+            if username and self.ADMIN_USERNAME and username == self.ADMIN_USERNAME:
                 return True
             return False
         return check

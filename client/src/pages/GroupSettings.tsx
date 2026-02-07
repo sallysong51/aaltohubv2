@@ -17,21 +17,9 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { toast } from 'sonner';
-import { Loader2, Link as LinkIcon, Trash2, Copy, XCircle } from 'lucide-react';
+import { Loader2, Link as LinkIcon, Trash2, Copy, XCircle, ArrowLeft } from 'lucide-react';
 import ProtectedRoute from '@/components/ProtectedRoute';
-import axios from 'axios';
-
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-
-interface InviteLink {
-  id: string;
-  token: string;
-  expires_at?: string;
-  is_revoked: boolean;
-  used_count: number;
-  max_uses?: number;
-  created_at: string;
-}
+import { groupsApi, InviteLink, RegisteredGroup, getApiErrorMessage } from '@/lib/api';
 
 function GroupSettingsContent() {
   const [, params] = useRoute('/groups/:groupId/settings');
@@ -39,7 +27,7 @@ function GroupSettingsContent() {
   
   const groupId = params?.groupId;
   
-  const [group, setGroup] = useState<any>(null);
+  const [group, setGroup] = useState<RegisteredGroup | null>(null);
   const [inviteLinks, setInviteLinks] = useState<InviteLink[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -53,103 +41,85 @@ function GroupSettingsContent() {
   }, [groupId]);
 
   const loadGroupDetails = async () => {
+    if (!groupId) return;
     try {
-      const token = localStorage.getItem('access_token');
-      const response = await axios.get(`${API_BASE_URL}/api/groups/${groupId}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await groupsApi.getGroup(groupId);
       setGroup(response.data);
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || '그룹 정보를 불러오는데 실패했습니다');
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '그룹 정보를 불러오는데 실패했습니다'));
     } finally {
       setIsLoading(false);
     }
   };
 
   const loadInviteLinks = async () => {
+    if (!groupId) return;
     try {
-      const token = localStorage.getItem('access_token');
-      const response = await axios.get(`${API_BASE_URL}/api/groups/${groupId}/invite-links`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await groupsApi.getInviteLinks(groupId);
       setInviteLinks(response.data);
     } catch (error) {
-      // Ignore error if endpoint doesn't exist yet
+      // Ignore error - private groups might not have invites yet
     }
   };
 
   const handleVisibilityChange = async (isPublic: boolean) => {
+    if (!groupId) return;
     try {
-      const token = localStorage.getItem('access_token');
-      await axios.patch(
-        `${API_BASE_URL}/api/groups/${groupId}/visibility`,
-        null,
-        {
-          params: { visibility: isPublic ? 'public' : 'private' },
-          headers: { Authorization: `Bearer ${token}` },
-        }
-      );
+      await groupsApi.updateVisibility(groupId, isPublic ? 'public' : 'private');
       toast.success('공개 설정이 변경되었습니다');
       loadGroupDetails();
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || '공개 설정 변경에 실패했습니다');
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '공개 설정 변경에 실패했습니다'));
     }
   };
 
   const handleCreateInviteLink = async () => {
+    if (!groupId) return;
     try {
-      const token = localStorage.getItem('access_token');
-      const response = await axios.post(
-        `${API_BASE_URL}/api/groups/${groupId}/invite-link`,
-        {},
-        {
-          headers: { Authorization: `Bearer ${token}` },
-        }
-      );
-      
+      const response = await groupsApi.createInviteLink(groupId);
       const inviteUrl = `${window.location.origin}/invite/${response.data.token}`;
-      await navigator.clipboard.writeText(inviteUrl);
-      toast.success('초대 링크가 생성되고 클립보드에 복사되었습니다');
+      try {
+        await navigator.clipboard.writeText(inviteUrl);
+        toast.success('초대 링크가 생성되고 클립보드에 복사되었습니다');
+      } catch {
+        toast.success('초대 링크가 생성되었습니다');
+      }
       loadInviteLinks();
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || '초대 링크 생성에 실패했습니다');
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '초대 링크 생성에 실패했습니다'));
     }
   };
 
   const handleCopyInviteLink = async (token: string) => {
     const inviteUrl = `${window.location.origin}/invite/${token}`;
-    await navigator.clipboard.writeText(inviteUrl);
-    toast.success('초대 링크가 클립보드에 복사되었습니다');
+    try {
+      await navigator.clipboard.writeText(inviteUrl);
+      toast.success('초대 링크가 클립보드에 복사되었습니다');
+    } catch {
+      toast.error('클립보드 복사에 실패했습니다');
+    }
   };
 
   const handleRevokeInviteLink = async (inviteId: string) => {
+    if (!groupId) return;
     try {
-      const token = localStorage.getItem('access_token');
-      await axios.post(
-        `${API_BASE_URL}/api/groups/${groupId}/invite-link/${inviteId}/revoke`,
-        {},
-        {
-          headers: { Authorization: `Bearer ${token}` },
-        }
-      );
+      await groupsApi.revokeInviteLink(groupId, inviteId);
       toast.success('초대 링크가 무효화되었습니다');
       loadInviteLinks();
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || '초대 링크 무효화에 실패했습니다');
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '초대 링크 무효화에 실패했습니다'));
     }
   };
 
   const handleDeleteGroup = async () => {
+    if (!groupId) return;
     setIsDeleting(true);
     try {
-      const token = localStorage.getItem('access_token');
-      await axios.delete(`${API_BASE_URL}/api/groups/${groupId}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      await groupsApi.deleteGroup(groupId);
       toast.success('그룹이 삭제되었습니다');
       setLocation('/groups');
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || '그룹 삭제에 실패했습니다');
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '그룹 삭제에 실패했습니다'));
     } finally {
       setIsDeleting(false);
       setShowDeleteDialog(false);
@@ -182,12 +152,26 @@ function GroupSettingsContent() {
   }
 
   return (
-    <div className="min-h-screen bg-background p-4">
-      <div className="container max-w-4xl">
-        <div className="mb-6">
-          <h1 className="text-3xl font-bold mb-2">{group.title}</h1>
+    <div className="min-h-screen bg-background">
+      {/* Header */}
+      <div className="border-b border-border bg-card">
+        <div className="container max-w-4xl py-6">
+          <Button
+            variant="outline"
+            onClick={() => setLocation('/groups')}
+            className="mb-4"
+          >
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            돌아가기
+          </Button>
+          <h1 className="text-4xl font-bold mb-2">{group.title}</h1>
           <p className="text-muted-foreground">그룹 설정</p>
         </div>
+      </div>
+
+      {/* Content */}
+      <div className="container max-w-4xl p-4">
+        <div className="mb-6" />
 
         {/* Visibility Settings */}
         <Card className="mb-6">
@@ -208,16 +192,6 @@ function GroupSettingsContent() {
               />
             </div>
             
-            {group.visibility === 'public' && group.admin_invite_error && (
-              <div className="mt-4 p-3 bg-destructive/10 border border-destructive/20 rounded">
-                <p className="text-sm text-destructive">
-                  관리자 초대 실패: {group.admin_invite_error}
-                </p>
-                <p className="text-xs text-muted-foreground mt-1">
-                  @chaeyeonsally를 그룹에 직접 초대해주세요.
-                </p>
-              </div>
-            )}
           </CardContent>
         </Card>
 

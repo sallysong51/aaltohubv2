@@ -9,10 +9,12 @@ import Home from "./pages/Home";
 import Login from "./pages/Login";
 import GroupSelection from "./pages/GroupSelection";
 import UserGroups from "./pages/UserGroups";
+import EventFeed from "./pages/EventFeed";
 import AdminDashboard from "./pages/AdminDashboard";
 import InviteAccept from "./pages/InviteAccept";
 import GroupSettings from "./pages/GroupSettings";
 import CrawlerManagement from "./pages/CrawlerManagement";
+import UserManagement from "./pages/UserManagement";
 import Privacy from "./pages/Privacy";
 
 function HomeRedirect() {
@@ -31,7 +33,7 @@ function HomeRedirect() {
     return <Redirect to="/admin" />;
   }
 
-  return <Redirect to="/groups" />;
+  return <Redirect to="/feed" />;
 }
 
 function Router() {
@@ -39,10 +41,12 @@ function Router() {
     <Switch>
       <Route path="/" component={HomeRedirect} />
       <Route path="/login" component={Login} />
+      <Route path="/feed" component={EventFeed} />
       <Route path="/groups/select" component={GroupSelection} />
       <Route path="/groups" component={UserGroups} />
       <Route path="/admin" component={AdminDashboard} />
       <Route path="/admin/crawler" component={CrawlerManagement} />
+      <Route path="/admin/users" component={UserManagement} />
       <Route path="/invite/:token" component={InviteAccept} />
       <Route path="/groups/:groupId/settings" component={GroupSettings} />
       <Route path="/privacy" component={Privacy} />

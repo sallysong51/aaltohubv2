@@ -8,8 +8,8 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { toast } from 'sonner';
-import { Loader2, Users, Globe, Lock, Plus, Settings } from 'lucide-react';
-import { groupsApi, RegisteredGroup } from '@/lib/api';
+import { Loader2, Users, Globe, Lock, Plus, Settings, ArrowLeft } from 'lucide-react';
+import { groupsApi, RegisteredGroup, getApiErrorMessage } from '@/lib/api';
 import ProtectedRoute from '@/components/ProtectedRoute';
 
 function UserGroupsContent() {
@@ -26,8 +26,8 @@ function UserGroupsContent() {
     try {
       const response = await groupsApi.getRegisteredGroups();
       setGroups(response.data);
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || '그룹 목록을 불러오는데 실패했습니다');
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '그룹 목록을 불러오는데 실패했습니다'));
     } finally {
       setIsLoading(false);
     }
@@ -44,18 +44,28 @@ function UserGroupsContent() {
   return (
     <div className="min-h-screen bg-background">
       {/* Header */}
-      <div className="border-b-4 border-border bg-card">
+      <div className="border-b border-border bg-card">
         <div className="container py-6">
           <div className="flex items-center justify-between">
             <div>
-              <h1 className="text-4xl font-bold mb-2">내 그룹</h1>
+              <div className="flex items-center gap-3 mb-2">
+                <Button
+                  variant="outline"
+                  onClick={() => setLocation('/feed')}
+                  size="sm"
+                >
+                  <ArrowLeft className="h-4 w-4 mr-2" />
+                  피드로
+                </Button>
+                <h1 className="text-4xl font-bold">내 그룹</h1>
+              </div>
               <p className="text-muted-foreground">
                 등록된 텔레그램 그룹 목록
               </p>
             </div>
             <Button
               onClick={() => setLocation('/groups/select')}
-              className="border-2 border-border btn-pressed"
+              className="btn-pressed"
             >
               <Plus className="mr-2 h-4 w-4" />
               그룹 추가
@@ -67,7 +77,7 @@ function UserGroupsContent() {
       {/* Groups List */}
       <div className="container py-8">
         {groups.length === 0 ? (
-          <Card className="brutalist-card border-4">
+          <Card className="refined-card">
             <CardContent className="pt-6">
               <div className="text-center py-12">
                 <Users className="h-16 w-16 mx-auto mb-4 text-muted-foreground" />
@@ -77,7 +87,7 @@ function UserGroupsContent() {
                 </p>
                 <Button
                   onClick={() => setLocation('/groups/select')}
-                  className="border-2 border-border btn-pressed"
+                  className="btn-pressed"
                   size="lg"
                 >
                   <Plus className="mr-2 h-5 w-5" />
@@ -89,7 +99,7 @@ function UserGroupsContent() {
         ) : (
           <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
             {groups.map((group) => (
-              <Card key={group.id} className="brutalist-card border-4">
+              <Card key={group.id} className="refined-card">
                 <CardContent className="p-6">
                   <div className="mb-4">
                     <h3 className="font-bold text-xl mb-2">{group.title}</h3>
@@ -100,8 +110,8 @@ function UserGroupsContent() {
 
                   <div className="flex flex-wrap gap-2 mb-4">
                     <Badge
+                      key="visibility"
                       variant={group.visibility === 'public' ? 'default' : 'secondary'}
-                      className="border-2"
                     >
                       {group.visibility === 'public' ? (
                         <>
@@ -117,25 +127,17 @@ function UserGroupsContent() {
                     </Badge>
 
                     {group.member_count && (
-                      <Badge variant="outline" className="border-2">
+                      <Badge key="member-count" variant="outline" className="border-2">
                         <Users className="mr-1 h-3 w-3" />
                         {group.member_count.toLocaleString()}명
                       </Badge>
                     )}
 
-                    <Badge variant="outline" className="border-2">
-                      {group.group_type === 'channel' ? '채널' : 
+                    <Badge key="group-type" variant="outline" className="border-2">
+                      {group.group_type === 'channel' ? '채널' :
                        group.group_type === 'supergroup' ? '슈퍼그룹' : '그룹'}
                     </Badge>
                   </div>
-
-                  {group.visibility === 'public' && !group.admin_invited && group.admin_invite_error && (
-                    <div className="mt-4 p-3 border-2 border-destructive bg-destructive/10 rounded">
-                      <p className="text-xs text-destructive font-medium">
-                        관리자 초대 실패: {group.admin_invite_error}
-                      </p>
-                    </div>
-                  )}
 
                   <div className="mt-4 flex items-center justify-between">
                     <span className="text-xs text-muted-foreground timestamp">

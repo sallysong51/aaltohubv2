@@ -27,16 +27,6 @@ class GroupVisibility(str, Enum):
     PRIVATE = "private"
 
 
-class MediaType(str, Enum):
-    TEXT = "text"
-    PHOTO = "photo"
-    VIDEO = "video"
-    DOCUMENT = "document"
-    AUDIO = "audio"
-    STICKER = "sticker"
-    VOICE = "voice"
-    VIDEO_NOTE = "video_note"
-
 
 class CrawlerStatus(str, Enum):
     ACTIVE = "active"
@@ -116,10 +106,10 @@ class RefreshTokenRequest(BaseModel):
 class TelegramGroupBase(BaseModel):
     telegram_id: int
     title: str
-    username: Optional[str] = None
+    username: Optional[str] = None  # from Telegram API (not stored in DB)
     member_count: Optional[int] = None
     group_type: Optional[GroupType] = None
-    photo_url: Optional[str] = None  # Group profile photo URL
+    photo_url: Optional[str] = None
 
 
 class TelegramGroupInfo(TelegramGroupBase):
@@ -129,15 +119,15 @@ class TelegramGroupInfo(TelegramGroupBase):
 
 class TelegramGroupCreate(TelegramGroupBase):
     visibility: GroupVisibility = GroupVisibility.PUBLIC
-    registered_by: int  # telegram_id of the user
+    registered_by: int
 
 
 class TelegramGroupResponse(TelegramGroupBase):
+    id: Optional[str] = None
     visibility: GroupVisibility
     invite_link: Optional[str] = None
     registered_by: Optional[int] = None
     created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -170,14 +160,11 @@ class MessageBase(BaseModel):
     group_id: int  # telegram_group_id
     sender_id: Optional[int] = None
     sender_name: Optional[str] = None
-    sender_username: Optional[str] = None
     content: Optional[str] = None
-    media_type: MediaType = MediaType.TEXT
+    media_type: Optional[str] = None  # DB enum: photo, video, document, audio, sticker, voice (NULL=text)
     media_url: Optional[str] = None
-    media_thumbnail_url: Optional[str] = None
     reply_to_message_id: Optional[int] = None
     topic_id: Optional[int] = None
-    topic_title: Optional[str] = None
     sent_at: datetime
 
 
@@ -188,10 +175,8 @@ class MessageCreate(MessageBase):
 class MessageResponse(MessageBase):
     id: str  # UUID for messages
     is_deleted: bool = False
-    edited_at: Optional[datetime] = None
-    edit_count: int = 0
     created_at: datetime
-    
+
     class Config:
         from_attributes = True
 

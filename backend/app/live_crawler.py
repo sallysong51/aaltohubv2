@@ -12,7 +12,9 @@ Features:
 - Multiple admin accounts support
 """
 import asyncio
+import fcntl
 import io
+import json
 import logging
 import time
 import traceback
@@ -39,8 +41,11 @@ from telethon.tl.types import (
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from supabase import create_client, Client
 
+# Transient exceptions that justify a retry (not programming bugs)
+_TRANSIENT_EXCEPTIONS = (ConnectionError, TimeoutError, OSError)
+
 from app.config import settings
-from app.encryption import session_encryption
+from app.encryption import session_encryption, ENCRYPTION_VERSION
 from app.models import UserRole
 
 logger = logging.getLogger(__name__)
@@ -56,6 +61,8 @@ BATCH_TIMEOUT = 2.0  # seconds to wait for more messages before flushing
 GAP_FILL_INTERVAL = 1800  # 30 minutes
 GAP_FILL_LOOKBACK_HOURS = 1  # re-check last 1 hour of messages
 GAP_FILL_MAX_MESSAGES = 500  # max messages per group during gap-fill
+DIALOGS_COOLDOWN = 600  # 10 minutes — minimum interval between get_dialogs() calls
+QUEUE_DRAIN_TIMEOUT = 60  # seconds — max wait for queue to drain after historical crawl
 
 # Circuit breaker settings
 CB_FAILURE_THRESHOLD = 5  # failures before opening
@@ -124,6 +131,8 @@ class LiveCrawlerService:
         self._historical_task: asyncio.Task | None = None
         self._writer_task: asyncio.Task | None = None
         self._started_at: datetime | None = None
+        # _message_count is only mutated from asyncio coroutines (single-threaded
+        # event loop), so no lock is needed. Do NOT access from executor threads.
         self._message_count = 0
         self._historical_crawl_running = False
         self._crawled_groups: set[int] = set()
@@ -138,6 +147,10 @@ class LiveCrawlerService:
         self._gap_fill_task: asyncio.Task | None = None
         # Async HTTP client for broadcasts
         self._http_client = None
+        # File lock to prevent concurrent crawlers
+        self._lock_file = None
+        # Cooldown for get_dialogs() calls (expensive API call)
+        self._last_dialogs_fetch: float = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -149,6 +162,20 @@ class LiveCrawlerService:
             logger.warning("Live crawler is already running")
             return
 
+        # Acquire file lock to prevent concurrent crawlers (live + legacy)
+        # sharing the same Telegram session, which causes forced disconnects.
+        lock_path = "/tmp/aaltohub-crawler.lock"
+        try:
+            self._lock_file = open(lock_path, "w")
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lock_file.write(str(time.time()))
+            self._lock_file.flush()
+        except (IOError, OSError):
+            logger.error("Another crawler instance is already running (lock: %s). Aborting.", lock_path)
+            if hasattr(self, "_lock_file") and self._lock_file:
+                self._lock_file.close()
+            return
+
         logger.info("=" * 60)
         logger.info("Initializing live crawler with multiple admin accounts...")
         logger.info("=" * 60)
@@ -157,7 +184,9 @@ class LiveCrawlerService:
             self.supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
 
             # Find all admin users
-            admin_resp = self.supabase.table("users").select("*").eq("role", UserRole.ADMIN.value).execute()
+            admin_resp = await asyncio.to_thread(
+                lambda: self.supabase.table("users").select("*").eq("role", UserRole.ADMIN.value).execute()
+            )
             if not admin_resp.data:
                 logger.error("Live crawler: No admin user found. Please login as admin first.")
                 return
@@ -172,17 +201,32 @@ class LiveCrawlerService:
 
                 try:
                     # Load encrypted session
-                    session_resp = (
-                        self.supabase.table("telethon_sessions")
-                        .select("session_data")
-                        .eq("user_id", admin_id)
+                    session_resp = await asyncio.to_thread(
+                        lambda _aid=admin_id: self.supabase.table("telethon_sessions")
+                        .select("session_data,key_hash")
+                        .eq("user_id", _aid)
                         .execute()
                     )
                     if not session_resp.data:
                         logger.warning("Live crawler: Admin %s (id=%s) has no session. Skipping.", admin_name, admin_id)
                         continue
 
-                    session_string = session_encryption.decrypt(session_resp.data[0]["session_data"])
+                    row = session_resp.data[0]
+                    aad = str(admin_id)
+                    if row.get("key_hash") == ENCRYPTION_VERSION:
+                        session_string = session_encryption.decrypt(row["session_data"], aad=aad)
+                    else:
+                        # Legacy session — decrypt and re-encrypt with v2
+                        from app.encryption import get_legacy_encryption
+                        session_string = get_legacy_encryption().decrypt(row["session_data"])
+                        new_encrypted = session_encryption.encrypt(session_string, aad=aad)
+                        await asyncio.to_thread(
+                            lambda _enc=new_encrypted, _aid=admin_id: self.supabase.table("telethon_sessions").update({
+                                "session_data": _enc,
+                                "key_hash": ENCRYPTION_VERSION,
+                            }).eq("user_id", _aid).execute()
+                        )
+                        logger.info("Live crawler: Migrated session for admin %s to v2 encryption", admin_name)
 
                     # Create Telethon client
                     client = TelegramClient(
@@ -246,6 +290,26 @@ class LiveCrawlerService:
             import httpx as _httpx
             self._http_client = _httpx.AsyncClient(timeout=5.0)
 
+            # Restore previously crawled groups to avoid re-crawling on restart
+            try:
+                crawled_resp = await asyncio.to_thread(
+                    lambda: self.supabase.table("crawler_status")
+                        .select("group_id")
+                        .eq("status", "active")
+                        .execute()
+                )
+                if crawled_resp.data:
+                    for row in crawled_resp.data:
+                        try:
+                            self._crawled_groups.add(int(row["group_id"]))
+                        except (ValueError, TypeError):
+                            pass
+                    logger.info("Restored %d previously crawled groups", len(self._crawled_groups))
+            except Exception as e:
+                logger.warning("Failed to load crawled groups state: %s", e)
+
+            self.connected = True
+
             self._refresh_task = asyncio.create_task(self._periodic_group_refresh())
             self._historical_task = asyncio.create_task(self._crawl_all_groups_historical())
             self._gap_fill_task = asyncio.create_task(self._periodic_gap_fill())
@@ -304,6 +368,16 @@ class LiveCrawlerService:
                 self._writer_task.cancel()
 
         await self._cleanup()
+
+        # Release file lock
+        if self._lock_file:
+            try:
+                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+                self._lock_file.close()
+            except Exception:
+                pass
+            self._lock_file = None
+
         logger.info("Live crawler stopped.")
 
     async def restart(self) -> None:
@@ -397,7 +471,7 @@ class LiveCrawlerService:
     @retry(
         stop=stop_after_attempt(4),
         wait=wait_exponential(multiplier=1, min=1, max=8),
-        retry=retry_if_exception_type(Exception),
+        retry=retry_if_exception_type(_TRANSIENT_EXCEPTIONS),
         reraise=True,
     )
     def _db_upsert_batch(self, rows: list[dict], ignore_duplicates: bool = True) -> None:
@@ -410,7 +484,7 @@ class LiveCrawlerService:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=4),
-        retry=retry_if_exception_type(Exception),
+        retry=retry_if_exception_type(_TRANSIENT_EXCEPTIONS),
         reraise=True,
     )
     def _db_upsert_single(self, row: dict, ignore_duplicates: bool = True) -> None:
@@ -423,7 +497,7 @@ class LiveCrawlerService:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=4),
-        retry=retry_if_exception_type(Exception),
+        retry=retry_if_exception_type(_TRANSIENT_EXCEPTIONS),
         reraise=True,
     )
     def _db_update(self, data: dict, record_id: str) -> None:
@@ -457,7 +531,8 @@ class LiveCrawlerService:
             logger.warning("Broadcast failed for event=%s: %s", event, e)
 
     def _write_to_dead_letter(self, row: dict, error: str) -> None:
-        """Write a failed message to the dead letter table for later retry."""
+        """Write a failed message to the dead letter table for later retry.
+        Falls back to local file if DB is also unreachable."""
         if not self.supabase:
             return
         try:
@@ -469,7 +544,12 @@ class LiveCrawlerService:
                 "retry_count": 0,
             }).execute()
         except Exception as e:
-            logger.error("Dead letter write failed: %s", e)
+            logger.error("Dead letter DB write failed: %s — writing to local file", e)
+            try:
+                with open("/tmp/aaltohub-dead-letters.jsonl", "a") as f:
+                    f.write(json.dumps({"row": row, "error": str(error)[:500], "ts": time.time()}) + "\n")
+            except Exception as e2:
+                logger.error("Local dead letter file write also failed: %s", e2)
 
     async def _flush_batch(self, batch: list[dict]) -> None:
         """Write a batch of messages to the database.
@@ -514,9 +594,10 @@ class LiveCrawlerService:
                         logger.error("Upsert failed for msg %s: %s", row.get("telegram_message_id"), e2)
                         await asyncio.to_thread(self._write_to_dead_letter, row, str(e2))
 
-            # Broadcast new messages to frontend
-            for row in rows:
-                await self._broadcast("insert", row)
+            # Broadcast new messages to frontend (skip gap-fill re-checks)
+            for item in inserts:
+                if item.get("broadcast", True):
+                    await self._broadcast("insert", item["data"])
 
         # --- Handle upserts (edits — ON CONFLICT DO UPDATE) ---
         for item in upserts:
@@ -543,6 +624,7 @@ class LiveCrawlerService:
         is_edit: bool = False,
         download_media: bool = False,
         client: TelegramClient | None = None,
+        broadcast: bool = True,
     ) -> None:
         """Prepare message data and put it on the queue for the DB writer."""
         try:
@@ -599,7 +681,7 @@ class LiveCrawlerService:
                 "group_id": group_uuid,
                 "sender_id": sender_id,
                 "sender_name": sender_name,
-                "text": message.text,
+                "content": message.text,
                 "media_type": media_type,
                 "media_url": media_url,
                 "reply_to_message_id": message.reply_to_msg_id,
@@ -608,10 +690,14 @@ class LiveCrawlerService:
                 "sent_at": message.date.isoformat(),
             }
 
+            if is_edit:
+                message_data["edited_at"] = datetime.now(timezone.utc).isoformat()
+
             queue_item = {
                 "action": "upsert" if is_edit else "insert",
                 "data": message_data,
                 "group_uuid": group_uuid,
+                "broadcast": broadcast and not is_edit,
             }
 
             try:
@@ -630,29 +716,29 @@ class LiveCrawlerService:
     # ------------------------------------------------------------------
 
     async def _ensure_crawler_status_rows(self) -> None:
-        """Ensure every registered group has a crawler_status row."""
-        if not self.supabase:
+        """Ensure every registered group has a crawler_status row (single batch upsert)."""
+        if not self.supabase or not self.group_id_map:
             return
-        for gid, group_uuid in self.group_id_map.items():
-            try:
-                existing = await asyncio.to_thread(
-                    lambda guuid=group_uuid: self.supabase.table("crawler_status")
-                    .select("id").eq("group_id", guuid).execute()
-                )
-                if not existing.data:
-                    await asyncio.to_thread(
-                        lambda guuid=group_uuid: self.supabase.table("crawler_status").insert({
-                            "group_id": guuid,
-                            "status": "initializing",
-                            "is_enabled": True,
-                            "error_count": 0,
-                            "initial_crawl_progress": 0,
-                            "initial_crawl_total": 0,
-                        }).execute()
-                    )
-                    logger.info("Created crawler_status for group %s", group_uuid)
-            except Exception as e:
-                logger.warning("Failed to create crawler_status for %s: %s", group_uuid, e)
+        rows = [
+            {
+                "group_id": group_uuid,
+                "status": "initializing",
+                "is_enabled": True,
+                "error_count": 0,
+                "initial_crawl_progress": 0,
+                "initial_crawl_total": 0,
+            }
+            for group_uuid in self.group_id_map.values()
+        ]
+        try:
+            await asyncio.to_thread(
+                lambda: self.supabase.table("crawler_status").upsert(
+                    rows, on_conflict="group_id", ignore_duplicates=True
+                ).execute()
+            )
+            logger.info("Ensured crawler_status rows for %d groups", len(rows))
+        except Exception as e:
+            logger.warning("Failed to ensure crawler_status rows: %s", e)
 
     # ------------------------------------------------------------------
     # Group management
@@ -670,16 +756,22 @@ class LiveCrawlerService:
                 logger.info("Live crawler: no crawl-enabled groups found.")
                 return
 
+            # Build new dicts, then atomically swap references.
+            # This prevents event handlers from seeing empty dicts during rebuild.
             old_ids = set(self.group_id_map.keys())
-            self.group_id_map.clear()
-            self.group_info_map.clear()
+            new_id_map: dict[int, str] = {}
+            new_info_map: dict[int, dict] = {}
 
             for group in resp.data:
                 gid = group["id"]
-                self.group_id_map[gid] = str(gid)
-                self.group_info_map[gid] = group
+                new_id_map[gid] = str(gid)
+                new_info_map[gid] = group
 
-            new_ids = set(self.group_id_map.keys()) - old_ids
+            # Atomic swap — event handlers always see a complete map
+            self.group_id_map = new_id_map
+            self.group_info_map = new_info_map
+
+            new_ids = set(new_id_map.keys()) - old_ids
             if new_ids:
                 for nid in new_ids:
                     title = self._get_group_title(nid)
@@ -724,9 +816,8 @@ class LiveCrawlerService:
             # Table may not exist yet — that's fine, cache starts empty
             logger.debug("Entity cache load failed (table may not exist): %s", e)
 
-    def _save_entity_to_cache(self, gid: int, access_hash: int, entity_type: str) -> None:
-        """Persist a single entity cache entry to memory + DB."""
-        self._entity_cache[gid] = (access_hash, entity_type)
+    def _save_entity_to_cache_sync(self, gid: int, access_hash: int, entity_type: str) -> None:
+        """Sync DB write for entity cache (runs in thread pool)."""
         if not self.supabase:
             return
         try:
@@ -737,6 +828,13 @@ class LiveCrawlerService:
             }, on_conflict="telegram_id").execute()
         except Exception as e:
             logger.debug("Entity cache DB write failed for %s: %s", gid, e)
+
+    def _save_entity_to_cache(self, gid: int, access_hash: int, entity_type: str) -> None:
+        """Persist a single entity cache entry to memory + fire-and-forget DB write."""
+        self._entity_cache[gid] = (access_hash, entity_type)
+        asyncio.create_task(
+            asyncio.to_thread(self._save_entity_to_cache_sync, gid, access_hash, entity_type)
+        )
 
     def _cache_entity(self, entity) -> None:
         """Extract access_hash from a resolved entity and cache it."""
@@ -764,11 +862,13 @@ class LiveCrawlerService:
                     entity = await client.get_entity(InputPeerChat(chat_id=gid))
                 return entity
             except Exception:
-                # Stale cache entry — remove from memory AND DB
+                # Stale cache entry — remove from memory AND DB (async)
                 self._entity_cache.pop(gid, None)
                 try:
                     if self.supabase:
-                        self.supabase.table("entity_cache").delete().eq("telegram_id", gid).execute()
+                        await asyncio.to_thread(
+                            lambda _gid=gid: self.supabase.table("entity_cache").delete().eq("telegram_id", _gid).execute()
+                        )
                 except Exception:
                     pass
 
@@ -783,18 +883,25 @@ class LiveCrawlerService:
                 pass
 
         # 3) Warm cache via get_dialogs() and cache ALL discovered entities
-        logger.debug("Entity cache miss for %s — warming cache via get_dialogs()...", gid)
-        dialogs = await client.get_dialogs()
-        target_entity = None
-        for dialog in dialogs:
-            entity = dialog.entity
-            if isinstance(entity, (Channel, Chat)):
-                self._cache_entity(entity)
-            if entity.id == gid:
-                target_entity = entity
+        # Throttle: get_dialogs() is expensive, skip if called recently
+        now = time.monotonic()
+        if now - self._last_dialogs_fetch < DIALOGS_COOLDOWN:
+            logger.debug("Entity cache miss for %s — get_dialogs() on cooldown (%ds remaining)",
+                         gid, int(DIALOGS_COOLDOWN - (now - self._last_dialogs_fetch)))
+        else:
+            logger.debug("Entity cache miss for %s — warming cache via get_dialogs()...", gid)
+            self._last_dialogs_fetch = now
+            dialogs = await client.get_dialogs()
+            target_entity = None
+            for dialog in dialogs:
+                entity = dialog.entity
+                if isinstance(entity, (Channel, Chat)):
+                    self._cache_entity(entity)
+                if entity.id == gid:
+                    target_entity = entity
 
-        if target_entity:
-            return target_entity
+            if target_entity:
+                return target_entity
 
         # 4) Final retry after cache warm
         try:
@@ -879,7 +986,7 @@ class LiveCrawlerService:
                         if not self.running:
                             break
                         if message.text or message.media:
-                            await self._enqueue_message(message, gid, group_uuid, client=working_client)
+                            await self._enqueue_message(message, gid, group_uuid, client=working_client, broadcast=False)
                             count += 1
                         if count >= GAP_FILL_MAX_MESSAGES:
                             break
@@ -996,8 +1103,13 @@ class LiveCrawlerService:
                 except Exception as e:
                     logger.warning("Error enqueuing msg %d: %s", message.id, e)
 
-            # Wait for queue to drain before marking complete
+            # Wait for queue to drain before marking complete (with timeout)
+            drain_start = time.monotonic()
             while not self._msg_queue.empty():
+                if time.monotonic() - drain_start > QUEUE_DRAIN_TIMEOUT:
+                    logger.warning("Queue drain timeout (%ds) for %s — %d items remaining",
+                                   QUEUE_DRAIN_TIMEOUT, title, self._msg_queue.qsize())
+                    break
                 await asyncio.sleep(0.5)
 
             await self._update_crawler_status(
@@ -1148,13 +1260,15 @@ class LiveCrawlerService:
                     if chat_id not in self.group_id_map:
                         return
                     group_uuid = self.group_id_map[chat_id]
-                    logger.info("[DELETE] %s: %d msgs", self._get_group_title(chat_id), len(event.deleted_ids))
-                    for msg_id in event.deleted_ids:
-                        await asyncio.to_thread(
-                            lambda mid=msg_id, guuid=group_uuid: self.supabase.table("messages").update({
-                                "is_deleted": True,
-                            }).eq("telegram_message_id", mid).eq("group_id", guuid).execute()
-                        )
+                    deleted_ids = list(event.deleted_ids)
+                    logger.info("[DELETE] %s: %d msgs", self._get_group_title(chat_id), len(deleted_ids))
+                    # Single batch UPDATE instead of N individual queries
+                    await asyncio.to_thread(
+                        lambda ids=deleted_ids, guuid=group_uuid: self.supabase.table("messages").update({
+                            "is_deleted": True,
+                        }).in_("telegram_message_id", ids).eq("group_id", guuid).execute()
+                    )
+                    for msg_id in deleted_ids:
                         await self._broadcast("update", {
                             "telegram_message_id": msg_id,
                             "group_id": group_uuid,

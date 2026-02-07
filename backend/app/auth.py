@@ -1,7 +1,9 @@
 """
 Authentication and JWT utilities
 """
-from datetime import datetime, timedelta
+import asyncio
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 from jose import JWTError, jwt
 from fastapi import HTTPException, Security, Depends
@@ -17,13 +19,13 @@ security = HTTPBearer()
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """Create JWT access token"""
     to_encode = data.copy()
-    
+
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
-    
-    to_encode.update({"exp": expire, "type": "access"})
+        expire = datetime.now(timezone.utc) + timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    to_encode.update({"exp": expire, "type": "access", "jti": str(uuid.uuid4())})
     encoded_jwt = jwt.encode(to_encode, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
     return encoded_jwt
 
@@ -31,8 +33,8 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 def create_refresh_token(data: dict) -> str:
     """Create JWT refresh token"""
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "type": "refresh"})
+    expire = datetime.now(timezone.utc) + timedelta(days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire, "type": "refresh", "jti": str(uuid.uuid4())})
     encoded_jwt = jwt.encode(to_encode, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
     return encoded_jwt
 
@@ -42,8 +44,8 @@ def decode_token(token: str) -> Dict:
     try:
         payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
         return payload
-    except JWTError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="유효하지 않은 토큰입니다")
 
 
 async def get_current_user(
@@ -65,14 +67,18 @@ async def get_current_user(
     
     # Fetch user from database
     try:
-        response = db.table("users").select("*").eq("id", user_id).execute()
+        response = await asyncio.to_thread(
+            lambda: db.table("users").select("*").eq("id", user_id).execute()
+        )
         if not response.data or len(response.data) == 0:
             raise HTTPException(status_code=404, detail="User not found")
-        
+
         user_data = response.data[0]
         return UserResponse(**user_data)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="사용자 정보 조회 중 오류가 발생했습니다")
 
 
 async def get_current_admin_user(
@@ -84,12 +90,25 @@ async def get_current_admin_user(
     return current_user
 
 
-def verify_refresh_token(refresh_token: str) -> Dict:
-    """Verify refresh token and return payload"""
+def verify_refresh_token(refresh_token: str, db=None) -> Dict:
+    """Verify refresh token and return payload. Checks revocation if db provided."""
     payload = decode_token(refresh_token)
-    
+
     # Check token type
     if payload.get("type") != "refresh":
         raise HTTPException(status_code=401, detail="Invalid token type")
-    
+
+    # Check revocation
+    if db:
+        jti = payload.get("jti")
+        if jti:
+            try:
+                revoked = db.table("revoked_tokens").select("id").eq("jti", jti).execute()
+                if revoked.data:
+                    raise HTTPException(status_code=401, detail="Token has been revoked")
+            except HTTPException:
+                raise
+            except Exception:
+                pass  # DB error should not block auth
+
     return payload

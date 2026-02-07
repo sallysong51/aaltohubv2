@@ -37,7 +37,6 @@ export default function MessageBubble({ message, onReplyClick }: MessageBubblePr
   };
 
   const getSenderColor = (senderName: string) => {
-    // Generate consistent color based on sender name
     const colors = [
       'text-red-600',
       'text-blue-600',
@@ -67,11 +66,6 @@ export default function MessageBubble({ message, onReplyClick }: MessageBubblePr
       {/* Sender name */}
       <div className={`font-bold text-sm mb-1 ${getSenderColor(message.sender_name || 'Unknown')}`}>
         {message.sender_name || 'Unknown'}
-        {message.sender_username && (
-          <span className="text-muted-foreground font-normal ml-2">
-            @{message.sender_username}
-          </span>
-        )}
       </div>
 
       {/* Reply reference */}
@@ -86,16 +80,16 @@ export default function MessageBubble({ message, onReplyClick }: MessageBubblePr
       )}
 
       {/* Media preview */}
-      {message.media_type !== 'text' && (
+      {message.media_type && (
         <div className="mb-2">
-          {message.media_thumbnail_url && message.media_type === 'photo' && (
+          {message.media_url && message.media_type === 'photo' && (
             <img
-              src={message.media_thumbnail_url}
+              src={message.media_url}
               alt="Media"
               className="max-w-sm rounded border-2 border-border"
             />
           )}
-          
+
           {message.media_type !== 'photo' && (
             <div className="flex items-center gap-2 p-2 bg-muted rounded border-2 border-border max-w-sm">
               {getMediaIcon(message.media_type)}
@@ -135,18 +129,6 @@ export default function MessageBubble({ message, onReplyClick }: MessageBubblePr
         <span className="text-xs text-muted-foreground timestamp">
           {formatTime(message.sent_at)}
         </span>
-        
-        {message.edited_at && (
-          <Badge variant="outline" className="text-xs">
-            수정됨
-          </Badge>
-        )}
-        
-        {message.topic_title && (
-          <Badge variant="secondary" className="text-xs">
-            #{message.topic_title}
-          </Badge>
-        )}
       </div>
     </div>
   );

@@ -4,7 +4,9 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "dev": "vite --host",
+    "dev": "pnpm run dev:backend & pnpm run dev:frontend",
+    "dev:frontend": "vite --host",
+    "dev:backend": "cd backend && source venv/bin/activate && python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload",
     "build": "vite build",
     "start": "NODE_ENV=production node dist/index.js",
     "preview": "vite preview --host",

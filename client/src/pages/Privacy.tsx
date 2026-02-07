@@ -13,7 +13,7 @@ export default function Privacy() {
   return (
     <div className="min-h-screen bg-background">
       {/* Header */}
-      <div className="border-b-4 border-border bg-card">
+      <div className="border-b border-border bg-card">
         <div className="container py-6">
           <Button
             variant="outline"
@@ -32,7 +32,7 @@ export default function Privacy() {
 
       {/* Content */}
       <div className="container py-8">
-        <Card className="brutalist-card border-4">
+        <Card className="refined-card">
           <CardContent className="p-8 space-y-6">
             <section>
               <h2 className="text-2xl font-bold mb-4">1. 수집하는 개인정보</h2>

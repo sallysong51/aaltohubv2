@@ -3,6 +3,7 @@
  * Admin-only page for managing crawler status and viewing error logs
  */
 import { useState, useEffect } from 'react';
+import { useLocation } from 'wouter';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -10,12 +11,9 @@ import { Switch } from '@/components/ui/switch';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { toast } from 'sonner';
-import { Loader2, AlertCircle, CheckCircle, XCircle, RefreshCw } from 'lucide-react';
+import { Loader2, AlertCircle, CheckCircle, XCircle, RefreshCw, ArrowLeft } from 'lucide-react';
 import ProtectedRoute from '@/components/ProtectedRoute';
-import { useAuth } from '@/contexts/AuthContext';
-import axios from 'axios';
-
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+import apiClient, { getApiErrorMessage } from '@/lib/api';
 
 interface CrawlerStatus {
   id: string;
@@ -37,31 +35,60 @@ interface ErrorLog {
   group_title?: string;
   error_type: string;
   error_message: string;
-  error_details?: any;
+  error_details?: Record<string, unknown>;
   created_at: string;
 }
 
+interface LiveCrawlerStatus {
+  running: boolean;
+  connected: boolean;
+  groups_count: number;
+  messages_received: number;
+  historical_crawl_running: boolean;
+  crawled_groups: number;
+  uptime_seconds: number;
+}
+
 function CrawlerManagementContent() {
-  const { user } = useAuth();
+  const [, setLocation] = useLocation();
   const [crawlerStatuses, setCrawlerStatuses] = useState<CrawlerStatus[]>([]);
   const [errorLogs, setErrorLogs] = useState<ErrorLog[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingLogs, setIsLoadingLogs] = useState(false);
+  const [liveStatus, setLiveStatus] = useState<LiveCrawlerStatus | null>(null);
 
   useEffect(() => {
     loadCrawlerStatuses();
+    loadLiveStatus();
+    const interval = setInterval(loadLiveStatus, 30_000);
+    return () => clearInterval(interval);
   }, []);
+
+  const loadLiveStatus = async () => {
+    try {
+      const res = await apiClient.get('/admin/live-crawler/status');
+      setLiveStatus(res.data);
+    } catch { /* ignore */ }
+  };
+
+  const handleRestartLiveCrawler = async () => {
+    try {
+      await apiClient.post('/admin/live-crawler/restart');
+      toast.success('라이브 크롤러가 재시작되었습니다');
+      loadLiveStatus();
+      loadCrawlerStatuses();
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '크롤러 재시작 실패'));
+    }
+  };
 
   const loadCrawlerStatuses = async () => {
     setIsLoading(true);
     try {
-      const token = localStorage.getItem('access_token');
-      const response = await axios.get(`${API_BASE_URL}/api/admin/crawler-status`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await apiClient.get('/admin/crawler-status');
       setCrawlerStatuses(response.data);
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || '크롤러 상태를 불러오는데 실패했습니다');
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '크롤러 상태를 불러오는데 실패했습니다'));
     } finally {
       setIsLoading(false);
     }
@@ -70,16 +97,12 @@ function CrawlerManagementContent() {
   const loadErrorLogs = async (groupId?: string) => {
     setIsLoadingLogs(true);
     try {
-      const token = localStorage.getItem('access_token');
-      const url = groupId
-        ? `${API_BASE_URL}/api/admin/error-logs?group_id=${groupId}`
-        : `${API_BASE_URL}/api/admin/error-logs`;
-      const response = await axios.get(url, {
-        headers: { Authorization: `Bearer ${token}` },
+      const response = await apiClient.get('/admin/error-logs', {
+        params: groupId ? { group_id: groupId } : undefined,
       });
       setErrorLogs(response.data);
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || '에러 로그를 불러오는데 실패했습니다');
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '에러 로그를 불러오는데 실패했습니다'));
     } finally {
       setIsLoadingLogs(false);
     }
@@ -87,19 +110,13 @@ function CrawlerManagementContent() {
 
   const toggleCrawler = async (groupId: string, isEnabled: boolean) => {
     try {
-      const token = localStorage.getItem('access_token');
-      await axios.post(
-        `${API_BASE_URL}/api/admin/crawler-status/${groupId}/toggle`,
-        null,
-        {
-          params: { is_enabled: isEnabled },
-          headers: { Authorization: `Bearer ${token}` },
-        }
-      );
+      await apiClient.post(`/admin/crawler-status/${groupId}/toggle`, null, {
+        params: { is_enabled: isEnabled },
+      });
       toast.success(isEnabled ? '크롤러가 활성화되었습니다' : '크롤러가 비활성화되었습니다');
       loadCrawlerStatuses();
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || '크롤러 상태 변경에 실패했습니다');
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '크롤러 상태 변경에 실패했습니다'));
     }
   };
 
@@ -142,14 +159,26 @@ function CrawlerManagementContent() {
   };
 
   return (
-    <div className="min-h-screen bg-background p-4">
-      <div className="container max-w-7xl">
-        <div className="mb-6">
-          <h1 className="text-3xl font-bold mb-2">크롤러 관리</h1>
+    <div className="min-h-screen bg-background">
+      <div className="border-b border-border bg-card">
+        <div className="container max-w-7xl py-6">
+          <Button
+            variant="outline"
+            onClick={() => setLocation('/admin')}
+            className="mb-4"
+          >
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            돌아가기
+          </Button>
+          <h1 className="text-4xl font-bold mb-2">크롤러 관리</h1>
           <p className="text-muted-foreground">
             그룹별 크롤링 상태를 모니터링하고 에러 로그를 확인하세요
           </p>
         </div>
+      </div>
+
+      <div className="container max-w-7xl p-4">
+        <div className="mb-6" />
 
         <Tabs defaultValue="status" className="w-full">
           <TabsList className="mb-4">
@@ -160,6 +189,58 @@ function CrawlerManagementContent() {
           </TabsList>
 
           <TabsContent value="status">
+            {/* Live Crawler Status */}
+            {liveStatus && (
+              <Card className="mb-4">
+                <CardHeader>
+                  <div className="flex items-center justify-between">
+                    <CardTitle>라이브 크롤러</CardTitle>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleRestartLiveCrawler}
+                    >
+                      <RefreshCw className="mr-2 h-4 w-4" />
+                      재시작
+                    </Button>
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <div>
+                      <p className="text-sm text-muted-foreground">상태</p>
+                      <Badge variant={liveStatus.running && liveStatus.connected ? 'default' : 'destructive'}
+                        className={liveStatus.running && liveStatus.connected ? 'bg-green-500' : ''}>
+                        {liveStatus.running && liveStatus.connected ? '활성' : '비활성'}
+                      </Badge>
+                    </div>
+                    <div>
+                      <p className="text-sm text-muted-foreground">감시 그룹</p>
+                      <p className="text-lg font-bold">{liveStatus.groups_count}개</p>
+                    </div>
+                    <div>
+                      <p className="text-sm text-muted-foreground">수신 메시지</p>
+                      <p className="text-lg font-bold">{liveStatus.messages_received}건</p>
+                    </div>
+                    <div>
+                      <p className="text-sm text-muted-foreground">역사 크롤링</p>
+                      <p className="text-lg font-bold">
+                        {liveStatus.historical_crawl_running
+                          ? `진행 중 (${liveStatus.crawled_groups}개 완료)`
+                          : `완료 (${liveStatus.crawled_groups}개)`
+                        }
+                      </p>
+                    </div>
+                  </div>
+                  {liveStatus.uptime_seconds > 0 && (
+                    <p className="text-xs text-muted-foreground mt-2">
+                      Uptime: {Math.floor(liveStatus.uptime_seconds / 3600)}시간 {Math.floor((liveStatus.uptime_seconds % 3600) / 60)}분
+                    </p>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+
             <Card>
               <CardHeader>
                 <div className="flex items-center justify-between">
@@ -228,9 +309,11 @@ function CrawlerManagementContent() {
                                     className="bg-primary h-2 rounded-full transition-all"
                                     style={{
                                       width: `${
-                                        (crawler.initial_crawl_progress /
-                                          crawler.initial_crawl_total) *
-                                        100
+                                        crawler.initial_crawl_total > 0
+                                          ? Math.min(100, (crawler.initial_crawl_progress /
+                                              crawler.initial_crawl_total) *
+                                            100)
+                                          : 0
                                       }%`,
                                     }}
                                   />
@@ -338,7 +421,7 @@ function CrawlerManagementContent() {
 
 export default function CrawlerManagement() {
   return (
-    <ProtectedRoute requireAdmin>
+    <ProtectedRoute adminOnly>
       <CrawlerManagementContent />
     </ProtectedRoute>
   );

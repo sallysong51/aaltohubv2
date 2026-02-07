@@ -1,0 +1,22 @@
+[Unit]
+Description=AaltoHub v2 Enhanced Message Crawler
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/aaltohubv2/backend
+Environment="PATH=/home/ubuntu/aaltohubv2/backend/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/ubuntu/aaltohubv2/backend/venv/bin/python /home/ubuntu/aaltohubv2/backend/scripts/crawler_enhanced.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/aaltohub-crawler.log
+StandardError=append:/var/log/aaltohub-crawler-error.log
+
+# Restart on failure
+StartLimitIntervalSec=3600
+StartLimitBurst=20
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

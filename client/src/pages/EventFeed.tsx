@@ -3,13 +3,13 @@
  * Shows aggregated messages from all registered groups
  * Uses Supabase Realtime for instant message updates + polling fallback
  */
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useLocation } from 'wouter';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { toast } from 'sonner';
-import { Loader2, Calendar, Users, Settings, MessageSquare, Globe, RefreshCw, Zap } from 'lucide-react';
+import { Loader2, Calendar, Users, Settings, MessageSquare, Globe, RefreshCw, Zap, LayoutDashboard } from 'lucide-react';
 import { groupsApi, RegisteredGroup, Message, getApiErrorMessage } from '@/lib/api';
 import ProtectedRoute from '@/components/ProtectedRoute';
 import { useAuth } from '@/contexts/AuthContext';
@@ -63,6 +63,12 @@ function EventFeedContent() {
     }
   }, [groups, selectedGroupId, selectedTopicId]);
 
+  // Stable key for realtime subscription — only changes when the actual set of group IDs changes
+  const groupIdsKey = useMemo(
+    () => groups.map(g => g.id).sort().join(','),
+    [groups]
+  );
+
   // Supabase Realtime subscription for instant message updates
   useEffect(() => {
     if (groups.length === 0) return;
@@ -70,14 +76,12 @@ function EventFeedContent() {
     const groupIds = new Set(groups.map(g => g.id));
 
     const channel = supabase
-      .channel('live-messages')
+      .channel('messages')
       .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'messages' },
-        (payload) => {
-          const newMsg = payload.new as Message;
-          // Skip messages without a valid id
-          if (!newMsg.id) return;
+        'broadcast',
+        { event: 'insert' },
+        ({ payload: newMsg }: { payload: Message }) => {
+          if (!newMsg || !newMsg.group_id) return;
           // Only add if it belongs to one of the user's groups
           if (!groupIds.has(newMsg.group_id)) return;
           // Filter by selected group
@@ -88,8 +92,8 @@ function EventFeedContent() {
           if (newMsg.is_deleted) return;
 
           setMessages(prev => {
-            // Deduplicate
-            if (prev.some(m => m.id === newMsg.id)) return prev;
+            // Deduplicate by telegram_message_id + group_id (id may not be available from broadcast)
+            if (prev.some(m => m.telegram_message_id === newMsg.telegram_message_id && m.group_id === newMsg.group_id)) return prev;
             // Insert at the top (newest first)
             return [newMsg, ...prev];
           });
@@ -97,16 +101,15 @@ function EventFeedContent() {
         }
       )
       .on(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'messages' },
-        (payload) => {
-          const updated = payload.new as Message;
-          if (!groupIds.has(updated.group_id)) return;
+        'broadcast',
+        { event: 'update' },
+        ({ payload: updated }: { payload: Message }) => {
+          if (!updated || !groupIds.has(updated.group_id)) return;
 
           setMessages(prev =>
             updated.is_deleted
-              ? prev.filter(m => m.id !== updated.id)
-              : prev.map(m => m.id === updated.id ? updated : m)
+              ? prev.filter(m => !(m.telegram_message_id === updated.telegram_message_id && m.group_id === updated.group_id))
+              : prev.map(m => (m.telegram_message_id === updated.telegram_message_id && m.group_id === updated.group_id) ? { ...m, ...updated } : m)
           );
         }
       )
@@ -118,7 +121,7 @@ function EventFeedContent() {
       supabase.removeChannel(channel);
       setRealtimeConnected(false);
     };
-  }, [groups]);
+  }, [groupIdsKey]);
 
   // Fallback polling (only when on page 1, less frequent since Realtime is primary)
   useEffect(() => {
@@ -153,46 +156,26 @@ function EventFeedContent() {
   };
 
   const fetchMessages = useCallback(async (currentGroups: RegisteredGroup[], pageNum: number = 1) => {
-    const groupsToFetch = selectedGroupId
-      ? currentGroups.filter(g => g.id === selectedGroupId)
-      : currentGroups;
+    const groupIds = selectedGroupId
+      ? [selectedGroupId]
+      : currentGroups.filter(g => g.id).map(g => g.id);
 
-    const validGroups = groupsToFetch.filter(g => g.id);
-
-    if (validGroups.length === 0) {
+    if (groupIds.length === 0) {
       return { messages: [] as Message[], hasMore: false };
     }
 
-    const messagePromises = validGroups.map(group =>
-      groupsApi.getGroupMessages(group.id, pageNum, 50)
+    // Single aggregated API call instead of N parallel calls
+    const response = await groupsApi.getAggregatedMessages(
+      groupIds,
+      pageNum,
+      50,
+      selectedTopicId ?? undefined
     );
 
-    const responses = await Promise.all(messagePromises);
-
-    let anyHasMore = false;
-    const seen = new Set<string>();
-    const allMessages: Message[] = [];
-    responses.forEach(response => {
-      for (const msg of response.data.messages) {
-        if (msg.id && !seen.has(msg.id)) {
-          seen.add(msg.id);
-          allMessages.push(msg);
-        }
-      }
-      if (response.data.has_more) anyHasMore = true;
-    });
-
-    // Filter by topic if selected
-    if (selectedTopicId !== null) {
-      allMessages = allMessages.filter(msg => msg.topic_id === selectedTopicId);
-    }
-
-    // Sort by sent_at descending (newest first)
-    allMessages.sort((a, b) =>
-      new Date(b.sent_at).getTime() - new Date(a.sent_at).getTime()
-    );
-
-    return { messages: allMessages, hasMore: anyHasMore };
+    return {
+      messages: response.data.messages,
+      hasMore: response.data.has_more,
+    };
   }, [selectedGroupId, selectedTopicId]);
 
   const loadMessages = async () => {
@@ -290,14 +273,13 @@ function EventFeedContent() {
   if (groups.length === 0) {
     return (
       <div className="min-h-screen bg-background">
-        <div className="border-b-4 border-border bg-card">
+        <div className="border-b border-border bg-card">
           <div className="container py-6">
             <div className="flex items-center justify-between">
               <h1 className="text-4xl font-bold">이벤트 피드</h1>
               <Button
                 variant="outline"
                 onClick={logout}
-                className="border-2 border-border"
               >
                 로그아웃
               </Button>
@@ -306,7 +288,7 @@ function EventFeedContent() {
         </div>
 
         <div className="container py-8">
-          <Card className="brutalist-card border-4">
+          <Card className="refined-card">
             <CardContent className="pt-6">
               <div className="text-center py-12">
                 <MessageSquare className="h-16 w-16 mx-auto mb-4 text-muted-foreground" />
@@ -316,7 +298,7 @@ function EventFeedContent() {
                 </p>
                 <Button
                   onClick={() => setLocation('/groups/select')}
-                  className="border-2 border-border btn-pressed"
+                  className="btn-pressed"
                   size="lg"
                 >
                   <Globe className="mr-2 h-5 w-5" />
@@ -333,11 +315,11 @@ function EventFeedContent() {
   return (
     <div className="min-h-screen bg-background">
       {/* Header */}
-      <div className="border-b-4 border-border bg-card sticky top-0 z-10">
+      <div className="border-b border-border bg-card sticky top-0 z-10">
         <div className="container py-4">
           <div className="flex items-center justify-between mb-4">
             <div>
-              <h1 className="text-3xl font-bold mb-1">이벤트 피드</h1>
+              <h1 className="text-4xl font-bold mb-1">이벤트 피드</h1>
               <p className="text-sm text-muted-foreground">
                 {user?.first_name || user?.username || '사용자'}님의 그룹 메시지
               </p>
@@ -363,6 +345,17 @@ function EventFeedContent() {
               >
                 <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
               </Button>
+              {user?.role === 'admin' && (
+                <Button
+                  variant="outline"
+                  onClick={() => setLocation('/admin')}
+                  className="border-2 border-border"
+                  size="sm"
+                >
+                  <LayoutDashboard className="h-4 w-4 mr-2" />
+                  관리자
+                </Button>
+              )}
               <Button
                 variant="outline"
                 onClick={() => setLocation('/groups')}
@@ -426,7 +419,7 @@ function EventFeedContent() {
             <Loader2 className="h-8 w-8 animate-spin text-primary" />
           </div>
         ) : messages.length === 0 ? (
-          <Card className="brutalist-card border-4">
+          <Card className="refined-card">
             <CardContent className="pt-6">
               <div className="text-center py-12">
                 <MessageSquare className="h-16 w-16 mx-auto mb-4 text-muted-foreground" />
@@ -445,30 +438,20 @@ function EventFeedContent() {
             {messages.filter(m => m.id).map((message, index) => {
               const group = getGroupById(message.group_id);
               return (
-                <Card key={message.id ?? `msg-${index}`} className="brutalist-card border-4">
+                <Card key={message.id ?? `msg-${index}`} className="refined-card">
                   <CardContent className="p-4">
                     {/* Message Header */}
                     <div className="flex items-start justify-between mb-3">
                       <div className="flex-1">
                         <div className="flex items-center gap-2 mb-1">
                           <span className="font-bold">
-                            {message.sender_name || message.sender_username || 'Anonymous'}
+                            {message.sender_name || 'Anonymous'}
                           </span>
-                          {message.sender_username && (
-                            <span className="text-xs text-muted-foreground">
-                              @{message.sender_username}
-                            </span>
-                          )}
                         </div>
                         <div className="flex items-center gap-2 flex-wrap">
-                          <Badge variant="outline" className="border-2">
+                          <Badge variant="outline">
                             {group?.title || 'Unknown Group'}
                           </Badge>
-                          {message.topic_title && (
-                            <Badge variant="secondary" className="border-2">
-                              {message.topic_title}
-                            </Badge>
-                          )}
                           <span className="text-xs text-muted-foreground">
                             <Calendar className="inline h-3 w-3 mr-1" />
                             {formatMessageTime(message.sent_at)}
@@ -485,9 +468,9 @@ function EventFeedContent() {
                     )}
 
                     {/* Media */}
-                    {message.media_type !== 'text' && (
+                    {message.media_type && (
                       <div className="mt-2">
-                        <Badge variant="outline" className="border-2">
+                        <Badge variant="outline">
                           {message.media_type}
                         </Badge>
                       </div>
@@ -503,12 +486,6 @@ function EventFeedContent() {
                       </div>
                     )}
 
-                    {/* Edit indicator */}
-                    {message.edit_count > 0 && (
-                      <div className="mt-2 text-xs text-muted-foreground">
-                        (수정됨 {message.edit_count}회)
-                      </div>
-                    )}
                   </CardContent>
                 </Card>
               );

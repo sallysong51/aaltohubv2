@@ -3,9 +3,19 @@
  */
 import axios, { AxiosInstance, AxiosError } from 'axios';
 
-// API base URL - update this to your backend URL
-// Use relative URL for Vercel proxy - requests to /api/* are proxied to EC2 backend
-const API_BASE_URL = '';
+/** Extract error detail message from API error response */
+export function getApiErrorMessage(error: unknown, fallback: string): string {
+  if (axios.isAxiosError(error)) {
+    return error.response?.data?.detail || fallback;
+  }
+  return fallback;
+}
+
+// API base URL configuration:
+// - Development: empty string → requests go to same origin → Vite proxy forwards to backend
+// - Production (Vercel): empty string → Vercel serverless proxy forwards to EC2 backend
+// - Override: set VITE_API_URL to an absolute URL (e.g. http://localhost:8000)
+const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
 // Create axios instance
 const apiClient: AxiosInstance = axios.create({
@@ -30,31 +40,50 @@ apiClient.interceptors.request.use(
   }
 );
 
-// Response interceptor to handle token refresh
+// Token refresh mutex — prevents concurrent 401 responses from each
+// independently refreshing the token (which would invalidate the first
+// refresh and force-logout the user).
+let refreshPromise: Promise<string> | null = null;
+
+// Response interceptor to handle network errors and token refresh
 apiClient.interceptors.response.use(
   (response) => response,
   async (error: AxiosError) => {
-    const originalRequest = error.config as any;
+    // Network error (backend unreachable) — no response at all
+    if (!error.response) {
+      const networkError: Error & { isNetworkError?: boolean } = new Error('Backend server is not reachable. Please make sure the backend is running.');
+      networkError.isNetworkError = true;
+      return Promise.reject(networkError);
+    }
+
+    const originalRequest = error.config as typeof error.config & { _retry?: boolean };
 
     // If 401 and not already retried, try to refresh token
     if (error.response?.status === 401 && !originalRequest._retry) {
       originalRequest._retry = true;
 
       try {
-        const refreshToken = localStorage.getItem('refresh_token');
-        if (refreshToken) {
-          const response = await axios.post(`${API_BASE_URL}/api/auth/refresh`, {
-            refresh_token: refreshToken,
-          });
+        // If a refresh is already in progress, wait for it instead of
+        // firing a second refresh request.
+        if (!refreshPromise) {
+          refreshPromise = (async () => {
+            const refreshToken = localStorage.getItem('refresh_token');
+            if (!refreshToken) throw new Error('No refresh token');
 
-          const { access_token, refresh_token: newRefreshToken } = response.data;
-          localStorage.setItem('access_token', access_token);
-          localStorage.setItem('refresh_token', newRefreshToken);
+            const response = await axios.post(`${API_BASE_URL}/api/auth/refresh`, {
+              refresh_token: refreshToken,
+            });
 
-          // Retry original request with new token
-          originalRequest.headers.Authorization = `Bearer ${access_token}`;
-          return apiClient(originalRequest);
+            const { access_token, refresh_token: newRefreshToken } = response.data;
+            localStorage.setItem('access_token', access_token);
+            localStorage.setItem('refresh_token', newRefreshToken);
+            return access_token;
+          })();
         }
+
+        const newAccessToken = await refreshPromise;
+        originalRequest.headers.Authorization = `Bearer ${newAccessToken}`;
+        return apiClient(originalRequest);
       } catch (refreshError) {
         // Refresh failed, logout user
         localStorage.removeItem('access_token');
@@ -62,6 +91,8 @@ apiClient.interceptors.response.use(
         localStorage.removeItem('user');
         window.location.href = '/login';
         return Promise.reject(refreshError);
+      } finally {
+        refreshPromise = null;
       }
     }
 
@@ -141,6 +172,7 @@ export interface TelegramGroup {
   member_count?: number;
   group_type?: 'group' | 'supergroup' | 'channel';
   is_registered?: boolean;
+  photo_url?: string;  // Group profile photo URL (optional)
 }
 
 export interface RegisteredGroup {
@@ -152,11 +184,9 @@ export interface RegisteredGroup {
   group_type?: 'group' | 'supergroup' | 'channel';
   visibility: 'public' | 'private';
   invite_link?: string;
+  description?: string;
   registered_by?: string;
-  admin_invited: boolean;
-  admin_invite_error?: string;
   created_at: string;
-  updated_at: string;
 }
 
 export interface RegisterGroupsRequest {
@@ -173,11 +203,6 @@ export interface RegisterGroupsRequest {
 export interface RegisterGroupsResponse {
   success: boolean;
   registered_groups: RegisteredGroup[];
-  failed_invites: Array<{
-    group_id: string;
-    title: string;
-    error: string;
-  }>;
 }
 
 export interface Message {
@@ -186,17 +211,12 @@ export interface Message {
   group_id: string;
   sender_id?: number;
   sender_name?: string;
-  sender_username?: string;
   content?: string;
-  media_type: string;
+  media_type?: string;  // photo, video, document, audio, sticker, voice (null = text)
   media_url?: string;
-  media_thumbnail_url?: string;
   reply_to_message_id?: number;
   topic_id?: number;
-  topic_title?: string;
   is_deleted: boolean;
-  edited_at?: string;
-  edit_count: number;
   sent_at: string;
   created_at: string;
 }
@@ -209,6 +229,24 @@ export interface MessagesListResponse {
   has_more: boolean;
 }
 
+export interface InviteLink {
+  id: string;
+  token: string;
+  expires_at?: string;
+  is_revoked: boolean;
+  used_count: number;
+  max_uses?: number;
+  created_at: string;
+}
+
+export interface CreateInviteLinkResponse {
+  success: boolean;
+  invite_link: string;
+  token: string;
+  expires_at?: string;
+  max_uses?: number;
+}
+
 export const groupsApi = {
   getMyTelegramGroups: () =>
     apiClient.get<TelegramGroup[]>('/groups/my-telegram-groups'),
@@ -219,13 +257,46 @@ export const groupsApi = {
   getRegisteredGroups: () =>
     apiClient.get<RegisteredGroup[]>('/groups/registered'),
 
-  getGroupMessages: (groupId: string, page: number = 1, pageSize: number = 50) =>
+  getGroupMessages: (groupId: string, page: number = 1, pageSize: number = 50, topicId?: number) =>
     apiClient.get<MessagesListResponse>(`/groups/${groupId}/messages`, {
-      params: { page, page_size: pageSize },
+      params: { page, page_size: pageSize, ...(topicId != null ? { topic_id: topicId } : {}) },
     }),
 
-  retryInviteAdmin: (groupId: string) =>
-    apiClient.post(`/groups/${groupId}/invite-admin`),
+  getAggregatedMessages: (groupIds: string[], page: number = 1, pageSize: number = 50, topicId?: number) =>
+    apiClient.get<MessagesListResponse>('/groups/messages/aggregated', {
+      params: {
+        group_ids: groupIds.join(','),
+        page,
+        page_size: pageSize,
+        ...(topicId != null ? { topic_id: topicId } : {}),
+      },
+    }),
+
+  getGroup: (groupId: string) =>
+    apiClient.get<RegisteredGroup>(`/groups/${groupId}`),
+
+  updateVisibility: (groupId: string, visibility: 'public' | 'private') =>
+    apiClient.patch(`/groups/${groupId}/visibility`, null, {
+      params: { visibility },
+    }),
+
+  getInviteLinks: (groupId: string) =>
+    apiClient.get<InviteLink[]>(`/groups/${groupId}/invite-links`),
+
+  createInviteLink: (groupId: string, expiresAt?: string, maxUses?: number) =>
+    apiClient.post<CreateInviteLinkResponse>(`/groups/${groupId}/invite-link`, {
+      expires_at: expiresAt,
+      max_uses: maxUses,
+    }),
+
+  revokeInviteLink: (groupId: string, inviteId: string) =>
+    apiClient.post(`/groups/${groupId}/invite-link/${inviteId}/revoke`),
+
+  acceptInvite: (token: string) =>
+    apiClient.post<{ success: boolean; group_id: string }>(`/groups/invite/${token}/accept`),
+
+  deleteGroup: (groupId: string) =>
+    apiClient.delete(`/groups/${groupId}`),
 };
 
 // ============================================================
@@ -248,10 +319,31 @@ export const adminApi = {
       params: { page, page_size: pageSize, days },
     }),
 
-  getFailedInvites: () =>
-    apiClient.get<{ failed_invites: Array<{ id: string; telegram_id: number; title: string; error: string; created_at: string }> }>('/admin/failed-invites'),
-
   getStats: () => apiClient.get<AdminStats>('/admin/stats'),
+
+  getAllUsers: () => apiClient.get<User[]>('/admin/users'),
+
+  updateUserRole: (userId: string, role: 'admin' | 'user') =>
+    apiClient.patch<{ success: boolean; user_id: string; new_role: string }>(
+      `/admin/users/${userId}/role`,
+      null,
+      { params: { role } }
+    ),
+
+  getCrawlerStatus: () => apiClient.get('/admin/crawler-status'),
+
+  getLiveCrawlerStatus: () => apiClient.get('/admin/live-crawler/status'),
+
+  restartLiveCrawler: () => apiClient.post('/admin/live-crawler/restart'),
+
+  triggerHistoricalCrawl: (groupId: string) =>
+    apiClient.post(`/admin/groups/${groupId}/crawl`),
+
+  getFailedMessages: (resolved: boolean = false, limit: number = 100) =>
+    apiClient.get('/admin/failed-messages', { params: { resolved, limit } }),
+
+  retryFailedMessage: (messageId: string) =>
+    apiClient.post(`/admin/failed-messages/${messageId}/retry`),
 };
 
 // ============================================================

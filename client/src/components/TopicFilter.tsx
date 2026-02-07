@@ -7,10 +7,11 @@ import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Badge } from '@/components/ui/badge';
 import { Hash } from 'lucide-react';
+import apiClient from '@/lib/api';
 
 interface Topic {
-  id: number;
-  title: string;
+  topic_id: number;
+  topic_title: string;
   message_count?: number;
 }
 
@@ -25,21 +26,30 @@ export default function TopicFilter({ groupId, selectedTopicId, onTopicSelect }:
   const [isLoading, setIsLoading] = useState(false);
 
   useEffect(() => {
-    loadTopics();
-  }, [groupId]);
+    const controller = new AbortController();
 
-  const loadTopics = async () => {
-    setIsLoading(true);
-    try {
-      // TODO: Implement API call to get topics for this group
-      // For now, return empty array
-      setTopics([]);
-    } catch (error) {
-      console.error('Failed to load topics:', error);
-    } finally {
-      setIsLoading(false);
-    }
-  };
+    const loadTopics = async () => {
+      setIsLoading(true);
+      try {
+        const response = await apiClient.get(`/groups/${groupId}/topics`, {
+          signal: controller.signal,
+        });
+        setTopics(response.data);
+      } catch {
+        if (!controller.signal.aborted) {
+          setTopics([]);
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setIsLoading(false);
+        }
+      }
+    };
+
+    loadTopics();
+
+    return () => controller.abort();
+  }, [groupId]);
 
   if (topics.length === 0) {
     return null; // Don't show topic filter if no topics
@@ -51,7 +61,7 @@ export default function TopicFilter({ groupId, selectedTopicId, onTopicSelect }:
         <Hash className="h-4 w-4" />
         <span className="font-bold text-sm">토픽</span>
       </div>
-      
+
       <ScrollArea className="h-32">
         <div className="space-y-1">
           <Button
@@ -62,17 +72,17 @@ export default function TopicFilter({ groupId, selectedTopicId, onTopicSelect }:
           >
             전체 메시지
           </Button>
-          
+
           {topics.map((topic) => (
             <Button
-              key={topic.id}
-              variant={selectedTopicId === topic.id ? 'default' : 'ghost'}
+              key={topic.topic_id}
+              variant={selectedTopicId === topic.topic_id ? 'default' : 'ghost'}
               size="sm"
               className="w-full justify-between"
-              onClick={() => onTopicSelect(topic.id)}
+              onClick={() => onTopicSelect(topic.topic_id)}
             >
-              <span className="truncate">{topic.title}</span>
-              {topic.message_count && (
+              <span className="truncate">{topic.topic_title}</span>
+              {topic.message_count != null && topic.message_count > 0 && (
                 <Badge variant="outline" className="ml-2">
                   {topic.message_count}
                 </Badge>

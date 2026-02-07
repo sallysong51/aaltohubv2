@@ -5,7 +5,7 @@ Runs 24/7 on AWS EC2 to collect messages from registered groups
 import asyncio
 import sys
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Add parent directory to path
@@ -24,7 +24,7 @@ class MessageCrawler:
     
     def __init__(self):
         self.client = None
-        self.supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+        self.supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
         self.group_id_map = {}  # telegram_id -> uuid mapping
         self.running = False
     
@@ -74,23 +74,24 @@ class MessageCrawler:
     async def load_groups(self):
         """Load all public groups from database"""
         print("Loading registered groups...")
-        
-        groups_response = self.supabase.table("telegram_groups").select("*").eq("visibility", "public").eq("admin_invited", True).execute()
-        
+
+        groups_response = self.supabase.table("groups").select("*").eq("visibility", "public").eq("crawl_enabled", True).execute()
+
         if not groups_response.data:
             print("No public groups found.")
             return
-        
+
+        # groups.id IS the telegram group ID
         self.group_id_map = {
-            group["telegram_id"]: group["id"]
+            group["id"]: group["id"]
             for group in groups_response.data
         }
-        
+
         print(f"Loaded {len(self.group_id_map)} groups:")
         for group in groups_response.data:
-            print(f"  - {group['title']} (ID: {group['telegram_id']})")
+            print(f"  - {group.get('title') or group.get('name', 'Unknown')} (ID: {group['id']})")
     
-    async def crawl_historical_messages(self, group_telegram_id: int, days: int = 30):
+    async def crawl_historical_messages(self, group_telegram_id: int, days: int = 14):
         """Crawl historical messages from a group"""
         group_uuid = self.group_id_map.get(group_telegram_id)
         if not group_uuid:
@@ -103,7 +104,7 @@ class MessageCrawler:
             group = await self.client.get_entity(group_telegram_id)
             
             # Calculate date threshold
-            date_threshold = datetime.utcnow() - timedelta(days=days)
+            date_threshold = datetime.now(timezone.utc) - timedelta(days=days)
             
             # Get messages
             messages = []
@@ -125,9 +126,8 @@ class MessageCrawler:
         """Save a message to database"""
         try:
             # Determine media type
-            media_type = "text"
+            media_type = None  # DB enum: photo, video, document, audio, sticker, voice (NULL=text)
             media_url = None
-            media_thumbnail_url = None
             
             if message.media:
                 if hasattr(message.media, 'photo'):
@@ -140,7 +140,7 @@ class MessageCrawler:
                     else:
                         media_type = "document"
                 elif hasattr(message.media, 'webpage'):
-                    media_type = "text"
+                    media_type = None
             
             # Get sender info
             sender_id = message.sender_id
@@ -157,22 +157,19 @@ class MessageCrawler:
                 "group_id": group_uuid,
                 "sender_id": sender_id,
                 "sender_name": sender_name,
-                "sender_username": sender_username,
                 "content": message.text,
                 "media_type": media_type,
                 "media_url": media_url,
-                "media_thumbnail_url": media_thumbnail_url,
                 "reply_to_message_id": message.reply_to_msg_id,
                 "sent_at": message.date.isoformat()
             }
             
-            # Insert into database (ignore duplicates)
-            try:
-                self.supabase.table("messages").insert(message_data).execute()
-            except Exception as e:
-                # Ignore duplicate key errors
-                if "duplicate" not in str(e).lower():
-                    raise
+            # Upsert into database (ON CONFLICT DO NOTHING for duplicates)
+            self.supabase.table("messages").upsert(
+                message_data,
+                on_conflict="telegram_message_id,group_id",
+                ignore_duplicates=True,
+            ).execute()
         except Exception as e:
             print(f"Error saving message {message.id}: {e}")
     
@@ -209,7 +206,7 @@ class MessageCrawler:
             # Crawl historical messages for all groups
             print("\n=== Crawling historical messages ===")
             for group_telegram_id in self.group_id_map.keys():
-                await self.crawl_historical_messages(group_telegram_id, days=30)
+                await self.crawl_historical_messages(group_telegram_id, days=14)
             
             print("\n=== Historical crawling complete ===\n")
             

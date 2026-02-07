@@ -12,9 +12,11 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Label } from '@/components/ui/label';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Badge } from '@/components/ui/badge';
+import { Avatar, AvatarImage, AvatarFallback } from '@/components/ui/avatar';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
-import { Loader2, Users, Lock, Globe, ChevronRight, AlertCircle } from 'lucide-react';
-import { groupsApi, TelegramGroup } from '@/lib/api';
+import { Loader2, Users, Lock, Globe, ChevronRight, AlertCircle, Info } from 'lucide-react';
+import { groupsApi, TelegramGroup, getApiErrorMessage } from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
 import ProtectedRoute from '@/components/ProtectedRoute';
 
@@ -47,8 +49,8 @@ function GroupSelectionContent() {
         }
       });
       setGroupVisibility(visibilityMap);
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || '그룹 목록을 불러오는데 실패했습니다');
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '그룹 목록을 불러오는데 실패했습니다'));
     } finally {
       setIsLoading(false);
     }
@@ -62,6 +64,26 @@ function GroupSelectionContent() {
       newSelected.add(telegramId);
     }
     setSelectedGroups(newSelected);
+  };
+
+  const selectAllGroups = () => {
+    const allUnregisteredIds = unregisteredGroups.map(g => g.telegram_id);
+    setSelectedGroups(new Set(allUnregisteredIds));
+    toast.success(`${allUnregisteredIds.length}개 그룹이 모두 선택되었습니다`);
+  };
+
+  const deselectAllGroups = () => {
+    setSelectedGroups(new Set());
+    toast.info('선택이 모두 해제되었습니다');
+  };
+
+  const setAllVisibility = (visibility: 'public' | 'private') => {
+    const newMap = new Map(groupVisibility);
+    selectedGroups.forEach(groupId => {
+      newMap.set(groupId, visibility);
+    });
+    setGroupVisibility(newMap);
+    toast.success(`모든 그룹이 ${visibility === 'public' ? '공개' : '비공개'}로 설정되었습니다`);
   };
 
   const handleNext = () => {
@@ -89,25 +111,31 @@ function GroupSelectionContent() {
       const response = await groupsApi.registerGroups({ groups: groupsToRegister });
 
       if (response.data.success) {
-        toast.success(`${response.data.registered_groups.length}개 그룹이 등록되었습니다`);
-        
-        // Show failed invites if any
-        if (response.data.failed_invites.length > 0) {
-          toast.warning(
-            `${response.data.failed_invites.length}개 그룹에 관리자 초대 실패`,
-            { description: '관리자 대시보드에서 수동으로 초대할 수 있습니다' }
-          );
-        }
+        const publicCount = groupsToRegister.filter(g => g.visibility === 'public').length;
+        const privateCount = groupsToRegister.filter(g => g.visibility === 'private').length;
+
+        toast.success(
+          `${response.data.registered_groups.length}개 그룹 등록 완료`,
+          {
+            description: publicCount > 0 && privateCount > 0
+              ? `공개: ${publicCount}개, 비공개: ${privateCount}개`
+              : publicCount > 0
+              ? `모두 공개로 등록되었습니다`
+              : `모두 비공개로 등록되었습니다`,
+          }
+        );
 
         // Redirect based on role
-        if (user?.role === 'admin') {
-          setLocation('/admin');
-        } else {
-          setLocation('/groups');
-        }
+        setTimeout(() => {
+          if (user?.role === 'admin') {
+            setLocation('/admin');
+          } else {
+            setLocation('/groups');
+          }
+        }, 1500);
       }
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || '그룹 등록에 실패했습니다');
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '그룹 등록에 실패했습니다'));
     } finally {
       setIsRegistering(false);
     }
@@ -134,23 +162,80 @@ function GroupSelectionContent() {
               <p className="text-muted-foreground">
                 등록할 텔레그램 그룹을 선택하세요
               </p>
+              {unregisteredGroups.length > 0 && (
+                <div className="mt-4 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Badge variant={selectedGroups.size > 0 ? "default" : "outline"} className="border-2">
+                      {selectedGroups.size}개 선택됨
+                    </Badge>
+                    <span className="text-sm text-muted-foreground">
+                      / 총 {unregisteredGroups.length}개 그룹
+                    </span>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={selectAllGroups}
+                      disabled={selectedGroups.size === unregisteredGroups.length}
+                      className="border-2"
+                    >
+                      모두 선택
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={deselectAllGroups}
+                      disabled={selectedGroups.size === 0}
+                      className="border-2"
+                    >
+                      선택 해제
+                    </Button>
+                  </div>
+                </div>
+              )}
             </div>
 
             {unregisteredGroups.length === 0 ? (
-              <Card className="brutalist-card border-4">
+              <Card className="refined-card">
                 <CardContent className="pt-6">
                   <div className="text-center py-8">
-                    <AlertCircle className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
-                    <p className="text-lg font-medium mb-2">등록 가능한 그룹이 없습니다</p>
-                    <p className="text-sm text-muted-foreground mb-4">
-                      모든 그룹이 이미 등록되었습니다
-                    </p>
-                    <Button
-                      onClick={() => setLocation(user?.role === 'admin' ? '/admin' : '/groups')}
-                      className="border-2 border-border btn-pressed"
-                    >
-                      계속하기
-                    </Button>
+                    {registeredGroups.length > 0 ? (
+                      <>
+                        <Users className="h-12 w-12 mx-auto mb-4 text-primary" />
+                        <p className="text-lg font-medium mb-2">모든 그룹이 등록되었습니다</p>
+                        <p className="text-sm text-muted-foreground mb-4">
+                          텔레그램 그룹 {registeredGroups.length}개가 모두 AaltoHub에 등록되어 있습니다
+                        </p>
+                        <Button
+                          onClick={() => setLocation(user?.role === 'admin' ? '/admin' : '/groups')}
+                          className="border-2 border-border btn-pressed"
+                        >
+                          그룹 관리로 이동
+                        </Button>
+                      </>
+                    ) : (
+                      <>
+                        <AlertCircle className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
+                        <p className="text-lg font-medium mb-2">가입된 그룹이 없습니다</p>
+                        <p className="text-sm text-muted-foreground mb-4">
+                          텔레그램에서 그룹에 가입한 후 다시 시도해주세요
+                        </p>
+                        <Button
+                          onClick={loadGroups}
+                          variant="outline"
+                          className="border-2 border-border mr-2"
+                        >
+                          새로고침
+                        </Button>
+                        <Button
+                          onClick={() => setLocation(user?.role === 'admin' ? '/admin' : '/groups')}
+                          className="border-2 border-border btn-pressed"
+                        >
+                          계속하기
+                        </Button>
+                      </>
+                    )}
                   </div>
                 </CardContent>
               </Card>
@@ -160,7 +245,7 @@ function GroupSelectionContent() {
                   {unregisteredGroups.map((group) => (
                     <Card
                       key={group.telegram_id}
-                      className={`brutalist-card border-4 cursor-pointer transition-all ${
+                      className={`refined-card cursor-pointer transition-all ${
                         selectedGroups.has(group.telegram_id)
                           ? 'border-primary'
                           : 'border-border'
@@ -174,10 +259,18 @@ function GroupSelectionContent() {
                             onCheckedChange={() => toggleGroupSelection(group.telegram_id)}
                             className="mt-1"
                           />
-                          <div className="flex-1">
-                            <h3 className="font-bold text-lg">{group.title}</h3>
+                          <Avatar className="size-14 rounded-lg border-2 border-border shrink-0">
+                            {group.photo_url && (
+                              <AvatarImage src={group.photo_url} alt={group.title} />
+                            )}
+                            <AvatarFallback className="rounded-lg font-bold text-lg bg-accent">
+                              {group.title.charAt(0).toUpperCase()}
+                            </AvatarFallback>
+                          </Avatar>
+                          <div className="flex-1 min-w-0">
+                            <h3 className="font-bold text-lg truncate">{group.title}</h3>
                             {group.username && (
-                              <p className="text-sm text-muted-foreground">@{group.username}</p>
+                              <p className="text-sm text-muted-foreground truncate">@{group.username}</p>
                             )}
                             <div className="flex items-center gap-4 mt-2">
                               {group.member_count && (
@@ -187,7 +280,7 @@ function GroupSelectionContent() {
                                 </div>
                               )}
                               <Badge variant="outline" className="border-2">
-                                {group.group_type === 'channel' ? '채널' : 
+                                {group.group_type === 'channel' ? '채널' :
                                  group.group_type === 'supergroup' ? '슈퍼그룹' : '그룹'}
                               </Badge>
                             </div>
@@ -203,35 +296,66 @@ function GroupSelectionContent() {
                     <h2 className="text-xl font-bold mb-4">이미 등록된 그룹</h2>
                     <div className="space-y-4">
                       {registeredGroups.map((group) => (
-                        <Card
-                          key={group.telegram_id}
-                          className="brutalist-card border-4 opacity-50"
-                        >
-                          <CardContent className="p-4">
-                            <div className="flex items-start gap-4">
-                              <Checkbox checked={false} disabled className="mt-1" />
-                              <div className="flex-1">
-                                <h3 className="font-bold text-lg">{group.title}</h3>
-                                {group.username && (
-                                  <p className="text-sm text-muted-foreground">@{group.username}</p>
-                                )}
-                                <Badge variant="secondary" className="mt-2">
-                                  이미 등록됨
-                                </Badge>
-                              </div>
-                            </div>
-                          </CardContent>
-                        </Card>
+                        <TooltipProvider key={group.telegram_id}>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Card
+                                className="refined-card opacity-50 cursor-not-allowed"
+                              >
+                                <CardContent className="p-4">
+                                  <div className="flex items-start gap-4">
+                                    <Checkbox checked={false} disabled className="mt-1" />
+                                    <Avatar className="size-14 rounded-lg border-2 border-border shrink-0 opacity-50">
+                                      {group.photo_url && (
+                                        <AvatarImage src={group.photo_url} alt={group.title} />
+                                      )}
+                                      <AvatarFallback className="rounded-lg font-bold text-lg bg-accent">
+                                        {group.title.charAt(0).toUpperCase()}
+                                      </AvatarFallback>
+                                    </Avatar>
+                                    <div className="flex-1 min-w-0">
+                                      <div className="flex items-center gap-2">
+                                        <h3 className="font-bold text-lg truncate">{group.title}</h3>
+                                        <Info className="h-4 w-4 text-muted-foreground shrink-0" />
+                                      </div>
+                                      {group.username && (
+                                        <p className="text-sm text-muted-foreground truncate">@{group.username}</p>
+                                      )}
+                                      <Badge variant="secondary" className="mt-2">
+                                        이미 등록됨
+                                      </Badge>
+                                    </div>
+                                  </div>
+                                </CardContent>
+                              </Card>
+                            </TooltipTrigger>
+                            <TooltipContent side="top" className="border-2 border-border">
+                              <p className="font-medium">이미 등록된 그룹입니다</p>
+                              <p className="text-xs text-muted-foreground mt-1">
+                                이 그룹은 이미 AaltoHub에 등록되어 있어 선택할 수 없습니다
+                              </p>
+                            </TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
                       ))}
                     </div>
                   </div>
                 )}
 
-                <div className="flex justify-end">
+                <div className="flex gap-4">
+                  <Button
+                    variant="outline"
+                    onClick={() => setLocation('/groups')}
+                    disabled={isRegistering}
+                    className="border-2 border-border"
+                    size="lg"
+                  >
+                    취소
+                  </Button>
                   <Button
                     onClick={handleNext}
-                    disabled={selectedGroups.size === 0}
-                    className="border-2 border-border btn-pressed"
+                    disabled={selectedGroups.size === 0 || isRegistering}
+                    className="flex-1 border-2 border-border btn-pressed"
                     size="lg"
                   >
                     다음
@@ -250,9 +374,31 @@ function GroupSelectionContent() {
               <p className="text-muted-foreground">
                 각 그룹의 공개 여부를 선택하세요 (기본값: 공개)
               </p>
+              {selectedGroups.size > 1 && (
+                <div className="mt-4 flex gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setAllVisibility('public')}
+                    className="border-2"
+                  >
+                    <Globe className="mr-2 h-4 w-4" />
+                    모두 공개로 설정
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setAllVisibility('private')}
+                    className="border-2"
+                  >
+                    <Lock className="mr-2 h-4 w-4" />
+                    모두 비공개로 설정
+                  </Button>
+                </div>
+              )}
             </div>
 
-            <Card className="brutalist-card border-4 mb-6">
+            <Card className="refined-card mb-6">
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                   <AlertCircle className="h-5 w-5" />
@@ -269,7 +415,7 @@ function GroupSelectionContent() {
               {groups
                 .filter(g => selectedGroups.has(g.telegram_id))
                 .map((group) => (
-                  <Card key={group.telegram_id} className="brutalist-card border-4">
+                  <Card key={group.telegram_id} className="refined-card">
                     <CardContent className="p-6">
                       <h3 className="font-bold text-lg mb-4">{group.title}</h3>
                       <RadioGroup

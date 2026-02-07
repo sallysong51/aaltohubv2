@@ -43,116 +43,130 @@
   --font-display: 'Space Grotesk', sans-serif;
   --font-body: 'Inter', sans-serif;
   --font-mono: 'JetBrains Mono', monospace;
+
+  /* Typography Scale - Clean Dashboard Hierarchy */
+  --font-size-4xl: 2.5rem;      /* 40px - h1 (page titles) */
+  --font-size-3xl: 1.875rem;    /* 30px - h2 (sections) */
+  --font-size-2xl: 1.5rem;      /* 24px - h3 (sub-sections) */
+  --font-size-xl: 1.25rem;      /* 20px - h4 (card titles) */
+  --font-size-base: 1rem;       /* 16px - body */
+  --font-size-sm: 0.875rem;     /* 14px - small text */
+  --font-size-xs: 0.75rem;      /* 12px - captions */
+
+  /* Line Heights */
+  --leading-tight: 1.25;
+  --leading-snug: 1.375;
+  --leading-normal: 1.5;
 }
 
-/* Telegram-Native Brutalism Theme */
+/* Modern Refined Telegram Theme */
 :root {
-  /* Primary: Telegram Blue */
-  --primary: #0088cc;
+  /* Primary: Telegram Blue (refined) */
+  --primary: #0084d4;
   --primary-foreground: #ffffff;
-  
-  /* Accent: Electric Cyan */
+
+  /* Accent: Vibrant Cyan */
   --accent: #00d4ff;
-  --accent-foreground: #000000;
-  
+  --accent-foreground: #ffffff;
+
   /* Base Colors */
   --background: #ffffff;
-  --foreground: #000000;
-  
+  --foreground: #0f1419;
+
   /* Card & Surface */
-  --card: #ffffff;
-  --card-foreground: #000000;
-  
+  --card: #f8f9fb;
+  --card-foreground: #0f1419;
+
   /* Popover */
   --popover: #ffffff;
-  --popover-foreground: #000000;
-  
+  --popover-foreground: #0f1419;
+
   /* Secondary */
-  --secondary: #f0f0f0;
-  --secondary-foreground: #000000;
-  
+  --secondary: #e8eef5;
+  --secondary-foreground: #0f1419;
+
   /* Muted */
-  --muted: #e8e8e8;
-  --muted-foreground: #666666;
-  
+  --muted: #d0d7e1;
+  --muted-foreground: #626d7d;
+
   /* Destructive */
-  --destructive: #ff3b30;
+  --destructive: #ef4444;
   --destructive-foreground: #ffffff;
-  
-  /* Borders & Inputs - Thick black borders for brutalism */
-  --border: #000000;
-  --input: #000000;
-  --ring: #0088cc;
-  
+
+  /* Borders & Inputs */
+  --border: #e1e8f0;
+  --input: #e1e8f0;
+  --ring: #0084d4;
+
   /* Sidebar */
-  --sidebar: #f5f5f5;
-  --sidebar-foreground: #000000;
-  --sidebar-primary: #0088cc;
+  --sidebar: #f8f9fb;
+  --sidebar-foreground: #0f1419;
+  --sidebar-primary: #0084d4;
   --sidebar-primary-foreground: #ffffff;
   --sidebar-accent: #00d4ff;
-  --sidebar-accent-foreground: #000000;
-  --sidebar-border: #000000;
-  --sidebar-ring: #0088cc;
-  
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #e1e8f0;
+  --sidebar-ring: #0084d4;
+
   /* Charts */
-  --chart-1: #0088cc;
+  --chart-1: #0084d4;
   --chart-2: #00d4ff;
-  --chart-3: #005f8c;
-  --chart-4: #003d5c;
-  --chart-5: #001f2e;
-  
-  /* Border radius - minimal for brutalism */
-  --radius: 4px;
+  --chart-3: #0066a6;
+  --chart-4: #004d7a;
+  --chart-5: #00334e;
+
+  /* Border radius - modern rounded corners */
+  --radius: 10px;
 }
 
 .dark {
-  /* Primary: Telegram Blue (slightly brighter for dark mode) */
+  /* Primary: Telegram Blue (refined for dark mode) */
   --primary: #00a0e9;
   --primary-foreground: #ffffff;
-  
-  /* Accent: Electric Cyan */
+
+  /* Accent: Vibrant Cyan */
   --accent: #00d4ff;
-  --accent-foreground: #000000;
-  
+  --accent-foreground: #ffffff;
+
   /* Base Colors */
-  --background: #1a1a1a;
-  --foreground: #ffffff;
-  
+  --background: #0f1419;
+  --foreground: #eceff4;
+
   /* Card & Surface */
-  --card: #2a2a2a;
-  --card-foreground: #ffffff;
-  
+  --card: #1a1f2e;
+  --card-foreground: #eceff4;
+
   /* Popover */
-  --popover: #2a2a2a;
-  --popover-foreground: #ffffff;
-  
+  --popover: #1a1f2e;
+  --popover-foreground: #eceff4;
+
   /* Secondary */
-  --secondary: #3a3a3a;
-  --secondary-foreground: #ffffff;
-  
+  --secondary: #252d3d;
+  --secondary-foreground: #eceff4;
+
   /* Muted */
-  --muted: #4a4a4a;
-  --muted-foreground: #a0a0a0;
-  
+  --muted: #3a424f;
+  --muted-foreground: #9ca3af;
+
   /* Destructive */
-  --destructive: #ff453a;
+  --destructive: #f87171;
   --destructive-foreground: #ffffff;
-  
+
   /* Borders & Inputs */
-  --border: #ffffff;
-  --input: #ffffff;
+  --border: #2a323f;
+  --input: #2a323f;
   --ring: #00a0e9;
-  
+
   /* Sidebar */
-  --sidebar: #2a2a2a;
-  --sidebar-foreground: #ffffff;
+  --sidebar: #1a1f2e;
+  --sidebar-foreground: #eceff4;
   --sidebar-primary: #00a0e9;
   --sidebar-primary-foreground: #ffffff;
   --sidebar-accent: #00d4ff;
-  --sidebar-accent-foreground: #000000;
-  --sidebar-border: #ffffff;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #2a323f;
   --sidebar-ring: #00a0e9;
-  
+
   /* Charts */
   --chart-1: #00a0e9;
   --chart-2: #00d4ff;
@@ -171,9 +185,40 @@
     font-family: var(--font-body);
   }
   
-  h1, h2, h3, h4, h5, h6 {
+  /* Typography Hierarchy - Clean & Bold */
+  h1 {
     font-family: var(--font-display);
+    font-size: var(--font-size-4xl);  /* 40px */
     font-weight: 700;
+    line-height: var(--leading-tight);
+    letter-spacing: -0.02em;
+  }
+
+  h2 {
+    font-family: var(--font-display);
+    font-size: var(--font-size-3xl);  /* 30px */
+    font-weight: 700;
+    line-height: var(--leading-tight);
+    letter-spacing: -0.01em;
+  }
+
+  h3 {
+    font-family: var(--font-display);
+    font-size: var(--font-size-2xl);  /* 24px */
+    font-weight: 700;
+    line-height: var(--leading-snug);
+  }
+
+  h4 {
+    font-family: var(--font-display);
+    font-size: var(--font-size-xl);   /* 20px */
+    font-weight: 600;
+    line-height: var(--leading-snug);
+  }
+
+  h5, h6 {
+    font-family: var(--font-display);
+    font-weight: 600;
   }
   
   button:not(:disabled),
@@ -218,53 +263,83 @@
     }
   }
   
-  /* Brutalist Card with thick border and hard shadow */
+  /* Refined Card - Subtle depth, soft shadows */
+  .refined-card {
+    border: 1px solid var(--border);
+    background-color: var(--card);
+    border-radius: 1rem; /* rounded-2xl */
+    box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px 0 rgba(0, 0, 0, 0.03);
+    transition: all 0.2s ease-in-out;
+  }
+
+  .refined-card:hover {
+    box-shadow: 0 4px 12px 0 rgba(0, 0, 0, 0.08), 0 2px 4px 0 rgba(0, 0, 0, 0.04);
+  }
+
+  /* Backwards compatibility alias (deprecated) */
   .brutalist-card {
-    @apply border-4 border-border bg-card;
-    box-shadow: 4px 4px 0 0 currentColor;
+    all: unset;
+    display: inherit;
   }
-  
-  /* Telegram-style message bubble */
+
+  .brutalist-card {
+    border: 1px solid var(--border);
+    background-color: var(--card);
+    border-radius: 1rem;
+    box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px 0 rgba(0, 0, 0, 0.03);
+    transition: all 0.2s ease-in-out;
+  }
+
+  /* Telegram-style message bubble - refined */
   .message-bubble {
-    @apply rounded-lg px-3 py-2 max-w-[70%] break-words;
+    @apply rounded-xl px-4 py-2.5 max-w-[70%] break-words;
+    font-size: 0.95rem;
+    line-height: 1.4;
   }
-  
+
   .message-bubble.outgoing {
     @apply bg-primary text-primary-foreground ml-auto;
+    border-radius: 18px 4px 18px 18px;
   }
-  
+
   .message-bubble.incoming {
     @apply bg-secondary text-secondary-foreground mr-auto;
+    border-radius: 4px 18px 18px 18px;
   }
-  
-  /* Monospace timestamp */
+
+  /* Monospace timestamp - refined */
   .timestamp {
     font-family: var(--font-mono);
     @apply text-xs text-muted-foreground;
+    font-weight: 500;
+    letter-spacing: 0.3px;
   }
-  
-  /* Button pressed state */
+
+  /* Button pressed state - refined */
   .btn-pressed:active {
-    transform: translateY(2px);
-    box-shadow: 2px 2px 0 0 currentColor;
+    transform: translateY(1px);
+    transition: all 0.1s ease-in-out;
   }
 }
 
-/* Custom scrollbar for Telegram-like feel */
+/* Custom scrollbar - refined */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 
 ::-webkit-scrollbar-track {
-  background: var(--muted);
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--muted-foreground);
-  border-radius: 4px;
+  background: var(--muted);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--foreground);
+  background: var(--muted-foreground);
+  background-clip: padding-box;
 }

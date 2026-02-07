@@ -25,7 +25,6 @@ function AdminDashboardContent() {
   const { user, logout } = useAuth();
 
   const [groups, setGroups] = useState<RegisteredGroup[]>([]);
-  const [groupMessages, setGroupMessages] = useState<Map<string, Message>>(new Map());
   const [selectedGroup, setSelectedGroup] = useState<RegisteredGroup | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoadingGroups, setIsLoadingGroups] = useState(true);
@@ -115,24 +114,8 @@ function AdminDashboardContent() {
       const response = await adminApi.getAllGroups();
       setGroups(response.data);
 
-      // Load latest message for each group (parallel)
-      const messagesMap = new Map<string, Message>();
-      const msgPromises = response.data.map(async (group) => {
-        try {
-          const msgResponse = await adminApi.getGroupMessages(group.id, 1, 1, 30);
-          if (msgResponse.data.messages.length > 0) {
-            return { groupId: group.id, message: msgResponse.data.messages[0] };
-          }
-        } catch (error) {
-          // Ignore errors for individual groups
-        }
-        return null;
-      });
-      const results = await Promise.all(msgPromises);
-      results.forEach((r) => {
-        if (r) messagesMap.set(r.groupId, r.message);
-      });
-      setGroupMessages(messagesMap);
+      // N+1 latest-message fetch removed — messages load when a group is selected.
+      // The sidebar shows group metadata without message previews.
 
       // Load crawler statuses
       try {
@@ -359,9 +342,8 @@ function AdminDashboardContent() {
           <ScrollArea className="flex-1">
             <div className="p-2">
               {groups.map((group) => {
-                const lastMessage = groupMessages.get(group.id);
                 const crawlerStatus = getCrawlerStatus(group);
-                
+
                 return (
                   <button
                     key={group.id}
@@ -396,11 +378,6 @@ function AdminDashboardContent() {
                         {group.username ? `@${group.username}` : '텔레그램 링크'}
                       </a>
                     )}
-                    {lastMessage && (
-                      <div className="text-xs text-muted-foreground truncate mt-1">
-                        {lastMessage.sender_name}: {lastMessage.text || '[미디어]'}
-                      </div>
-                    )}
                     <div className="flex items-center justify-between mt-1">
                       {group.member_count && (
                         <Badge variant="outline" className="text-xs">
@@ -419,11 +396,6 @@ function AdminDashboardContent() {
                         >
                           <Download className="h-3 w-3" />
                         </button>
-                        {lastMessage && (
-                          <span className="text-xs text-muted-foreground timestamp">
-                            {formatTimestamp(lastMessage.sent_at)}
-                          </span>
-                        )}
                       </div>
                     </div>
                   </button>
