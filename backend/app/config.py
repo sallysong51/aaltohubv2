@@ -3,6 +3,7 @@ Configuration settings for AaltoHub v2 Backend
 """
 import hmac
 import logging
+from urllib.parse import urlparse
 from pydantic_settings import BaseSettings
 from typing import Callable, List, Optional
 
@@ -34,6 +35,10 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str = ""
 
     # Encryption
+    # ⚠️ CRITICAL: Do not change ENCRYPTION_KEY after deployment!
+    # Changing it will break all existing Telegram sessions (users will need to re-login).
+    # This key is permanent — treat it like JWT_SECRET.
+    # If you must rotate: keep the old key and implement a migration strategy.
     ENCRYPTION_KEY: str  # Used as SESSION_ENCRYPTION_KEY
 
     # JWT
@@ -64,6 +69,31 @@ class Settings(BaseSettings):
             _config_logger.warning("JWT_SECRET is shorter than 32 characters — weak secret")
         if len(self.ENCRYPTION_KEY) < 32:
             _config_logger.warning("ENCRYPTION_KEY is shorter than 32 characters — weak key")
+        # Validate DATABASE_URL early with deep parsing
+        if not self.DATABASE_URL:
+            _config_logger.error(
+                "DATABASE_URL is empty! Set it in backend/.env. "
+                "Get from: Supabase Dashboard > Settings > Database > Connection string (URI)"
+            )
+        elif not self.DATABASE_URL.startswith(("postgresql://", "postgres://")):
+            _config_logger.error(
+                "DATABASE_URL has invalid scheme (expected postgresql:// or postgres://): %s...",
+                self.DATABASE_URL[:20],
+            )
+        else:
+            parsed = urlparse(self.DATABASE_URL)
+            if not parsed.hostname:
+                _config_logger.error("DATABASE_URL has no hostname — check URL format")
+            elif ".." in parsed.hostname:
+                _config_logger.error("DATABASE_URL hostname contains '..': %s", parsed.hostname)
+            if parsed.port and not (1 <= parsed.port <= 65535):
+                _config_logger.error("DATABASE_URL port out of range: %s", parsed.port)
+            if not parsed.path or parsed.path == "/":
+                _config_logger.warning("DATABASE_URL has no database name (path is empty or '/')")
+            if not parsed.password or parsed.password in ("YOUR_DB_PASSWORD", "[YOUR-PASSWORD]", "YOUR-PASSWORD"):
+                _config_logger.error(
+                    "DATABASE_URL contains a placeholder password — replace with your actual Supabase DB password"
+                )
 
     @property
     def crawler_api_secret(self) -> str:

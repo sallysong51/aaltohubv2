@@ -6,8 +6,11 @@ import { Route, Switch, Redirect } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider } from "./contexts/ThemeContext";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
+import { groupsApi, authApi } from "./lib/api";
 import Home from "./pages/Home";
 import Login from "./pages/Login";
+import Signup from "./pages/Signup";
+import EmailLinking from "./pages/EmailLinking";
 import GroupSelection from "./pages/GroupSelection";
 import UserGroups from "./pages/UserGroups";
 import EventFeed from "./pages/EventFeed";
@@ -20,13 +23,58 @@ import Privacy from "./pages/Privacy";
 
 function HomeRedirect() {
   const { isAuthenticated, user, isLoading } = useAuth();
+  const [hasGroups, setHasGroups] = useState<boolean | null>(null);
+  const [emailLinkRequired, setEmailLinkRequired] = useState<boolean | null>(null);
 
-  if (isLoading) {
-    return null; // or a loading spinner
+  useEffect(() => {
+    if (!isAuthenticated || isLoading) return;
+
+    let cancelled = false;
+
+    // Check email linking status first (forced migration)
+    authApi.getEmailLinkingStatus()
+      .then(res => {
+        if (cancelled) return;
+        if (res.data.email_link_required) {
+          setEmailLinkRequired(true);
+          return;
+        }
+        setEmailLinkRequired(false);
+
+        // Then check groups
+        return groupsApi.getRegisteredGroups();
+      })
+      .then(res => {
+        if (cancelled || !res) return;
+        setHasGroups(res.data.length > 0);
+      })
+      .catch(err => {
+        if (cancelled) return;
+        console.error('HomeRedirect check failed:', err);
+        // On error, assume email not required and has groups to avoid redirect loop
+        setEmailLinkRequired(false);
+        setHasGroups(true);
+      });
+
+    return () => { cancelled = true; };
+  }, [isAuthenticated, isLoading]);
+
+  if (isLoading || (isAuthenticated && (emailLinkRequired === null || hasGroups === null))) {
+    return null;
   }
 
   if (!isAuthenticated) {
     return <Redirect to="/login" />;
+  }
+
+  // Force email linking if required (migration checkpoint)
+  if (emailLinkRequired) {
+    return <Redirect to="/email-linking" />;
+  }
+
+  // No registered groups → go to group selection
+  if (hasGroups === false) {
+    return <Redirect to="/groups/select" />;
   }
 
   // Redirect based on role
@@ -42,6 +90,8 @@ function Router() {
     <Switch>
       <Route path="/" component={HomeRedirect} />
       <Route path="/login" component={Login} />
+      <Route path="/signup" component={Signup} />
+      <Route path="/email-linking" component={EmailLinking} />
       <Route path="/feed" component={EventFeed} />
       <Route path="/groups/select" component={GroupSelection} />
       <Route path="/groups" component={UserGroups} />

@@ -4,6 +4,7 @@ Admin-only routes
 import asyncio
 import json
 import logging
+import traceback
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List
 from datetime import datetime, timedelta, timezone
@@ -46,6 +47,7 @@ async def get_group_messages_admin(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=100),
     days: int = Query(30, ge=1, le=365, description="Number of days to look back"),
+    topic_id: int = Query(None, description="Filter by topic ID"),
     current_user: UserResponse = Depends(get_current_admin_user),
 ):
     """Get messages from a group for the last N days (admin only)"""
@@ -54,26 +56,48 @@ async def get_group_messages_admin(
         date_threshold = datetime.now(timezone.utc) - timedelta(days=days)
         offset = (page - 1) * page_size
 
-        total = await db.fetchval(
-            "SELECT COUNT(*) FROM messages WHERE group_id = $1 AND is_deleted = FALSE AND sent_at >= $2",
-            gid, date_threshold,
-        )
+        if topic_id is not None:
+            total = await db.fetchval(
+                "SELECT COUNT(*) FROM messages WHERE group_id = $1 AND is_deleted = FALSE AND sent_at >= $2 AND topic_id = $3",
+                gid, date_threshold, topic_id,
+            )
+            messages_rows = await db.fetch(
+                """SELECT id, telegram_message_id, group_id, sender_id, sender_name,
+                          "text" AS content, media_type, media_url,
+                          reply_to_message_id, topic_id, sent_at, is_deleted, created_at
+                   FROM messages
+                   WHERE group_id = $1 AND is_deleted = FALSE AND sent_at >= $2 AND topic_id = $5
+                   ORDER BY sent_at DESC LIMIT $3 OFFSET $4""",
+                gid, date_threshold, page_size, offset, topic_id,
+            )
+        else:
+            total = await db.fetchval(
+                "SELECT COUNT(*) FROM messages WHERE group_id = $1 AND is_deleted = FALSE AND sent_at >= $2",
+                gid, date_threshold,
+            )
+            messages_rows = await db.fetch(
+                """SELECT id, telegram_message_id, group_id, sender_id, sender_name,
+                          "text" AS content, media_type, media_url,
+                          reply_to_message_id, topic_id, sent_at, is_deleted, created_at
+                   FROM messages
+                   WHERE group_id = $1 AND is_deleted = FALSE AND sent_at >= $2
+                   ORDER BY sent_at DESC LIMIT $3 OFFSET $4""",
+                gid, date_threshold, page_size, offset,
+            )
 
-        messages_rows = await db.fetch(
-            """SELECT * FROM messages
-               WHERE group_id = $1 AND is_deleted = FALSE AND sent_at >= $2
-               ORDER BY sent_at DESC LIMIT $3 OFFSET $4""",
-            gid, date_threshold, page_size, offset,
-        )
-
-        messages = [MessageResponse(**dict(m)) for m in messages_rows]
+        messages = []
+        for m in messages_rows:
+            try:
+                messages.append(MessageResponse(**dict(m)))
+            except Exception as exc:
+                logger.warning("Skipping malformed message row id=%s: %s", dict(m).get('id'), exc)
 
         return MessagesListResponse(
             messages=messages, total=total, page=page, page_size=page_size,
             has_more=offset + page_size < total,
         )
     except Exception as e:
-        logger.error("get_group_messages_admin error: %s", e)
+        logger.error("get_group_messages_admin error: %s\n%s", e, traceback.format_exc())
         raise HTTPException(status_code=500, detail="Failed to fetch messages")
 
 
@@ -115,7 +139,11 @@ async def get_crawler_status(
     offset = (page - 1) * page_size
     try:
         rows = await db.fetch(
-            "SELECT * FROM crawler_status ORDER BY updated_at DESC LIMIT $1 OFFSET $2",
+            """SELECT cs.*, g.name AS group_title
+               FROM crawler_status cs
+               LEFT JOIN groups g ON g.id = cs.group_id
+               ORDER BY cs.updated_at DESC
+               LIMIT $1 OFFSET $2""",
             page_size, offset,
         )
         return [dict(r) for r in rows]
@@ -281,7 +309,7 @@ async def retry_failed_message(
 
         # Upsert into messages
         await db.execute(
-            """INSERT INTO messages (telegram_message_id, group_id, sender_id, sender_name, content,
+            """INSERT INTO messages (telegram_message_id, group_id, sender_id, sender_name, "text",
                    media_type, media_url, reply_to_message_id, topic_id, sent_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                ON CONFLICT (telegram_message_id, group_id) DO NOTHING""",
@@ -289,8 +317,8 @@ async def retry_failed_message(
             payload.get("group_id"),
             payload.get("sender_id"),
             payload.get("sender_name"),
-            payload.get("content"),
-            payload.get("media_type", "text"),
+            payload.get("content") or payload.get("text"),
+            payload.get("media_type"),
             payload.get("media_url"),
             payload.get("reply_to_message_id"),
             payload.get("topic_id"),

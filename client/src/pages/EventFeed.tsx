@@ -9,7 +9,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { toast } from 'sonner';
-import { Loader2, Calendar, Users, Settings, MessageSquare, Globe, RefreshCw, Zap, LayoutDashboard } from 'lucide-react';
+import { Loader2, Calendar, Users, Settings, MessageSquare, RefreshCw, Zap, LayoutDashboard } from 'lucide-react';
 import { groupsApi, RegisteredGroup, Message, getApiErrorMessage, SSE_BASE_URL } from '@/lib/api';
 import ProtectedRoute from '@/components/ProtectedRoute';
 import { useAuth } from '@/contexts/AuthContext';
@@ -21,6 +21,7 @@ function EventFeedContent() {
   const [, setLocation] = useLocation();
   const { user, logout, isLoading: isAuthLoading } = useAuth();
   const [groups, setGroups] = useState<RegisteredGroup[]>([]);
+  const [groupsLoadFailed, setGroupsLoadFailed] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
   const [selectedTopicId, setSelectedTopicId] = useState<number | null>(null);
@@ -71,8 +72,14 @@ function EventFeedContent() {
   // SSE (Server-Sent Events) subscription — single persistent connection to backend
   // Replaces Supabase Realtime per-group channels. Uses Postgres LISTEN/NOTIFY on backend.
   // EventSource auto-reconnects on disconnect (browser built-in).
+  // SSE requires direct backend access — skip if SSE_BASE_URL is not configured
+  // (Vercel serverless proxy cannot stream SSE; would cause infinite 15s reconnect loop).
   useEffect(() => {
     if (groups.length === 0) return;
+    if (!SSE_BASE_URL) {
+      console.warn('[EventFeed] SSE_BASE_URL not set — SSE disabled, using polling fallback');
+      return;
+    }
 
     const token = localStorage.getItem('access_token');
     if (!token) return;
@@ -89,8 +96,30 @@ function EventFeedContent() {
         if (selectedTopicIdRef.current !== null && newMsg.topic_id !== selectedTopicIdRef.current) return;
         if (newMsg.is_deleted) return;
 
+        // Detect NOTIFY truncation (content ends with "...") — fetch full message
+        // Fetch a small page and find the matching message by telegram_message_id
+        if (newMsg.content && newMsg.content.endsWith('...') && newMsg.content.length >= 200) {
+          groupsApi.getGroupMessages(String(newMsg.group_id), 1, 10).then(resp => {
+            const full = resp.data?.messages?.find(
+              (m: Message) => m.telegram_message_id === newMsg.telegram_message_id
+            );
+            if (full) {
+              setMessages(prev => {
+                if (prev.some(m => m.telegram_message_id === full.telegram_message_id && String(m.group_id) === String(full.group_id))) {
+                  return prev.map(m =>
+                    m.telegram_message_id === full.telegram_message_id && String(m.group_id) === String(full.group_id) ? full : m
+                  );
+                }
+                const updated = [full, ...prev];
+                return updated.length > 500 ? updated.slice(0, 500) : updated;
+              });
+            }
+          }).catch(() => {});
+          return; // Don't add truncated version — wait for full fetch
+        }
+
         setMessages(prev => {
-          if (prev.some(m => m.telegram_message_id === newMsg.telegram_message_id && m.group_id === newMsg.group_id)) return prev;
+          if (prev.some(m => m.telegram_message_id === newMsg.telegram_message_id && String(m.group_id) === String(newMsg.group_id))) return prev;
           const updated = [newMsg, ...prev];
           return updated.length > 500 ? updated.slice(0, 500) : updated;
         });
@@ -126,6 +155,12 @@ function EventFeedContent() {
       }
     });
 
+    // Overflow: server dropped events due to backpressure — refresh messages
+    es.addEventListener('overflow', () => {
+      console.warn('[EventFeed] SSE overflow — refreshing messages');
+      loadMessages();
+    });
+
     es.onopen = () => setRealtimeConnected(true);
     es.onerror = () => setRealtimeConnected(false);
 
@@ -150,6 +185,7 @@ function EventFeedContent() {
 
   const loadGroups = async () => {
     setIsLoading(true);
+    setGroupsLoadFailed(false);
     try {
       const response = await groupsApi.getRegisteredGroups();
       // Deduplicate groups by id
@@ -161,6 +197,7 @@ function EventFeedContent() {
       });
       setGroups(unique);
     } catch (error) {
+      setGroupsLoadFailed(true);
       toast.error(getApiErrorMessage(error, '그룹 목록을 불러오는데 실패했습니다'));
     } finally {
       setIsLoading(false);
@@ -273,6 +310,13 @@ function EventFeedContent() {
     return date.toLocaleDateString('ko-KR');
   };
 
+  // If no groups registered (confirmed, not API error), redirect to group selection
+  useEffect(() => {
+    if (!isLoading && groups.length === 0 && !groupsLoadFailed) {
+      setLocation('/groups/select');
+    }
+  }, [isLoading, groups.length, groupsLoadFailed, setLocation]);
+
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
@@ -281,45 +325,37 @@ function EventFeedContent() {
     );
   }
 
-  // If no groups registered, show onboarding
-  if (groups.length === 0) {
+  if (!isLoading && groups.length === 0 && groupsLoadFailed) {
     return (
       <div className="min-h-screen bg-background">
         <div className="border-b border-border bg-card">
           <div className="container py-6">
             <div className="flex items-center justify-between">
               <h1 className="text-4xl font-bold">이벤트 피드</h1>
-              <Button
-                variant="outline"
-                onClick={logout}
-              >
-                로그아웃
-              </Button>
+              <Button variant="outline" onClick={logout}>로그아웃</Button>
             </div>
           </div>
         </div>
-
         <div className="container py-8">
           <Card className="refined-card">
             <CardContent className="pt-6">
               <div className="text-center py-12">
                 <MessageSquare className="h-16 w-16 mx-auto mb-4 text-muted-foreground" />
-                <h2 className="text-2xl font-bold mb-2">등록된 그룹이 없습니다</h2>
-                <p className="text-muted-foreground mb-6">
-                  텔레그램 그룹을 등록하여 이벤트 정보를 받아보세요
-                </p>
-                <Button
-                  onClick={() => setLocation('/groups/select')}
-                  className="btn-pressed"
-                  size="lg"
-                >
-                  <Globe className="mr-2 h-5 w-5" />
-                  그룹 등록하기
-                </Button>
+                <h2 className="text-xl font-bold mb-2">그룹 목록을 불러올 수 없습니다</h2>
+                <p className="text-muted-foreground mb-6">서버 연결을 확인하고 다시 시도해주세요</p>
+                <Button onClick={loadGroups} size="lg">다시 시도</Button>
               </div>
             </CardContent>
           </Card>
         </div>
+      </div>
+    );
+  }
+
+  if (groups.length === 0) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <Loader2 className="h-8 w-8 animate-spin text-primary" />
       </div>
     );
   }
@@ -425,7 +461,7 @@ function EventFeedContent() {
       </div>
 
       {/* Messages Feed */}
-      <div className="container py-6">
+      <div className="container py-3">
         {isLoadingMessages ? (
           <div className="flex items-center justify-center py-12">
             <Loader2 className="h-8 w-8 animate-spin text-primary" />
@@ -446,79 +482,75 @@ function EventFeedContent() {
             </CardContent>
           </Card>
         ) : (
-          <div className="space-y-4">
+          <div className="space-y-0 bg-card border border-border rounded-lg overflow-hidden divide-y divide-border">
             {messages.filter(m => m.id).map((message, index) => {
               const group = getGroupById(message.group_id);
               return (
-                <Card key={message.id ?? `msg-${index}`} className="refined-card">
-                  <CardContent className="p-4">
-                    {/* Message Header */}
-                    <div className="flex items-start justify-between mb-3">
-                      <div className="flex-1">
-                        <div className="flex items-center gap-2 mb-1">
-                          <span className="font-bold">
-                            {message.sender_name || 'Anonymous'}
-                          </span>
-                        </div>
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <Badge variant="outline">
-                            {group?.title || 'Unknown Group'}
-                          </Badge>
-                          <span className="text-xs text-muted-foreground">
-                            <Calendar className="inline h-3 w-3 mr-1" />
-                            {formatMessageTime(message.sent_at)}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Message Content */}
-                    {message.content && (
-                      <div className="text-sm whitespace-pre-wrap mb-3">
-                        {message.content}
-                      </div>
-                    )}
-
-                    {/* Media */}
-                    {message.media_type && (
-                      <div className="mt-2">
-                        <Badge variant="outline">
-                          {message.media_type}
+                <div
+                  key={message.id ?? `msg-${index}`}
+                  className="p-2 hover:bg-accent/50 transition-colors"
+                >
+                  {/* Message Header - compact */}
+                  <div className="flex items-start justify-between gap-2 mb-1">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-semibold text-xs">
+                          {message.sender_name || 'Anonymous'}
+                        </span>
+                        <Badge variant="outline" className="text-xs py-0">
+                          {group?.title || 'Unknown Group'}
                         </Badge>
                       </div>
-                    )}
+                    </div>
+                    <span className="text-xs text-muted-foreground whitespace-nowrap">
+                      {formatMessageTime(message.sent_at)}
+                    </span>
+                  </div>
 
-                    {message.media_url && message.media_type === 'photo' && /^https?:\/\//i.test(message.media_url) && (
-                      <div className="mt-2">
+                  {/* Message Content */}
+                  {message.content && (
+                    <div className="text-xs whitespace-pre-wrap break-words mb-1 line-clamp-3">
+                      {message.content}
+                    </div>
+                  )}
+
+                  {/* Media */}
+                  {message.media_type && (
+                    <div className="flex items-center gap-1">
+                      {message.media_type === 'photo' && message.media_url && /^https?:\/\//i.test(message.media_url) ? (
                         <img
                           src={message.media_url}
                           alt={`${message.sender_name || '사용자'}의 미디어`}
-                          className="max-w-full rounded border-2 border-border"
+                          className="max-h-24 rounded border border-border"
                         />
-                      </div>
-                    )}
-
-                  </CardContent>
-                </Card>
+                      ) : (
+                        <Badge variant="secondary" className="text-xs py-0">
+                          {message.media_type}
+                        </Badge>
+                      )}
+                    </div>
+                  )}
+                </div>
               );
             })}
+          </div>
+        )}
 
-            {/* Load More Button */}
-            {hasMore && (
-              <div className="flex justify-center pt-4 pb-8">
-                <Button
-                  variant="outline"
-                  onClick={handleLoadMore}
-                  disabled={isLoadingMore}
-                  className="border-2 border-border w-full max-w-md"
-                >
-                  {isLoadingMore ? (
-                    <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                  ) : null}
-                  {isLoadingMore ? '불러오는 중...' : '더 보기'}
-                </Button>
-              </div>
-            )}
+        {/* Load More Button */}
+        {hasMore && (
+          <div className="flex justify-center pt-3 pb-4">
+            <Button
+              variant="outline"
+              onClick={handleLoadMore}
+              disabled={isLoadingMore}
+              className="border border-border w-full max-w-md"
+              size="sm"
+            >
+              {isLoadingMore ? (
+                <Loader2 className="h-3 w-3 animate-spin mr-2" />
+              ) : null}
+              {isLoadingMore ? '불러오는 중...' : '더 보기'}
+            </Button>
           </div>
         )}
       </div>

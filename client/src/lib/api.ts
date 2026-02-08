@@ -5,7 +5,19 @@ import axios, { AxiosInstance, AxiosError } from 'axios';
 
 /** Extract error detail message from API error response */
 export function getApiErrorMessage(error: unknown, fallback: string): string {
+  // Network error — backend unreachable (no response at all)
+  if (error && typeof error === 'object' && 'isNetworkError' in error) {
+    return '서버에 연결할 수 없습니다. 백엔드가 실행 중인지 확인하세요.';
+  }
   if (axios.isAxiosError(error)) {
+    // Proxy error — Vite/Vercel returns 502/504 when backend is down
+    if (error.response?.status === 502 || error.response?.status === 504) {
+      return '서버가 응답하지 않습니다. 백엔드를 확인하세요.';
+    }
+    // Service unavailable — DB down or degraded mode
+    if (error.response?.status === 503) {
+      return '서비스가 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해주세요.';
+    }
     return error.response?.data?.detail || fallback;
   }
   return fallback;
@@ -144,10 +156,11 @@ export interface Verify2FARequest {
 /**
  * User model. `id` is string because DB uses BIGSERIAL which PostgREST
  * serializes as string to avoid JS Number precision loss (>2^53).
+ * `telegram_id` is optional (null for email-only users).
  */
 export interface User {
   id: string;
-  telegram_id: number;
+  telegram_id?: number | null;
   phone_number?: string;
   username?: string;
   first_name?: string;
@@ -164,6 +177,35 @@ export interface AuthResponse {
   user: User;
 }
 
+export interface EmailLoginRequest {
+  email: string;
+  password: string;
+}
+
+export interface EmailLinkingRequest {
+  email: string;
+  password: string;
+}
+
+export interface EmailLinkingStatusResponse {
+  email_link_required: boolean;
+  email: string | null;
+  linked_at: string | null;
+}
+
+export interface EmailLinkingResponse {
+  success: boolean;
+  message: string;
+  email: string;
+}
+
+export interface EmailSignupRequest {
+  email: string;
+  password: string;
+  first_name?: string;
+  last_name?: string;
+}
+
 export const authApi = {
   sendCode: (data: SendCodeRequest) =>
     apiClient.post<SendCodeResponse>('/auth/send-code', data),
@@ -177,6 +219,19 @@ export const authApi = {
   getMe: () => apiClient.get<User>('/auth/me'),
 
   logout: () => apiClient.post('/auth/logout'),
+
+  // Email auth endpoints (Supabase Auth)
+  signupEmail: (data: EmailSignupRequest) =>
+    apiClient.post<AuthResponse>('/auth/signup-email', data),
+
+  loginEmail: (data: EmailLoginRequest) =>
+    apiClient.post<AuthResponse>('/auth/login-email', data),
+
+  linkEmail: (data: EmailLinkingRequest) =>
+    apiClient.post<EmailLinkingResponse>('/auth/link-email', data),
+
+  getEmailLinkingStatus: () =>
+    apiClient.get<EmailLinkingStatusResponse>('/auth/email-linking-status'),
 };
 
 // ============================================================
@@ -225,6 +280,7 @@ export interface RegisterGroupsRequest {
 export interface RegisterGroupsResponse {
   success: boolean;
   registered_groups: RegisteredGroup[];
+  crawl_initiated?: boolean;
 }
 
 /**
@@ -237,6 +293,7 @@ export interface Message {
   group_id: string;
   sender_id?: number;
   sender_name?: string;
+  sender_username?: string;
   content?: string;
   media_type?: string;  // photo, video, document, audio, sticker, voice (null = text)
   media_url?: string;
@@ -271,6 +328,17 @@ export interface CreateInviteLinkResponse {
   token: string;
   expires_at?: string;
   max_uses?: number;
+}
+
+export interface CrawlProgressItem {
+  group_id: string;
+  status: string;
+  initial_crawl_progress: number;
+  initial_crawl_total: number;
+  last_error?: string;
+  updated_at: string;
+  group_name: string;
+  is_currently_crawling?: boolean;
 }
 
 export const groupsApi = {
@@ -323,6 +391,9 @@ export const groupsApi = {
 
   deleteGroup: (groupId: string) =>
     apiClient.delete(`/groups/${groupId}`),
+
+  getCrawlProgress: () =>
+    apiClient.get<CrawlProgressItem[]>('/groups/crawl-progress'),
 };
 
 // ============================================================

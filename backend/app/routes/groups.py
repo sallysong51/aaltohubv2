@@ -6,6 +6,7 @@ DB `groups` table columns:
   has_topics, visibility, crawl_status, crawl_enabled, last_crawled_at,
   last_error, registered_by (FK users.id), created_at
 """
+import asyncio
 import logging
 import secrets
 from datetime import datetime, timezone
@@ -21,7 +22,7 @@ from app.models import (
 )
 from app.auth import get_current_user, get_current_admin_user
 from app.database import db
-from app.telegram_client import telegram_manager
+from app.telegram_client import telegram_manager, TelegramAuthError
 
 
 router = APIRouter(prefix="/groups", tags=["Groups"])
@@ -102,6 +103,11 @@ async def get_my_groups(
             result.append(group_info)
 
         return result
+    except HTTPException:
+        raise
+    except TelegramAuthError as e:
+        logger.warning("Telegram auth error for user %s: %s (status=%d)", current_user.id, e.detail, e.status_code)
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
         logger.error("Groups API error: %s", e)
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -157,9 +163,34 @@ async def register_groups(
             updated = await db.fetchrow("SELECT * FROM groups WHERE id = $1", telegram_id)
             registered_groups.append(TelegramGroupResponse(**_db_group_to_api(dict(updated))))
 
+        # Trigger sequential historical crawl for newly registered groups.
+        # Uses asyncio.wait_for with 5s timeout so the API response is fast,
+        # but we can report accurate crawl_initiated status to the frontend.
+        crawl_initiated = False
+        if registered_groups:
+            new_group_ids = [str(g.telegram_id) for g in registered_groups]
+            try:
+                from app import crawler_client
+                result = await asyncio.wait_for(
+                    crawler_client.trigger_batch_historical_crawl(new_group_ids),
+                    timeout=5.0,
+                )
+                if result and result.get("success"):
+                    crawl_initiated = True
+                    logger.info("Batch crawl triggered for %d groups: %s", len(new_group_ids), new_group_ids)
+                elif result:
+                    logger.warning("Batch crawl trigger rejected: %s", result)
+                else:
+                    logger.warning("Crawler unreachable for batch crawl trigger")
+            except asyncio.TimeoutError:
+                logger.warning("Batch crawl trigger timed out (5s) — crawler may still start")
+            except Exception as exc:
+                logger.warning("Failed to trigger batch crawl: %s", exc)
+
         return RegisterGroupsResponse(
             success=True,
             registered_groups=registered_groups,
+            crawl_initiated=crawl_initiated,
         )
     except HTTPException:
         raise
@@ -191,6 +222,47 @@ async def get_registered_groups(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@router.get("/crawl-progress")
+async def get_crawl_progress(
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Get crawl progress for the current user's registered groups."""
+    try:
+        rows = await db.fetch(
+            """SELECT cs.group_id, cs.status, cs.initial_crawl_progress,
+                      cs.initial_crawl_total, cs.last_error, cs.updated_at,
+                      g.name as group_name
+               FROM crawler_status cs
+               JOIN user_groups ug ON ug.group_id = cs.group_id
+               JOIN groups g ON g.id = cs.group_id
+               WHERE ug.user_id = $1""",
+            current_user.id,
+        )
+
+        # Fetch currently crawling group from crawler process
+        currently_crawling_id = None
+        try:
+            from app import crawler_client
+            status = await crawler_client.get_crawler_status()
+            if status:
+                currently_crawling_id = status.get("currently_crawling_group_id")
+        except Exception:
+            pass
+
+        result = []
+        for r in rows:
+            item = dict(r)
+            item["is_currently_crawling"] = (
+                currently_crawling_id is not None
+                and int(item["group_id"]) == currently_crawling_id
+            )
+            result.append(item)
+        return result
+    except Exception as e:
+        logger.error("get_crawl_progress error: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to fetch crawl progress")
+
+
 @router.get("/messages/aggregated", response_model=MessagesListResponse)
 async def get_aggregated_messages(
     group_ids: str = Query(..., description="Comma-separated group IDs"),
@@ -219,7 +291,10 @@ async def get_aggregated_messages(
                 int_ids, topic_id,
             )
             messages_rows = await db.fetch(
-                """SELECT * FROM messages
+                """SELECT id, telegram_message_id, group_id, sender_id, sender_name,
+                          "text" AS content, media_type, media_url,
+                          reply_to_message_id, topic_id, sent_at, is_deleted, created_at
+                   FROM messages
                    WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE AND topic_id = $2
                    ORDER BY sent_at DESC LIMIT $3 OFFSET $4""",
                 int_ids, topic_id, page_size, offset,
@@ -230,13 +305,21 @@ async def get_aggregated_messages(
                 int_ids,
             )
             messages_rows = await db.fetch(
-                """SELECT * FROM messages
+                """SELECT id, telegram_message_id, group_id, sender_id, sender_name,
+                          "text" AS content, media_type, media_url,
+                          reply_to_message_id, topic_id, sent_at, is_deleted, created_at
+                   FROM messages
                    WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE
                    ORDER BY sent_at DESC LIMIT $2 OFFSET $3""",
                 int_ids, page_size, offset,
             )
 
-        messages = [MessageResponse(**dict(m)) for m in messages_rows]
+        messages = []
+        for m in messages_rows:
+            try:
+                messages.append(MessageResponse(**dict(m)))
+            except Exception as exc:
+                logger.warning("Skipping malformed message row id=%s: %s", dict(m).get('id'), exc)
 
         return MessagesListResponse(
             messages=messages, total=total, page=page, page_size=page_size,
@@ -254,7 +337,11 @@ async def get_group_topics(
 ):
     """Get topics/threads for a group (Telegram forum groups)"""
     try:
-        gid = int(group_id)
+        try:
+            gid = int(group_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid group ID: must be numeric")
+
         group = await db.fetchrow("SELECT id, visibility FROM groups WHERE id = $1", gid)
         if not group:
             raise HTTPException(status_code=404, detail="Group not found")
@@ -295,7 +382,7 @@ async def get_group_topics(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Groups API error: %s", e)
+        logger.error("Topics endpoint error for group_id=%s: %s", group_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -330,7 +417,10 @@ async def get_group_messages(
                 gid, topic_id,
             )
             messages_rows = await db.fetch(
-                """SELECT * FROM messages
+                """SELECT id, telegram_message_id, group_id, sender_id, sender_name,
+                          "text" AS content, media_type, media_url,
+                          reply_to_message_id, topic_id, sent_at, is_deleted, created_at
+                   FROM messages
                    WHERE group_id = $1 AND is_deleted = FALSE AND topic_id = $2
                    ORDER BY sent_at DESC LIMIT $3 OFFSET $4""",
                 gid, topic_id, page_size, offset,
@@ -341,13 +431,21 @@ async def get_group_messages(
                 gid,
             )
             messages_rows = await db.fetch(
-                """SELECT * FROM messages
+                """SELECT id, telegram_message_id, group_id, sender_id, sender_name,
+                          "text" AS content, media_type, media_url,
+                          reply_to_message_id, topic_id, sent_at, is_deleted, created_at
+                   FROM messages
                    WHERE group_id = $1 AND is_deleted = FALSE
                    ORDER BY sent_at DESC LIMIT $2 OFFSET $3""",
                 gid, page_size, offset,
             )
 
-        messages = [MessageResponse(**dict(m)) for m in messages_rows]
+        messages = []
+        for m in messages_rows:
+            try:
+                messages.append(MessageResponse(**dict(m)))
+            except Exception as exc:
+                logger.warning("Skipping malformed message row id=%s: %s", dict(m).get('id'), exc)
 
         return MessagesListResponse(
             messages=messages, total=total, page=page, page_size=page_size,

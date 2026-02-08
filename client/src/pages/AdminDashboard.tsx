@@ -24,6 +24,7 @@ function AdminDashboardContent() {
   const { user, logout } = useAuth();
 
   const [groups, setGroups] = useState<RegisteredGroup[]>([]);
+  const [groupsLoadFailed, setGroupsLoadFailed] = useState(false);
   const [selectedGroup, setSelectedGroup] = useState<RegisteredGroup | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoadingGroups, setIsLoadingGroups] = useState(true);
@@ -31,12 +32,17 @@ function AdminDashboardContent() {
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(false);
   const [selectedTopicId, setSelectedTopicId] = useState<number | null>(null);
-  const [crawlerStatusMap, setCrawlerStatusMap] = useState<Map<string, string>>(new Map());
+  const [crawlerStatusMap, setCrawlerStatusMap] = useState<Map<string, { status: string; progress: number; total: number }>>(new Map());
   const [liveCrawlerStatus, setLiveCrawlerStatus] = useState<{
     running: boolean; connected: boolean; groups_count: number;
     messages_received: number; historical_crawl_running: boolean;
     crawled_groups: number; uptime_seconds: number;
+    currently_crawling_group_id?: number | null;
+    currently_crawling_group_title?: string | null;
+    seconds_since_last_event?: number | null;
+    start_error?: string | null;
   } | null>(null);
+  const [crawlerUnreachable, setCrawlerUnreachable] = useState(false);
   const [realtimeConnected, setRealtimeConnected] = useState(false);
   const [groupSearch, setGroupSearch] = useState('');
 
@@ -47,14 +53,35 @@ function AdminDashboardContent() {
   useEffect(() => {
     loadGroups();
     loadLiveCrawlerStatus();
-    const interval = setInterval(loadLiveCrawlerStatus, 30_000);
-    return () => clearInterval(interval);
   }, []);
+
+  // Determine if any group is actively crawling
+  const hasActiveCrawling = Array.from(crawlerStatusMap.values()).some(
+    s => s.status === 'initializing'
+  );
+
+  // Poll crawler statuses: 5s during active crawling, 30s otherwise
+  useEffect(() => {
+    const intervalMs = hasActiveCrawling ? 5000 : 30000;
+    loadCrawlerStatuses();
+    loadLiveCrawlerStatus();
+    const interval = setInterval(() => {
+      loadCrawlerStatuses();
+      loadLiveCrawlerStatus();
+    }, intervalMs);
+    return () => clearInterval(interval);
+  }, [hasActiveCrawling]);
 
   // SSE subscription — single persistent connection for the selected group
   // Replaces Supabase Realtime. EventSource auto-reconnects on disconnect.
   useEffect(() => {
     if (!selectedGroup) return;
+
+    // P1-1: SSE requires direct backend access — skip if not configured (Vercel proxy can't stream)
+    if (!SSE_BASE_URL) {
+      console.warn('[AdminDashboard] SSE_BASE_URL not configured — realtime disabled, using polling only');
+      return;
+    }
 
     const token = localStorage.getItem('access_token');
     if (!token) return;
@@ -68,6 +95,27 @@ function AdminDashboardContent() {
         const newMessage: Message = JSON.parse(e.data);
         if (!newMessage) return;
         if (selectedTopicId !== null && newMessage.topic_id !== selectedTopicId) return;
+
+        // P1-3: NOTIFY payload may be truncated at 8000 bytes — detect and fetch full message
+        // Fetch a small page (10 msgs) to find the matching message by telegram_message_id
+        if (newMessage.content && newMessage.content.endsWith('...') && newMessage.content.length >= 200) {
+          adminApi.getGroupMessages(groupId, 1, 10, 30, selectedTopicId).then((res) => {
+            const fullMsg = res.data.messages?.find(
+              (m: Message) => m.telegram_message_id === newMessage.telegram_message_id
+            );
+            if (fullMsg) {
+              setMessages((prev) => {
+                if (prev.some(m => m.telegram_message_id === fullMsg.telegram_message_id && String(m.group_id) === String(fullMsg.group_id))) {
+                  return prev.map(m => m.telegram_message_id === fullMsg.telegram_message_id && String(m.group_id) === String(fullMsg.group_id) ? fullMsg : m);
+                }
+                const updated = [...prev, fullMsg];
+                return updated.length > 500 ? updated.slice(-500) : updated;
+              });
+            }
+          }).catch(() => { /* best-effort */ });
+          return;
+        }
+
         setMessages((prev) => {
           if (prev.some(m => m.telegram_message_id === newMessage.telegram_message_id && String(m.group_id) === String(newMessage.group_id))) return prev;
           const updated = [...prev, newMessage];
@@ -109,6 +157,14 @@ function AdminDashboardContent() {
       }
     });
 
+    // P1-5: Overflow event — backend dropped events due to backpressure, refresh from DB
+    es.addEventListener('overflow', () => {
+      console.warn('[AdminDashboard] SSE overflow — refreshing messages from server');
+      if (selectedGroup) {
+        loadMessages(selectedGroup.id, 1);
+      }
+    });
+
     es.onopen = () => setRealtimeConnected(true);
     es.onerror = () => {
       setRealtimeConnected(false);
@@ -125,8 +181,12 @@ function AdminDashboardContent() {
     try {
       const res = await adminApi.getLiveCrawlerStatus();
       setLiveCrawlerStatus(res.data);
-    } catch {
-      // Non-critical
+      setCrawlerUnreachable(false);
+    } catch (err: any) {
+      if (err?.response?.status === 503) {
+        setCrawlerUnreachable(true);
+        setLiveCrawlerStatus(null);
+      }
     }
   };
 
@@ -149,32 +209,37 @@ function AdminDashboardContent() {
     }
   };
 
+  const loadCrawlerStatuses = async () => {
+    try {
+      const statusResponse = await adminApi.getCrawlerStatus();
+      const statusMap = new Map<string, { status: string; progress: number; total: number }>();
+      (statusResponse.data || []).forEach((s: { group_id: string; status?: string; initial_crawl_progress?: number; initial_crawl_total?: number }) => {
+        statusMap.set(String(s.group_id), {
+          status: s.status || 'inactive',
+          progress: s.initial_crawl_progress || 0,
+          total: s.initial_crawl_total || 0,
+        });
+      });
+      setCrawlerStatusMap(statusMap);
+    } catch {
+      // Non-critical: leave map as-is
+    }
+  };
+
   const loadGroups = async () => {
     setIsLoadingGroups(true);
+    setGroupsLoadFailed(false);
     try {
       const response = await adminApi.getAllGroups();
       setGroups(response.data);
-
-      // N+1 latest-message fetch removed — messages load when a group is selected.
-      // The sidebar shows group metadata without message previews.
-
-      // Load crawler statuses
-      try {
-        const statusResponse = await adminApi.getCrawlerStatus();
-        const statusMap = new Map<string, string>();
-        (statusResponse.data || []).forEach((s: { group_id: string; status?: string }) => {
-          statusMap.set(String(s.group_id), s.status || 'inactive');
-        });
-        setCrawlerStatusMap(statusMap);
-      } catch {
-        // Non-critical: leave map empty
-      }
+      await loadCrawlerStatuses();
 
       // Auto-select first group (use functional update to avoid stale closure — P2-4.8)
       if (response.data.length > 0) {
         setSelectedGroup((prev) => prev ?? response.data[0]);
       }
     } catch (error) {
+      setGroupsLoadFailed(true);
       toast.error(getApiErrorMessage(error, '그룹 목록을 불러오는데 실패했습니다'));
     } finally {
       setIsLoadingGroups(false);
@@ -184,7 +249,7 @@ function AdminDashboardContent() {
   const loadMessages = async (groupId: string, pageNum: number = 1) => {
     setIsLoadingMessages(true);
     try {
-      const response = await adminApi.getGroupMessages(groupId, pageNum, 50, 30, selectedTopicId);
+      const response = await adminApi.getGroupMessages(groupId, pageNum, 150, 30, selectedTopicId);
       
       if (pageNum === 1) {
         setMessages(response.data.messages);
@@ -234,11 +299,17 @@ function AdminDashboardContent() {
     return date.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
   };
 
-  const getCrawlerStatus = (group: RegisteredGroup): 'active' | 'inactive' | 'error' => {
-    const status = crawlerStatusMap.get(String(group.telegram_id || group.id));
-    if (status === 'active') return 'active';
-    if (status === 'error') return 'error';
+  const getCrawlerStatus = (group: RegisteredGroup): 'active' | 'inactive' | 'error' | 'initializing' => {
+    const info = crawlerStatusMap.get(String(group.telegram_id || group.id));
+    if (!info) return 'inactive';
+    if (info.status === 'active') return 'active';
+    if (info.status === 'error') return 'error';
+    if (info.status === 'initializing') return 'initializing';
     return 'inactive';
+  };
+
+  const getCrawlerProgressInfo = (group: RegisteredGroup) => {
+    return crawlerStatusMap.get(String(group.telegram_id || group.id));
   };
 
   const formatDate = (dateString: string) => {
@@ -271,7 +342,36 @@ function AdminDashboardContent() {
 
   const groupedMessages = groupMessagesByDate(messages);
 
+  // If no groups registered, redirect to group selection
+  // If no groups (confirmed, not API error), redirect to group selection
+  useEffect(() => {
+    if (!isLoadingGroups && groups.length === 0 && !groupsLoadFailed) {
+      setLocation('/groups/select');
+    }
+  }, [isLoadingGroups, groups.length, groupsLoadFailed, setLocation]);
+
   if (isLoadingGroups) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      </div>
+    );
+  }
+
+  if (groups.length === 0 && groupsLoadFailed) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-center">
+          <AlertCircle className="h-16 w-16 mx-auto mb-4 text-muted-foreground" />
+          <p className="text-lg font-medium mb-2">그룹 목록을 불러올 수 없습니다</p>
+          <p className="text-sm text-muted-foreground mb-4">서버 연결을 확인하고 다시 시도해주세요</p>
+          <Button onClick={loadGroups}>다시 시도</Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (groups.length === 0) {
     return (
       <div className="min-h-screen flex items-center justify-center">
         <Loader2 className="h-8 w-8 animate-spin text-primary" />
@@ -281,127 +381,130 @@ function AdminDashboardContent() {
 
   return (
     <div className="h-screen flex flex-col bg-background">
-      {/* Header */}
+      {/* Header - Compact */}
       <div className="border-b border-border bg-card flex-shrink-0">
-        <div className="container py-4">
-          {/* Breadcrumb */}
-          <div className="flex items-center gap-2 mb-3 text-sm text-muted-foreground">
-            <span>Admin</span>
-            <ChevronRight className="h-4 w-4" />
-            <span className="text-foreground font-medium">Dashboard</span>
+        <div className="container py-3">
+          {/* Top Row: Title + Status */}
+          <div className="flex items-center justify-between gap-3 mb-2">
+            <div>
+              <h1 className="text-2xl font-bold">관리자</h1>
+              <p className="text-xs text-muted-foreground">
+                {user?.first_name || 'Admin'} (@{user?.username})
+              </p>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap justify-end">
+              {crawlerUnreachable ? (
+                <Badge variant="outline" className="border-orange-500 text-orange-600 text-xs py-0.5">
+                  <Zap className="h-2.5 w-2.5 mr-1" />
+                  크롤러 오류
+                </Badge>
+              ) : liveCrawlerStatus && (
+                <Badge
+                  variant="outline"
+                  className={`text-xs py-0.5 ${liveCrawlerStatus.running && liveCrawlerStatus.connected
+                    ? 'border-green-500 text-green-600'
+                    : 'border-red-500 text-red-600'
+                  }`}
+                >
+                  <Circle className={`h-1.5 w-1.5 mr-1 ${liveCrawlerStatus.running && liveCrawlerStatus.connected ? 'fill-green-500' : 'fill-red-500'}`} />
+                  <span className="hidden sm:inline">
+                    {liveCrawlerStatus.running && liveCrawlerStatus.connected ? '크롤러 활성' : '비활성'}
+                  </span>
+                  <span className="sm:hidden">활성</span>
+                </Badge>
+              )}
+              {selectedGroup && (
+                <Badge
+                  variant="outline"
+                  className={`text-xs py-0.5 ${realtimeConnected
+                    ? 'border-green-500 text-green-600'
+                    : 'border-yellow-500 text-yellow-600'
+                  }`}
+                >
+                  <Circle className={`h-1.5 w-1.5 mr-1 ${realtimeConnected ? 'fill-green-500' : 'fill-yellow-500'}`} />
+                  <span className="hidden sm:inline">{realtimeConnected ? '실시간' : '폴링'}</span>
+                </Badge>
+              )}
+            </div>
           </div>
 
-          {/* Main Header */}
-          <div className="flex items-center justify-between">
-            <div>
-              <h1 className="text-4xl font-bold">관리자 대시보드</h1>
-              <div className="flex items-center gap-2 mt-1">
-                <p className="text-sm text-muted-foreground">
-                  {user?.first_name || 'Admin'} (@{user?.username})
-                </p>
-                {liveCrawlerStatus && (
-                  <Badge
-                    variant="outline"
-                    className={liveCrawlerStatus.running && liveCrawlerStatus.connected
-                      ? 'border-green-500 text-green-600'
-                      : 'border-red-500 text-red-600'
-                    }
-                  >
-                    <Zap className="h-3 w-3 mr-1" />
-                    {liveCrawlerStatus.running && liveCrawlerStatus.connected
-                      ? `크롤러 활성 (${liveCrawlerStatus.messages_received}건)`
-                      : '크롤러 비활성'
-                    }
-                    {liveCrawlerStatus.historical_crawl_running && ' | 역사 수집 중...'}
-                  </Badge>
-                )}
-                {selectedGroup && (
-                  <Badge
-                    variant="outline"
-                    className={realtimeConnected
-                      ? 'border-green-500 text-green-600'
-                      : 'border-yellow-500 text-yellow-600'
-                    }
-                  >
-                    <Circle className={`h-2 w-2 mr-1 ${realtimeConnected ? 'fill-green-500' : 'fill-yellow-500'}`} />
-                    {realtimeConnected ? '실시간 연결됨' : '연결 중...'}
-                  </Badge>
-                )}
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <Button
-                variant="outline"
-                onClick={() => setLocation('/feed')}
-                className="border-2 border-border"
-              >
-                <ArrowLeft className="mr-2 h-4 w-4" />
-                피드로 돌아가기
-              </Button>
-              <Button
-                variant="outline"
-                onClick={() => setLocation('/groups/select')}
-                className="border-2 border-border"
-              >
-                <Plus className="mr-2 h-4 w-4" />
-                그룹 추가
-              </Button>
-              <Button
-                variant="outline"
-                onClick={handleRestartCrawler}
-                className="border-2 border-border"
-                title="라이브 크롤러 재시작"
-              >
-                <RefreshCw className="mr-2 h-4 w-4" />
-                크롤러 재시작
-              </Button>
-              <Button
-                variant="outline"
-                onClick={() => setLocation('/admin/crawler')}
-                className="border-2 border-border"
-              >
-                <BarChart3 className="mr-2 h-4 w-4" />
-                크롤러 관리
-              </Button>
-              <Button
-                variant="outline"
-                onClick={() => setLocation('/admin/users')}
-                className="border-2 border-border"
-              >
-                <UserCog className="mr-2 h-4 w-4" />
-                사용자 관리
-              </Button>
-              <Button
-                variant="outline"
-                onClick={handleLogout}
-                className="border-2 border-border"
-              >
-                <LogOut className="mr-2 h-4 w-4" />
-                로그아웃
-              </Button>
-            </div>
+          {/* Button Row - Compact */}
+          <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setLocation('/feed')}
+              className="h-7 px-2 text-xs"
+              title="피드"
+            >
+              <ArrowLeft className="h-3 w-3" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setLocation('/groups/select')}
+              className="h-7 px-2 text-xs"
+              title="그룹 추가"
+            >
+              <Plus className="h-3 w-3" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleRestartCrawler}
+              className="h-7 px-2 text-xs"
+              title="크롤러 재시작"
+            >
+              <RefreshCw className="h-3 w-3" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setLocation('/admin/crawler')}
+              className="h-7 px-2 text-xs hidden md:inline-flex"
+              title="크롤러 관리"
+            >
+              <BarChart3 className="h-3 w-3" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setLocation('/admin/users')}
+              className="h-7 px-2 text-xs hidden lg:inline-flex"
+              title="사용자 관리"
+            >
+              <UserCog className="h-3 w-3" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleLogout}
+              className="h-7 px-2 text-xs"
+              title="로그아웃"
+            >
+              <LogOut className="h-3 w-3" />
+            </Button>
           </div>
         </div>
       </div>
 
       {/* Main Content: Split Screen */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Left Sidebar: Groups List */}
-        <div className="w-80 border-r border-border bg-sidebar flex-shrink-0 flex flex-col">
-          <div className="p-4 border-b border-sidebar-border">
-            <h2 className="font-bold text-lg">등록된 그룹</h2>
-            <p className="text-xs text-muted-foreground">{groups.length}개 그룹</p>
+        {/* Left Sidebar: Groups List - Compact */}
+        <div className="w-full sm:w-72 border-r border-border bg-sidebar flex-shrink-0 flex flex-col overflow-hidden">
+          <div className="p-2 border-b border-sidebar-border">
+            <h2 className="font-bold text-sm">그룹 ({groups.length})</h2>
             <input
               type="text"
-              placeholder="그룹 검색..."
+              placeholder="검색..."
               value={groupSearch}
               onChange={(e) => setGroupSearch(e.target.value)}
-              className="mt-2 w-full px-2 py-1 text-sm rounded border border-border bg-background"
+              className="mt-1 w-full px-2 py-1 text-xs rounded border border-border bg-background"
             />
           </div>
 
           <ScrollArea className="flex-1">
-            <div className="p-2">
+            <div className="p-1">
               {groups.filter((g) => !groupSearch || g.title.toLowerCase().includes(groupSearch.toLowerCase())).map((group) => {
                 const crawlerStatus = getCrawlerStatus(group);
 
@@ -409,55 +512,76 @@ function AdminDashboardContent() {
                   <button
                     key={group.id}
                     onClick={() => handleGroupSelect(group)}
-                    className={`w-full text-left p-3 rounded border-2 mb-2 transition-all ${
+                    className={`w-full text-left p-2 rounded mb-1 transition-all text-xs ${
                       selectedGroup?.id === group.id
-                        ? 'border-primary bg-accent'
-                        : 'border-transparent hover:bg-accent/50'
+                        ? 'border border-primary bg-accent'
+                        : 'border border-transparent hover:bg-accent/50'
                     }`}
                   >
-                    <div className="flex items-center justify-between mb-1">
-                      <div className="font-bold truncate flex-1">{group.title}</div>
-                      <Circle
-                        className={`h-2 w-2 flex-shrink-0 ml-2 ${
-                          crawlerStatus === 'active'
-                            ? 'fill-green-500 text-green-500'
-                            : crawlerStatus === 'error'
-                            ? 'fill-yellow-500 text-yellow-500'
-                            : 'fill-red-500 text-red-500'
-                        }`}
-                      />
-                    </div>
-                    {group.invite_link && (
-                      <a
-                        href={group.invite_link}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        onClick={(e) => e.stopPropagation()}
-                        className="text-xs text-primary hover:underline truncate flex items-center gap-1"
-                      >
-                        <ExternalLink className="h-3 w-3 flex-shrink-0" />
-                        {group.username ? `@${group.username}` : '텔레그램 링크'}
-                      </a>
-                    )}
-                    <div className="flex items-center justify-between mt-1">
-                      {group.member_count && (
-                        <Badge variant="outline" className="text-xs">
-                          <Users className="mr-1 h-3 w-3" />
-                          {group.member_count.toLocaleString()}
-                        </Badge>
-                      )}
-                      <div className="flex items-center gap-1">
+                    <div className="flex items-center justify-between mb-0.5">
+                      <div className="font-semibold truncate flex-1 text-xs">{group.title}</div>
+                      <div className="flex items-center gap-1 flex-shrink-0 ml-1">
+                        {crawlerStatus === 'initializing' ? (
+                          <Loader2 className="h-2.5 w-2.5 animate-spin text-primary" />
+                        ) : (
+                          <Circle
+                            className={`h-1.5 w-1.5 ${
+                              crawlerStatus === 'active'
+                                ? 'fill-green-500 text-green-500'
+                                : crawlerStatus === 'error'
+                                ? 'fill-yellow-500 text-yellow-500'
+                                : 'fill-gray-400 text-gray-400'
+                            }`}
+                          />
+                        )}
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
                             handleTriggerCrawl(group.id);
                           }}
-                          className="text-xs text-primary hover:underline flex items-center gap-0.5"
-                          title="역사 크롤링 시작"
+                          title="역사 크롤링"
+                          className="text-primary hover:text-primary/80 p-0.5"
                         >
-                          <Download className="h-3 w-3" />
+                          <Download className="h-2.5 w-2.5" />
                         </button>
                       </div>
+                    </div>
+
+                    {crawlerStatus === 'initializing' && (() => {
+                      const info = getCrawlerProgressInfo(group);
+                      if (!info) return null;
+                      const pct = info.total > 0 ? Math.min(100, Math.round((info.progress / info.total) * 100)) : 0;
+                      return (
+                        <div className="mb-0.5">
+                          <div className="w-full bg-muted rounded h-0.5 overflow-hidden">
+                            <div
+                              className="bg-primary h-0.5 transition-all duration-500"
+                              style={{ width: `${info.total > 0 ? pct : 10}%` }}
+                            />
+                          </div>
+                          <p className="text-[9px] text-muted-foreground mt-0.5">
+                            {info.total > 0 ? `${pct}%` : '준비 중...'}
+                          </p>
+                        </div>
+                      );
+                    })()}
+
+                    <div className="flex items-center gap-1 text-[9px] text-muted-foreground flex-wrap">
+                      {group.member_count && (
+                        <span>👥 {group.member_count.toLocaleString()}</span>
+                      )}
+                      {group.username && (
+                        <a
+                          href={group.invite_link || `https://t.me/${group.username}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          onClick={(e) => e.stopPropagation()}
+                          className="text-primary hover:underline"
+                          title="텔레그램 링크"
+                        >
+                          @{group.username}
+                        </a>
+                      )}
                     </div>
                   </button>
                 );
@@ -468,76 +592,76 @@ function AdminDashboardContent() {
         </div>
 
         {/* Right: Message Viewer */}
-        <div className="flex-1 flex flex-col bg-background">
+        <div className="flex-1 flex flex-col bg-background overflow-hidden">
           {selectedGroup ? (
             <>
-              {/* Chat Header */}
-              <div className="p-4 border-b border-border bg-card flex-shrink-0">
-                <div className="flex items-center justify-between mb-3">
-                  <div>
-                    <h2 className="font-bold text-2xl">{selectedGroup.title}</h2>
+              {/* Chat Header - Compact */}
+              <div className="p-2 border-b border-border bg-card flex-shrink-0">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <h2 className="font-bold text-sm truncate">{selectedGroup.title}</h2>
                     {selectedGroup.username && (
-                      <p className="text-sm text-muted-foreground">@{selectedGroup.username}</p>
+                      <p className="text-xs text-muted-foreground truncate">@{selectedGroup.username}</p>
                     )}
                   </div>
-                  <div className="flex items-center gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => loadMessages(selectedGroup.id, 1)}
-                      disabled={isLoadingMessages}
-                      className="border-2 border-border"
-                      title="메시지 새로고침"
-                    >
-                      <RefreshCw className={`h-4 w-4 ${isLoadingMessages ? 'animate-spin' : ''}`} />
-                    </Button>
-                  </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => loadMessages(selectedGroup.id, 1)}
+                    disabled={isLoadingMessages}
+                    className="h-7 px-2"
+                    title="새로고침"
+                  >
+                    <RefreshCw className={`h-3 w-3 ${isLoadingMessages ? 'animate-spin' : ''}`} />
+                  </Button>
                 </div>
-                <TopicFilter
-                  groupId={selectedGroup.id}
-                  selectedTopicId={selectedTopicId}
-                  onTopicSelect={(topicId: number | null) => {
-                    setSelectedTopicId(topicId);
-                    loadMessages(selectedGroup.id, 1);
-                  }}
-                />
+                <div className="mt-1">
+                  <TopicFilter
+                    groupId={selectedGroup.id}
+                    selectedTopicId={selectedTopicId}
+                    onTopicSelect={(topicId: number | null) => {
+                      setSelectedTopicId(topicId);
+                      loadMessages(selectedGroup.id, 1);
+                    }}
+                  />
+                </div>
               </div>
 
-              {/* Messages Area */}
-              <ScrollArea className="flex-1 p-4" ref={scrollAreaRef}>
+              {/* Messages Area - Compact */}
+              <ScrollArea className="flex-1 px-2 py-1" ref={scrollAreaRef}>
                 {isLoadingMessages && page === 1 ? (
                   <div className="flex items-center justify-center h-full">
-                    <Loader2 className="h-8 w-8 animate-spin text-primary" />
+                    <Loader2 className="h-6 w-6 animate-spin text-primary" />
                   </div>
                 ) : messages.length === 0 ? (
                   <div className="flex items-center justify-center h-full">
                     <div className="text-center">
-                      <AlertCircle className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
-                      <p className="text-lg font-medium">메시지가 없습니다</p>
-                      <p className="text-sm text-muted-foreground">
+                      <AlertCircle className="h-10 w-10 mx-auto mb-2 text-muted-foreground" />
+                      <p className="text-sm font-medium">메시지 없음</p>
+                      <p className="text-xs text-muted-foreground">
                         지난 30일간 메시지가 없습니다
                       </p>
                     </div>
                   </div>
                 ) : (
-                  <div className="space-y-4">
+                  <div className="space-y-0.5">
                     {/* Load More Button */}
                     {hasMore && (
-                      <div className="text-center mb-4">
+                      <div className="text-center py-2">
                         <Button
                           variant="outline"
                           size="sm"
                           onClick={handleLoadMore}
                           disabled={isLoadingMessages}
-                          className="border-2 border-border"
+                          className="h-6 text-xs border border-border"
                         >
                           {isLoadingMessages ? (
                             <>
-                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                              로딩 중...
+                              <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                              로딩
                             </>
                           ) : (
-                            '이전 메시지 불러오기'
+                            '이전 메시지'
                           )}
                         </Button>
                       </div>
@@ -547,14 +671,14 @@ function AdminDashboardContent() {
                     {Object.entries(groupedMessages).map(([dateKey, msgs]) => (
                       <div key={dateKey}>
                         {/* Date Divider */}
-                        <div className="flex items-center justify-center my-4">
-                          <div className="px-3 py-1 bg-muted rounded-full text-xs font-medium">
+                        <div className="flex items-center justify-center py-2">
+                          <div className="px-2 py-0.5 bg-muted rounded text-xs text-muted-foreground font-medium">
                             {formatDate(msgs[0].sent_at)}
                           </div>
                         </div>
 
                         {/* Messages */}
-                        <div>
+                        <div className="border border-border rounded divide-y divide-border">
                           {msgs.map((message) => (
                             <MessageBubble
                               key={message.id}
@@ -579,10 +703,10 @@ function AdminDashboardContent() {
           ) : (
             <div className="flex items-center justify-center h-full">
               <div className="text-center">
-                <Users className="h-16 w-16 mx-auto mb-4 text-muted-foreground" />
-                <p className="text-lg font-medium">그룹을 선택하세요</p>
-                <p className="text-sm text-muted-foreground">
-                  왼쪽에서 그룹을 선택하여 메시지를 확인하세요
+                <Users className="h-12 w-12 mx-auto mb-2 text-muted-foreground" />
+                <p className="text-sm font-medium">그룹 선택</p>
+                <p className="text-xs text-muted-foreground">
+                  왼쪽에서 그룹을 선택하세요
                 </p>
               </div>
             </div>

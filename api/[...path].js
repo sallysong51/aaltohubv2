@@ -1,4 +1,8 @@
-const BACKEND_URL = process.env.BACKEND_URL || 'https://63.180.156.219:8000';
+const BACKEND_URL = process.env.BACKEND_URL || '';
+
+if (!BACKEND_URL) {
+  console.error('[Proxy] BACKEND_URL environment variable is not set');
+}
 
 const ALLOWED_ORIGINS = [
   'https://aaltohub.vercel.app',
@@ -21,6 +25,10 @@ function setCorsHeaders(req, res) {
 }
 
 export default async function handler(req, res) {
+  if (!BACKEND_URL) {
+    return res.status(503).json({ error: 'Backend URL not configured' });
+  }
+
   try {
     const { path } = req.query;
 
@@ -51,9 +59,9 @@ export default async function handler(req, res) {
       return res.status(200).end();
     }
 
-    // Forward request to backend (15s timeout to prevent hanging)
+    // Forward request to backend (25s timeout — must exceed DB command_timeout of 10s)
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+    const timeout = setTimeout(() => controller.abort(), 25000);
     const response = await fetch(targetUrl, {
       method: req.method,
       headers,

@@ -4,8 +4,9 @@
  * - Clear disabled state for registered groups
  * - Public/Private toggle with visual hierarchy
  */
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useLocation } from 'wouter';
+import axios from 'axios';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -15,32 +16,43 @@ import { Badge } from '@/components/ui/badge';
 import { Avatar, AvatarImage, AvatarFallback } from '@/components/ui/avatar';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
-import { Loader2, Users, Lock, Globe, ChevronRight, AlertCircle, Info } from 'lucide-react';
-import { groupsApi, TelegramGroup, getApiErrorMessage } from '@/lib/api';
+import { Loader2, Users, Lock, Globe, ChevronRight, AlertCircle, Info, CheckCircle2, XCircle, Download, Send } from 'lucide-react';
+import { groupsApi, authApi, TelegramGroup, CrawlProgressItem, getApiErrorMessage } from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
 import ProtectedRoute from '@/components/ProtectedRoute';
 
 function GroupSelectionContent() {
   const [, setLocation] = useLocation();
-  const { user } = useAuth();
-  
-  const [step, setStep] = useState<'select' | 'visibility'>('select');
+  const { user, refreshUser } = useAuth();
+
+  const [step, setStep] = useState<'select' | 'visibility' | 'complete'>('select');
   const [groups, setGroups] = useState<TelegramGroup[]>([]);
   const [selectedGroups, setSelectedGroups] = useState<Set<number>>(new Set());
   const [groupVisibility, setGroupVisibility] = useState<Map<number, 'public' | 'private'>>(new Map());
   const [isLoading, setIsLoading] = useState(true);
   const [isRegistering, setIsRegistering] = useState(false);
+  const [crawlInitiated, setCrawlInitiated] = useState(false);
+  const [crawlProgress, setCrawlProgress] = useState<CrawlProgressItem[]>([]);
+  const [registeredGroupIds, setRegisteredGroupIds] = useState<Set<string>>(new Set());
+  const [pollError, setPollError] = useState(false);
+  const [showTelegramLogin, setShowTelegramLogin] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollFailCountRef = useRef(0);
 
   useEffect(() => {
     loadGroups();
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
   }, []);
 
   const loadGroups = async () => {
     setIsLoading(true);
+    setShowTelegramLogin(false);
     try {
       const response = await groupsApi.getMyTelegramGroups();
       setGroups(response.data);
-      
+
       // Initialize all groups as public by default
       const visibilityMap = new Map<number, 'public' | 'private'>();
       response.data.forEach(group => {
@@ -50,6 +62,11 @@ function GroupSelectionContent() {
       });
       setGroupVisibility(visibilityMap);
     } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 401) {
+        // Show Telegram login UI instead of error
+        setShowTelegramLogin(true);
+        return;
+      }
       toast.error(getApiErrorMessage(error, '그룹 목록을 불러오는데 실패했습니다'));
     } finally {
       setIsLoading(false);
@@ -91,8 +108,59 @@ function GroupSelectionContent() {
       toast.error('최소 하나의 그룹을 선택해주세요');
       return;
     }
+    // Rebuild visibility map for currently selected groups only (prevents stale entries)
+    const freshMap = new Map<number, 'public' | 'private'>();
+    selectedGroups.forEach(gid => {
+      freshMap.set(gid, groupVisibility.get(gid) || 'public');
+    });
+    setGroupVisibility(freshMap);
     setStep('visibility');
   };
+
+  const pollCrawlProgress = useCallback(async () => {
+    try {
+      const res = await groupsApi.getCrawlProgress();
+      // Filter to only show progress for newly registered groups
+      const relevant = res.data.filter(
+        (p: CrawlProgressItem) => registeredGroupIds.has(String(p.group_id))
+      );
+      setCrawlProgress(relevant);
+      pollFailCountRef.current = 0;
+      setPollError(false);
+
+      // Stop polling when all groups are done (active or error)
+      const allDone = relevant.length > 0 && relevant.every(
+        (p: CrawlProgressItem) => p.status === 'active' || p.status === 'error'
+      );
+      if (allDone && pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+    } catch {
+      pollFailCountRef.current += 1;
+      if (pollFailCountRef.current >= 5) {
+        setPollError(true);
+        if (pollRef.current) {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+        }
+      }
+    }
+  }, [registeredGroupIds]);
+
+  // Start polling when we enter complete step with registeredGroupIds
+  useEffect(() => {
+    if (step === 'complete' && registeredGroupIds.size > 0 && crawlInitiated) {
+      pollCrawlProgress(); // immediate first call
+      pollRef.current = setInterval(pollCrawlProgress, 3000);
+      return () => {
+        if (pollRef.current) {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+        }
+      };
+    }
+  }, [step, registeredGroupIds, crawlInitiated, pollCrawlProgress]);
 
   const handleRegister = async () => {
     setIsRegistering(true);
@@ -111,34 +179,44 @@ function GroupSelectionContent() {
       const response = await groupsApi.registerGroups({ groups: groupsToRegister });
 
       if (response.data.success) {
-        const publicCount = groupsToRegister.filter(g => g.visibility === 'public').length;
-        const privateCount = groupsToRegister.filter(g => g.visibility === 'private').length;
+        const registeredCount = response.data.registered_groups.length;
+        const initiated = !!response.data.crawl_initiated;
+        setCrawlInitiated(initiated);
 
-        toast.success(
-          `${response.data.registered_groups.length}개 그룹 등록 완료`,
-          {
-            description: publicCount > 0 && privateCount > 0
-              ? `공개: ${publicCount}개, 비공개: ${privateCount}개`
-              : publicCount > 0
-              ? `모두 공개로 등록되었습니다`
-              : `모두 비공개로 등록되었습니다`,
-          }
+        // Track which groups were registered for progress filtering
+        const newIds = new Set(
+          response.data.registered_groups.map(g => String(g.telegram_id))
         );
+        setRegisteredGroupIds(newIds);
 
-        // Redirect based on role
-        setTimeout(() => {
-          if (user?.role === 'admin') {
-            setLocation('/admin');
-          } else {
-            setLocation('/groups');
-          }
-        }, 1500);
+        if (initiated) {
+          toast.success(
+            `${registeredCount}개 그룹 등록 완료`,
+            { description: '과거 메시지를 수집하는 중입니다.' }
+          );
+        } else if (registeredCount > 0) {
+          toast.success(`${registeredCount}개 그룹 등록 완료`, {
+            description: '크롤러 연결에 실패했습니다. 관리자 대시보드에서 수동으로 크롤링을 시작할 수 있습니다.',
+          });
+        } else {
+          toast.info('모든 그룹이 이미 등록되어 있습니다.');
+        }
+
+        setStep('complete');
       }
     } catch (error) {
       toast.error(getApiErrorMessage(error, '그룹 등록에 실패했습니다'));
     } finally {
       setIsRegistering(false);
     }
+  };
+
+  const handleContinue = () => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+    setLocation(user?.role === 'admin' ? '/admin' : '/feed');
   };
 
   const unregisteredGroups = groups.filter(g => !g.is_registered);
@@ -149,6 +227,19 @@ function GroupSelectionContent() {
       <div className="min-h-screen flex items-center justify-center">
         <Loader2 className="h-8 w-8 animate-spin text-primary" />
       </div>
+    );
+  }
+
+  if (showTelegramLogin) {
+    return (
+      <TelegramLoginFlow
+        onLoginSuccess={async () => {
+          await refreshUser();
+          setShowTelegramLogin(false);
+          await loadGroups();
+        }}
+        onCancel={() => setShowTelegramLogin(false)}
+      />
     );
   }
 
@@ -219,20 +310,14 @@ function GroupSelectionContent() {
                         <AlertCircle className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
                         <p className="text-lg font-medium mb-2">가입된 그룹이 없습니다</p>
                         <p className="text-sm text-muted-foreground mb-4">
-                          텔레그램에서 그룹에 가입한 후 다시 시도해주세요
+                          텔레그램에서 그룹이나 채널에 가입한 후 아래 새로고침을 눌러주세요
                         </p>
                         <Button
                           onClick={loadGroups}
                           variant="outline"
-                          className="border-2 border-border mr-2"
+                          className="border-2 border-border"
                         >
                           새로고침
-                        </Button>
-                        <Button
-                          onClick={() => setLocation(user?.role === 'admin' ? '/admin' : '/groups')}
-                          className="border-2 border-border btn-pressed"
-                        >
-                          계속하기
                         </Button>
                       </>
                     )}
@@ -495,7 +580,395 @@ function GroupSelectionContent() {
             </div>
           </>
         )}
+
+        {step === 'complete' && (
+          <div className="py-8">
+            <div className="text-center mb-8">
+              <Download className="h-16 w-16 mx-auto mb-4 text-primary" />
+              <h2 className="text-2xl font-bold mb-2">등록 완료!</h2>
+              {crawlInitiated ? (
+                <p className="text-muted-foreground">
+                  과거 2주간의 메시지를 수집하고 있습니다
+                </p>
+              ) : (
+                <p className="text-muted-foreground">
+                  그룹이 성공적으로 등록되었습니다.
+                </p>
+              )}
+            </div>
+
+            {crawlInitiated && crawlProgress.length > 0 && (
+              <div className="space-y-4 mb-8 max-w-xl mx-auto">
+                {crawlProgress.map((p) => {
+                  const pct = p.initial_crawl_total > 0
+                    ? Math.min(100, Math.round((p.initial_crawl_progress / p.initial_crawl_total) * 100))
+                    : 0;
+                  const isDone = p.status === 'active';
+                  const isError = p.status === 'error';
+                  const isInitializing = p.status === 'initializing' || p.status === 'inactive';
+                  const isCrawling = isInitializing && !!p.is_currently_crawling;
+                  const isQueued = isInitializing && !p.is_currently_crawling;
+
+                  return (
+                    <Card key={p.group_id} className="refined-card">
+                      <CardContent className="p-4">
+                        <div className="flex items-center gap-3 mb-2">
+                          {isDone && <CheckCircle2 className="h-5 w-5 text-green-500 shrink-0" />}
+                          {isError && <XCircle className="h-5 w-5 text-red-500 shrink-0" />}
+                          {isCrawling && <Loader2 className="h-5 w-5 animate-spin text-primary shrink-0" />}
+                          {isQueued && <Download className="h-5 w-5 text-muted-foreground shrink-0" />}
+                          <span className="font-bold truncate">{p.group_name}</span>
+                          <span className="ml-auto text-sm text-muted-foreground shrink-0">
+                            {isDone && '수집 완료'}
+                            {isError && '오류'}
+                            {isCrawling && p.initial_crawl_total > 0 && `수집 중: ${p.initial_crawl_progress.toLocaleString()} / ${p.initial_crawl_total.toLocaleString()}`}
+                            {isCrawling && p.initial_crawl_total === 0 && '수집 시작 중...'}
+                            {isQueued && '대기 중...'}
+                          </span>
+                        </div>
+                        {isCrawling && (
+                          <div className="w-full bg-muted rounded-full h-2 overflow-hidden">
+                            <div
+                              className="bg-primary h-2 rounded-full transition-all duration-500"
+                              style={{ width: `${p.initial_crawl_total > 0 ? pct : 10}%` }}
+                            />
+                          </div>
+                        )}
+                        {isQueued && (
+                          <div className="w-full bg-muted rounded-full h-2 overflow-hidden">
+                            <div className="bg-muted-foreground/30 h-2 rounded-full w-[5%]" />
+                          </div>
+                        )}
+                        {isDone && (
+                          <div className="w-full bg-green-100 dark:bg-green-950 rounded-full h-2">
+                            <div className="bg-green-500 h-2 rounded-full w-full" />
+                          </div>
+                        )}
+                        {isError && p.last_error && (
+                          <p className="text-xs text-red-500 mt-1 truncate">{p.last_error}</p>
+                        )}
+                      </CardContent>
+                    </Card>
+                  );
+                })}
+              </div>
+            )}
+
+            {crawlInitiated && crawlProgress.length === 0 && !pollError && (
+              <div className="flex items-center justify-center gap-2 text-sm text-muted-foreground mb-8">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                <span>크롤러에 연결 중...</span>
+              </div>
+            )}
+
+            {pollError && (
+              <div className="text-center text-sm text-red-500 mb-8">
+                <AlertCircle className="h-4 w-4 inline mr-1" />
+                진행 상태를 가져올 수 없습니다.{' '}
+                <button
+                  className="underline ml-1"
+                  onClick={() => {
+                    setPollError(false);
+                    pollFailCountRef.current = 0;
+                    pollCrawlProgress();
+                    pollRef.current = setInterval(pollCrawlProgress, 3000);
+                  }}
+                >
+                  다시 시도
+                </button>
+              </div>
+            )}
+
+            <div className="flex justify-center gap-4">
+              {(() => {
+                const allDone = crawlProgress.length > 0 && crawlProgress.every(
+                  p => p.status === 'active' || p.status === 'error'
+                );
+                return (
+                  <>
+                    <Button
+                      onClick={handleContinue}
+                      className="border-2 border-border btn-pressed"
+                      size="lg"
+                    >
+                      {allDone || !crawlInitiated ? '계속하기' : '건너뛰기'}
+                      <ChevronRight className="ml-2 h-5 w-5" />
+                    </Button>
+                  </>
+                );
+              })()}
+            </div>
+          </div>
+        )}
       </div>
+    </div>
+  );
+}
+
+// Inline Telegram login flow component for GroupSelection
+interface TelegramLoginFlowProps {
+  onLoginSuccess: () => void;
+  onCancel: () => void;
+}
+
+function TelegramLoginFlow({ onLoginSuccess, onCancel }: TelegramLoginFlowProps) {
+  const [step, setStep] = useState<'phone' | 'code' | '2fa'>('phone');
+  const [phoneOrUsername, setPhoneOrUsername] = useState('');
+  const [code, setCode] = useState('');
+  const [password, setPassword] = useState('');
+  const [phoneCodeHash, setPhoneCodeHash] = useState('');
+  const [sendStatus, setSendStatus] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
+  const [isLoading, setIsLoading] = useState(false);
+  const [resendTimer, setResendTimer] = useState(0);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const phoneCodeHashRef = useRef('');
+  const pendingCodeRef = useRef<string | null>(null);
+  const isSubmitting = useRef(false);
+
+  const startResendTimer = useCallback(() => {
+    setResendTimer(60);
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => {
+      setResendTimer((prev) => {
+        if (prev <= 1) {
+          if (timerRef.current) clearInterval(timerRef.current);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, []);
+
+  const doVerifyCode = useCallback(async (codeValue: string, hash: string) => {
+    if (isSubmitting.current) return;
+    isSubmitting.current = true;
+    setIsLoading(true);
+    try {
+      await authApi.verifyCode({
+        phone_or_username: phoneOrUsername,
+        code: codeValue,
+        phone_code_hash: hash,
+      });
+      onLoginSuccess();
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 403) {
+        setStep('2fa');
+        toast.info('2단계 인증이 필요합니다');
+      } else if (axios.isAxiosError(error) && error.response?.status === 408) {
+        setStep('phone');
+        setCode('');
+        setPhoneCodeHash('');
+        phoneCodeHashRef.current = '';
+        setSendStatus('idle');
+        toast.error('세션이 만료되었습니다. 다시 시도해주세요');
+      } else {
+        toast.error(getApiErrorMessage(error, '코드 검증 실패'));
+      }
+    } finally {
+      setIsLoading(false);
+      isSubmitting.current = false;
+    }
+  }, [phoneOrUsername, onLoginSuccess]);
+
+  const submitCode = useCallback(async (codeValue: string) => {
+    const hash = phoneCodeHashRef.current;
+    if (!hash) {
+      pendingCodeRef.current = codeValue;
+      return;
+    }
+    await doVerifyCode(codeValue, hash);
+  }, [doVerifyCode]);
+
+  const handleSendCode = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!phoneOrUsername.trim()) {
+      toast.error('전화번호 또는 username을 입력해주세요');
+      return;
+    }
+
+    setSendStatus('sending');
+    setCode('');
+    setStep('code');
+
+    try {
+      const response = await authApi.sendCode({ phone_or_username: phoneOrUsername });
+      if (response.data.success) {
+        const hash = response.data.phone_code_hash || '';
+        phoneCodeHashRef.current = hash;
+        setPhoneCodeHash(hash);
+        setSendStatus('sent');
+        startResendTimer();
+
+        if (pendingCodeRef.current) {
+          const pending = pendingCodeRef.current;
+          pendingCodeRef.current = null;
+          await doVerifyCode(pending, hash);
+        }
+      } else {
+        setSendStatus('error');
+        toast.error(response.data.message || '코드 전송 실패');
+      }
+    } catch (error) {
+      setSendStatus('error');
+      toast.error(getApiErrorMessage(error, '코드 전송 중 오류가 발생했습니다'));
+    }
+  };
+
+  const handleCodeChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = e.target.value.replace(/\D/g, '').slice(0, 5);
+    setCode(value);
+    if (value.length === 5) {
+      submitCode(value);
+    }
+  }, [submitCode]);
+
+  const handleVerify2FA = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!password.trim()) {
+      toast.error('2FA 비밀번호를 입력해주세요');
+      return;
+    }
+    setIsLoading(true);
+    try {
+      await authApi.verify2FA({
+        phone_or_username: phoneOrUsername,
+        password,
+        phone_code_hash: phoneCodeHash,
+      });
+      onLoginSuccess();
+    } catch (error) {
+      toast.error(getApiErrorMessage(error, '2FA 검증 실패'));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-background p-4">
+      <Card className="w-full max-w-md refined-card">
+        <CardHeader>
+          <CardTitle className="text-2xl font-bold text-center">
+            텔레그램 연결
+          </CardTitle>
+          <CardDescription className="text-center">
+            그룹을 추가하기 위해 텔레그램으로 로그인하세요
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {step === 'phone' && (
+            <form onSubmit={handleSendCode} className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="phone">전화번호 또는 Username</Label>
+                <Input
+                  id="phone"
+                  type="text"
+                  placeholder="+358... 또는 @username"
+                  value={phoneOrUsername}
+                  onChange={(e) => setPhoneOrUsername(e.target.value)}
+                  autoFocus
+                />
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={onCancel}
+                  disabled={isLoading}
+                  className="flex-1 border-2 border-border"
+                >
+                  취소
+                </Button>
+                <Button
+                  type="submit"
+                  className="flex-1 border-2 border-border btn-pressed"
+                  disabled={isLoading}
+                >
+                  {isLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Send className="mr-2 h-4 w-4" />}
+                  코드 받기
+                </Button>
+              </div>
+            </form>
+          )}
+
+          {step === 'code' && (
+            <form onSubmit={(e) => { e.preventDefault(); submitCode(code); }} className="space-y-4">
+              <div className="flex items-center gap-2 px-3 py-2 bg-muted rounded-md text-sm">
+                <span className="font-medium flex-1 truncate">{phoneOrUsername}</span>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="code">인증 코드</Label>
+                <Input
+                  id="code"
+                  type="text"
+                  inputMode="numeric"
+                  placeholder="12345"
+                  value={code}
+                  onChange={handleCodeChange}
+                  className="border-2 border-border font-mono text-center text-2xl"
+                  disabled={isLoading}
+                  maxLength={5}
+                  autoFocus
+                />
+              </div>
+              {resendTimer > 0 && (
+                <p className="text-xs text-center text-muted-foreground">
+                  {resendTimer}초 후 재전송 가능
+                </p>
+              )}
+              <Button
+                type="submit"
+                className="w-full border-2 border-border btn-pressed"
+                disabled={isLoading || code.length < 5}
+              >
+                {isLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                확인
+              </Button>
+            </form>
+          )}
+
+          {step === '2fa' && (
+            <form onSubmit={handleVerify2FA} className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="password">2단계 인증 비밀번호</Label>
+                <Input
+                  id="password"
+                  type="password"
+                  placeholder="••••••••"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  disabled={isLoading}
+                  autoFocus
+                />
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={onCancel}
+                  disabled={isLoading}
+                  className="flex-1 border-2 border-border"
+                >
+                  취소
+                </Button>
+                <Button
+                  type="submit"
+                  className="flex-1 border-2 border-border btn-pressed"
+                  disabled={isLoading}
+                >
+                  {isLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Lock className="mr-2 h-4 w-4" />}
+                  확인
+                </Button>
+              </div>
+            </form>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }

@@ -3,16 +3,37 @@ Database connection layer — asyncpg for all DB operations.
 
 supabase-py is kept ONLY for Supabase Storage uploads (live_crawler._upload_media).
 All query/insert/update/delete operations go through asyncpg directly.
+
+CRITICAL DATABASE_URL REQUIREMENTS:
+- This app uses LISTEN/NOTIFY for SSE realtime events (see sse.py)
+- LISTEN requires persistent connections across transactions
+- You MUST use either:
+  1. Session pooler (port 5432) — recommended for production
+  2. Direct connection (port 5432) — works for dev/testing
+- NEVER use Transaction pooler (port 6543) — it breaks LISTEN entirely
+
+Supabase pooler options:
+- Session: postgresql://postgres.PROJECT_REF:PASSWORD@aws-X-region.pooler.supabase.com:5432/postgres
+- Direct:  postgresql://postgres:PASSWORD@db.PROJECT_REF.supabase.co:5432/postgres
 """
 import logging
 from typing import Any, Optional
 
 import asyncpg
 from supabase import create_client, Client
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Transient errors that warrant a retry during pool creation
+_TRANSIENT_ERRORS = (
+    ConnectionError, TimeoutError, OSError,
+    asyncpg.InternalServerError,
+    asyncpg.PostgresConnectionError,
+    asyncpg.InterfaceError,
+)
 
 
 class Database:
@@ -30,14 +51,47 @@ class Database:
             raise RuntimeError(
                 "DATABASE_URL is not set. Get it from Supabase Dashboard > Settings > Database > Connection string."
             )
-        self._pool = await asyncpg.create_pool(
-            dsn=dsn,
-            min_size=5,
-            max_size=20,
-            command_timeout=30,
-            statement_cache_size=100,
+        try:
+            self._pool = await asyncpg.create_pool(
+                dsn=dsn,
+                min_size=5,
+                max_size=20,
+                command_timeout=10,
+                statement_cache_size=100,
+            )
+            logger.info("asyncpg pool created (min=5, max=20)")
+        except asyncpg.InternalServerError as e:
+            if "Tenant or user not found" in str(e):
+                raise RuntimeError(
+                    f"Supabase connection rejected: {e}. "
+                    "Possible causes: (1) project is PAUSED — wake it at https://app.supabase.com, "
+                    "(2) DATABASE_URL has wrong project ref, "
+                    "(3) wrong pooler endpoint."
+                ) from e
+            raise
+
+    async def connect_with_retry(self) -> bool:
+        """Connect with exponential backoff. Returns True on success, False on exhaustion."""
+        @retry(
+            stop=stop_after_attempt(5),
+            wait=wait_exponential(multiplier=2, min=2, max=32),
+            retry=retry_if_exception_type(_TRANSIENT_ERRORS),
+            before_sleep=lambda rs: logger.warning(
+                "[DB] Connection attempt %d failed, retrying in %.0fs: %s",
+                rs.attempt_number, rs.next_action.sleep, rs.outcome.exception(),
+            ),
         )
-        logger.info("asyncpg pool created (min=5, max=20)")
+        async def _try_connect():
+            # Reset pool so connect() actually attempts again
+            self._pool = None
+            await self.connect()
+
+        try:
+            await _try_connect()
+            return True
+        except Exception as e:
+            logger.critical("[DB] All connection attempts exhausted: %s", e)
+            return False
 
     async def close(self) -> None:
         """Close the connection pool. Call at app shutdown."""
@@ -46,8 +100,26 @@ class Database:
             self._pool = None
             logger.info("asyncpg pool closed")
 
+    @property
+    def is_connected(self) -> bool:
+        """Whether the connection pool is initialized and open."""
+        return self._pool is not None and not self._pool._closed
+
+    async def try_reconnect(self) -> bool:
+        """Single reconnection attempt. Returns True on success, False on failure."""
+        if self._pool is not None:
+            return True
+        try:
+            await self.connect()
+            logger.warning("[DB] Database connection recovered — exiting degraded mode")
+            return True
+        except Exception as e:
+            logger.debug("[DB] Reconnection attempt failed: %s", e)
+            return False
+
     def _ensure_pool(self) -> asyncpg.Pool:
         if self._pool is None:
+            logger.error("[DB] Pool access attempted while disconnected")
             raise RuntimeError("Database pool not initialized — call await db.connect() first")
         return self._pool
 

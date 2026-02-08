@@ -6,10 +6,11 @@ Runs the LiveCrawlerService as an independent FastAPI app on port 8001
 not exposed to the internet.
 
 Internal control API:
-  GET  /health          — crawler health (deep check: clients, circuit breaker, queue)
-  GET  /status          — full crawler status dict
-  POST /restart         — restart the crawler
-  POST /groups/{id}/crawl — trigger historical crawl for a group
+  GET  /health               — crawler health (deep check: clients, circuit breaker, queue)
+  GET  /status               — full crawler status dict
+  POST /restart              — restart the crawler
+  POST /groups/{id}/crawl    — trigger historical crawl for a group
+  POST /groups/batch-crawl   — sequential historical crawl for multiple groups
 
 All endpoints require Authorization: Bearer {CRAWLER_API_SECRET}.
 """
@@ -21,6 +22,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 import sentry_sdk
 from sentry_sdk.integrations.asyncio import AsyncioIntegration
 
@@ -133,6 +135,18 @@ async def get_status():
 
 @app.post("/restart", dependencies=[Depends(_verify_internal_token)])
 async def restart():
+    global _batch_crawl_task
+    # Cancel running batch crawl and drain stale queue before restart
+    if _batch_crawl_task and not _batch_crawl_task.done():
+        _batch_crawl_task.cancel()
+        try:
+            await _batch_crawl_task
+        except asyncio.CancelledError:
+            pass
+        _batch_crawl_task = None
+    _drain_batch_queue()
+    _batch_queued_gids.clear()
+
     await live_crawler.restart()
     return {"success": True, "status": live_crawler.get_status()}
 
@@ -149,15 +163,140 @@ async def trigger_crawl(group_id: str):
         if gid not in live_crawler.group_id_map:
             raise HTTPException(status_code=404, detail="Group not found in crawler")
 
+    # Prevent concurrent crawls of the same group
+    existing_task = live_crawler._manual_crawl_tasks.get(group_id)
+    if existing_task and not existing_task.done():
+        return {"success": True, "message": f"Historical crawl already running for group {group_id}"}
+
     live_crawler._crawled_groups.discard(gid)
     task = asyncio.create_task(live_crawler._crawl_historical_for_group(gid))
-    if not hasattr(live_crawler, '_manual_crawl_tasks'):
-        live_crawler._manual_crawl_tasks = {}
     live_crawler._manual_crawl_tasks[group_id] = task
+    # Clean up completed tasks to prevent memory accumulation
     live_crawler._manual_crawl_tasks = {
         k: v for k, v in live_crawler._manual_crawl_tasks.items() if not v.done()
     }
     return {"success": True, "message": f"Historical crawl started for group {group_id}"}
+
+
+class BatchCrawlRequest(BaseModel):
+    group_ids: list[str]
+
+
+# Batch crawl queue — ensures only ONE sequential crawl task runs at a time.
+# New requests append to the queue; the running task drains it.
+_batch_crawl_queue: asyncio.Queue[int] = asyncio.Queue(maxsize=500)
+_batch_crawl_task: asyncio.Task | None = None
+
+
+async def _batch_crawl_worker():
+    """Drain the batch crawl queue, processing groups one at a time."""
+    live_crawler._batch_crawl_active = True
+    try:
+        while True:
+            try:
+                gid = await asyncio.wait_for(_batch_crawl_queue.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                # No new items for 5 seconds — worker exits cleanly
+                break
+            if not live_crawler.running:
+                _batch_crawl_queue.task_done()
+                break
+            try:
+                live_crawler._crawled_groups.discard(gid)
+                title = live_crawler._get_group_title(gid)
+                remaining = _batch_crawl_queue.qsize()
+                logger.info("[BATCH-CRAWL] Crawling %s (queue: %d remaining)", title, remaining)
+                await live_crawler._crawl_historical_for_group(gid)
+            except Exception as e:
+                logger.error("[BATCH-CRAWL] Error crawling group %s: %s", gid, e)
+            finally:
+                _batch_crawl_queue.task_done()
+    finally:
+        live_crawler._batch_crawl_active = False
+        _batch_queued_gids.clear()
+
+    logger.info("[BATCH-CRAWL] Worker finished — queue drained")
+
+
+def _drain_batch_queue() -> None:
+    """Clear all pending items from the batch crawl queue (used on restart)."""
+    drained = 0
+    while not _batch_crawl_queue.empty():
+        try:
+            _batch_crawl_queue.get_nowait()
+            _batch_crawl_queue.task_done()
+            drained += 1
+        except asyncio.QueueEmpty:
+            break
+    if drained:
+        logger.info("[BATCH-CRAWL] Drained %d stale items from queue on restart", drained)
+
+
+# Track which group IDs are already in the batch queue (dedup)
+_batch_queued_gids: set[int] = set()
+
+
+@app.post("/groups/batch-crawl", dependencies=[Depends(_verify_internal_token)])
+async def trigger_batch_crawl(request: BatchCrawlRequest):
+    """Trigger sequential historical crawl for multiple groups.
+
+    Groups are crawled ONE AT A TIME via a shared queue to avoid
+    Telegram FloodWaitError. Concurrent requests safely append to queue.
+    Returns immediately.
+    """
+    global _batch_crawl_task
+
+    if not live_crawler.running:
+        raise HTTPException(status_code=400, detail="Crawler is not running")
+
+    if not request.group_ids:
+        raise HTTPException(status_code=400, detail="No group IDs provided")
+
+    # Always refresh groups when batch-crawl is called — this is typically triggered
+    # right after group registration, so we need to pick up new groups immediately
+    # for both historical crawl AND live event listening.
+    await live_crawler.refresh_groups()
+    await live_crawler._ensure_crawler_status_rows()
+
+    int_ids: list[int] = []
+
+    skipped: list[str] = []
+    for gid_str in request.group_ids:
+        gid = int(gid_str)
+        if gid in live_crawler.group_id_map:
+            int_ids.append(gid)
+        else:
+            skipped.append(gid_str)
+
+    if not int_ids:
+        raise HTTPException(status_code=404, detail="No valid groups found in crawler")
+
+    # Enqueue all validated IDs (with deduplication)
+    for gid in int_ids:
+        if gid in _batch_queued_gids:
+            skipped.append(str(gid))
+            logger.debug("[BATCH-CRAWL] Skipping duplicate group %s (already queued)", gid)
+            continue
+        try:
+            _batch_crawl_queue.put_nowait(gid)
+            _batch_queued_gids.add(gid)
+        except asyncio.QueueFull:
+            skipped.append(str(gid))
+            logger.warning("[BATCH-CRAWL] Queue full (maxsize=500), skipping group %s", gid)
+
+    # Start worker if not already running
+    if _batch_crawl_task is None or _batch_crawl_task.done():
+        _batch_crawl_task = asyncio.create_task(_batch_crawl_worker())
+
+    accepted_ids = [str(g) for g in int_ids if g not in set(int(s) for s in skipped)]
+    result: dict = {
+        "success": True,
+        "message": f"Sequential historical crawl queued for {len(int_ids)} groups",
+        "group_ids": accepted_ids,
+    }
+    if skipped:
+        result["skipped_ids"] = skipped
+    return result
 
 
 if __name__ == "__main__":

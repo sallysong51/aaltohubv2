@@ -57,7 +57,7 @@ from app.models import UserRole
 
 logger = logging.getLogger(__name__)
 
-GROUP_REFRESH_INTERVAL = 300  # 5 minutes
+GROUP_REFRESH_INTERVAL = 60  # 1 minute — reduced from 5min so newly registered groups start live listening faster
 ENABLED_CACHE_TTL = 60  # seconds
 HISTORICAL_CRAWL_DAYS = 14
 RECONNECT_DELAY = 10  # seconds
@@ -187,6 +187,19 @@ class LiveCrawlerService:
         # Groups with active penalties are skipped in gap-fill/historical loops
         # instead of blocking the entire loop.
         self._flood_wait_until: dict[int, float] = {}
+        # Manual crawl tasks triggered via admin API
+        self._manual_crawl_tasks: dict[str, asyncio.Task] = {}
+        # Granular crawl tracking for dashboard visibility
+        self._currently_crawling_group_id: int | None = None
+        self._batch_crawl_active = False
+        self._last_event_received_at: float = 0
+        self._watchdog_task: asyncio.Task | None = None
+        # Per-group crawl lock: prevents concurrent crawl of same group by startup + batch
+        self._crawling_groups_lock: set[int] = set()
+        # Track last gap-fill completion for dynamic lookback after outages
+        self._last_gap_fill_at: float = 0
+        # Last start failure reason, cleared on success — exposed via get_status()
+        self._start_error: str | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -211,10 +224,41 @@ class LiveCrawlerService:
             self._lock_file.write(str(os.getpid()))
             self._lock_file.flush()
         except (IOError, OSError):
-            logger.error("Another crawler instance is already running (lock: %s). Aborting.", lock_path)
-            if hasattr(self, "_lock_file") and self._lock_file:
-                self._lock_file.close()
-            return
+            # Check if the lock holder is still alive
+            stale = False
+            try:
+                with open(lock_path, "r") as f:
+                    old_pid = int(f.read().strip())
+                os.kill(old_pid, 0)  # Raises OSError if process is dead
+            except (OSError, ValueError):
+                stale = True
+
+            if stale:
+                logger.warning("Stale lock file found (dead PID). Reclaiming lock: %s", lock_path)
+                if self._lock_file:
+                    self._lock_file.close()
+                try:
+                    os.unlink(lock_path)
+                except OSError:
+                    pass
+                # Retry once
+                try:
+                    self._lock_file = open(lock_path, "w")
+                    fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self._lock_file.write(str(os.getpid()))
+                    self._lock_file.flush()
+                except (IOError, OSError):
+                    self._start_error = "Could not acquire lock even after removing stale file"
+                    logger.error("Live crawler: %s: %s", self._start_error, lock_path)
+                    if self._lock_file:
+                        self._lock_file.close()
+                    return
+            else:
+                self._start_error = f"Another crawler instance is already running (PID {old_pid})"
+                logger.error("Live crawler: %s (lock: %s)", self._start_error, lock_path)
+                if self._lock_file:
+                    self._lock_file.close()
+                return
 
         logger.info("=" * 60)
         logger.info("Initializing live crawler with multiple admin accounts...")
@@ -228,7 +272,9 @@ class LiveCrawlerService:
                 "SELECT * FROM users WHERE role = $1", UserRole.ADMIN.value
             )
             if not admin_rows:
-                logger.error("Live crawler: No admin user found. Please login as admin first.")
+                self._start_error = "No admin user found. Please login as admin first."
+                logger.error("Live crawler: %s", self._start_error)
+                self._release_lock()
                 return
 
             logger.info("Live crawler: Found %d admin user(s)", len(admin_rows))
@@ -252,22 +298,31 @@ class LiveCrawlerService:
                     if row["key_hash"] == ENCRYPTION_VERSION:
                         session_string = session_encryption.decrypt(row["session_data"], aad=aad)
                     else:
-                        # Legacy session — decrypt and re-encrypt with v2
-                        from app.encryption import get_legacy_encryption
-                        session_string = get_legacy_encryption().decrypt(row["session_data"])
-                        new_encrypted = session_encryption.encrypt(session_string, aad=aad)
-                        await db.execute(
-                            "UPDATE telethon_sessions SET session_data = $1, key_hash = $2 WHERE user_id = $3",
-                            new_encrypted, ENCRYPTION_VERSION, admin_id,
-                        )
-                        logger.info("Live crawler: Migrated session for admin %s to v2 encryption", admin_name)
+                        # Legacy session — try to decrypt and re-encrypt with v2
+                        try:
+                            from app.encryption import get_legacy_encryption
+                            session_string = get_legacy_encryption().decrypt(row["session_data"])
+                            new_encrypted = session_encryption.encrypt(session_string, aad=aad)
+                            await db.execute(
+                                "UPDATE telethon_sessions SET session_data = $1, key_hash = $2 WHERE user_id = $3",
+                                new_encrypted, ENCRYPTION_VERSION, admin_id,
+                            )
+                            logger.info("Live crawler: Migrated session for admin %s to v2 encryption", admin_name)
+                        except Exception as decrypt_err:
+                            logger.warning(
+                                "Live crawler: Cannot decrypt legacy session for %s (id=%s). "
+                                "ENCRYPTION_KEY may have changed. This user should re-login. "
+                                "Error: %s",
+                                admin_name, admin_id, type(decrypt_err).__name__,
+                            )
+                            continue
 
                     # Create Telethon client
                     client = TelegramClient(
                         StringSession(session_string),
                         settings.TELEGRAM_API_ID,
                         settings.TELEGRAM_API_HASH,
-                        use_ipv6=True,
+                        use_ipv6=False,
                         request_retries=3,
                         connection_retries=5,
                         retry_delay=3,
@@ -292,10 +347,13 @@ class LiveCrawlerService:
                     continue
 
             if not self.clients:
-                logger.error("Live crawler: Failed to initialize any admin clients.")
+                self._start_error = "Failed to initialize any admin Telegram clients."
+                logger.error("Live crawler: %s", self._start_error)
+                self._release_lock()
                 return
 
             self.running = True
+            self._start_error = None  # Clear any previous error
             self._started_at = datetime.now(timezone.utc)
             self._message_count = 0
 
@@ -340,6 +398,7 @@ class LiveCrawlerService:
             self._refresh_task = asyncio.create_task(self._periodic_group_refresh())
             self._historical_task = asyncio.create_task(self._crawl_all_groups_historical())
             self._gap_fill_task = asyncio.create_task(self._periodic_gap_fill())
+            self._watchdog_task = asyncio.create_task(self._listener_watchdog())
 
             logger.info("Live crawler started!")
             logger.info("  - %d admin account(s) connected", len(self.clients))
@@ -349,9 +408,11 @@ class LiveCrawlerService:
             logger.info("  - Real-time events active")
 
         except Exception as e:
+            self._start_error = f"Startup failed: {e}"
             logger.error("Live crawler failed to start: %s", e)
             logger.error(traceback.format_exc())
             await self._cleanup()
+            self._release_lock()
 
     async def stop(self) -> None:
         """Gracefully stop the crawler.
@@ -367,7 +428,7 @@ class LiveCrawlerService:
         self.running = False
 
         # Cancel background housekeeping tasks first
-        for task in [self._refresh_task, self._historical_task, self._gap_fill_task]:
+        for task in [self._refresh_task, self._historical_task, self._gap_fill_task, self._watchdog_task]:
             if task and not task.done():
                 task.cancel()
 
@@ -387,15 +448,7 @@ class LiveCrawlerService:
                 self._writer_task.cancel()
 
         await self._cleanup()
-
-        # Release file lock
-        if self._lock_file:
-            try:
-                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
-                self._lock_file.close()
-            except Exception:
-                pass
-            self._lock_file = None
+        self._release_lock()
 
         logger.info("Live crawler stopped.")
 
@@ -404,6 +457,16 @@ class LiveCrawlerService:
         await self.stop()
         await asyncio.sleep(1)
         await self.start()
+
+    def _release_lock(self) -> None:
+        """Release the file lock if held."""
+        if self._lock_file:
+            try:
+                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+                self._lock_file.close()
+            except Exception:
+                pass
+            self._lock_file = None
 
     async def _cleanup(self) -> None:
         self.connected = False
@@ -418,9 +481,15 @@ class LiveCrawlerService:
         return {
             "running": self.running,
             "connected": self.connected,
+            "start_error": self._start_error,
             "groups_count": len(self.group_id_map),
             "messages_received": self._message_count,
-            "historical_crawl_running": self._historical_crawl_running,
+            "historical_crawl_running": self._historical_crawl_running or self._batch_crawl_active,
+            "currently_crawling_group_id": self._currently_crawling_group_id,
+            "currently_crawling_group_title": (
+                self._get_group_title(self._currently_crawling_group_id)
+                if self._currently_crawling_group_id else None
+            ),
             "crawled_groups": len(self._crawled_groups),
             "queue_size": self._msg_queue.qsize(),
             "started_at": self._started_at.isoformat() if self._started_at else None,
@@ -428,6 +497,10 @@ class LiveCrawlerService:
                 int((datetime.now(timezone.utc) - self._started_at).total_seconds())
                 if self._started_at and self.running
                 else 0
+            ),
+            "seconds_since_last_event": (
+                int(time.monotonic() - self._last_event_received_at)
+                if self._last_event_received_at > 0 else None
             ),
         }
 
@@ -496,9 +569,9 @@ class LiveCrawlerService:
     async def _db_upsert_batch(self, rows: list[dict], ignore_duplicates: bool = True) -> None:
         """Batch upsert messages via asyncpg executemany."""
         conflict = "ON CONFLICT (telegram_message_id, group_id) DO NOTHING" if ignore_duplicates else \
-            "ON CONFLICT (telegram_message_id, group_id) DO UPDATE SET content = EXCLUDED.content, media_type = EXCLUDED.media_type, media_url = EXCLUDED.media_url, edited_at = EXCLUDED.edited_at, is_deleted = EXCLUDED.is_deleted"
+            'ON CONFLICT (telegram_message_id, group_id) DO UPDATE SET "text" = EXCLUDED."text", media_type = EXCLUDED.media_type, media_url = EXCLUDED.media_url, is_edited = TRUE, is_deleted = EXCLUDED.is_deleted'
         query = f"""INSERT INTO messages
-            (telegram_message_id, group_id, sender_id, sender_name, content,
+            (telegram_message_id, group_id, sender_id, sender_name, "text",
              media_type, media_url, reply_to_message_id, topic_id, is_deleted, sent_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             {conflict}"""
@@ -522,9 +595,9 @@ class LiveCrawlerService:
     async def _db_upsert_single(self, row: dict, ignore_duplicates: bool = True) -> None:
         """Single message upsert via asyncpg."""
         conflict = "ON CONFLICT (telegram_message_id, group_id) DO NOTHING" if ignore_duplicates else \
-            "ON CONFLICT (telegram_message_id, group_id) DO UPDATE SET content = EXCLUDED.content, media_type = EXCLUDED.media_type, media_url = EXCLUDED.media_url, edited_at = EXCLUDED.edited_at, is_deleted = EXCLUDED.is_deleted"
+            'ON CONFLICT (telegram_message_id, group_id) DO UPDATE SET "text" = EXCLUDED."text", media_type = EXCLUDED.media_type, media_url = EXCLUDED.media_url, is_edited = TRUE, is_deleted = EXCLUDED.is_deleted'
         query = f"""INSERT INTO messages
-            (telegram_message_id, group_id, sender_id, sender_name, content,
+            (telegram_message_id, group_id, sender_id, sender_name, "text",
              media_type, media_url, reply_to_message_id, topic_id, is_deleted, sent_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             {conflict}"""
@@ -723,7 +796,7 @@ class LiveCrawlerService:
                 "reply_to_message_id": message.reply_to_msg_id,
                 "topic_id": topic_id,
                 "is_deleted": False,
-                "sent_at": message.date.isoformat(),
+                "sent_at": message.date,
             }
 
             if is_edit:
@@ -895,10 +968,18 @@ class LiveCrawlerService:
             self._entity_cache[gid] = (access_hash, entity_type, _time.monotonic())
             try:
                 if entity_type == "channel":
-                    entity = await client.get_entity(InputPeerChannel(channel_id=gid, access_hash=access_hash))
+                    entity = await asyncio.wait_for(
+                        client.get_entity(InputPeerChannel(channel_id=gid, access_hash=access_hash)),
+                        timeout=10,
+                    )
                 else:
-                    entity = await client.get_entity(InputPeerChat(chat_id=gid))
+                    entity = await asyncio.wait_for(
+                        client.get_entity(InputPeerChat(chat_id=gid)),
+                        timeout=10,
+                    )
                 return entity
+            except asyncio.TimeoutError:
+                logger.debug("Cached entity resolution timeout for %s", gid)
             except Exception:
                 # Stale cache entry — remove from memory AND DB
                 self._entity_cache.pop(gid, None)
@@ -907,13 +988,18 @@ class LiveCrawlerService:
                 except Exception:
                     pass
 
-        # 2) Direct resolution attempts
+        # 2) Direct resolution attempts (with timeout to prevent hanging)
         for peer_cls in (PeerChannel, PeerChat):
             try:
                 kwarg = "channel_id" if peer_cls is PeerChannel else "chat_id"
-                entity = await client.get_entity(peer_cls(**{kwarg: gid}))
+                entity = await asyncio.wait_for(
+                    client.get_entity(peer_cls(**{kwarg: gid})),
+                    timeout=10,
+                )
                 self._cache_entity(entity)
                 return entity
+            except asyncio.TimeoutError:
+                logger.debug("Entity resolution timeout for %s via %s", gid, peer_cls.__name__)
             except Exception:
                 pass
 
@@ -926,7 +1012,7 @@ class LiveCrawlerService:
         else:
             logger.debug("Entity cache miss for %s — warming cache via get_dialogs()...", gid)
             self._last_dialogs_fetch = now
-            dialogs = await client.get_dialogs()
+            dialogs = await asyncio.wait_for(client.get_dialogs(), timeout=15)
             target_entity = None
             for dialog in dialogs:
                 entity = dialog.entity
@@ -938,11 +1024,16 @@ class LiveCrawlerService:
             if target_entity:
                 return target_entity
 
-        # 4) Final retry after cache warm
+        # 4) Final retry after cache warm (with timeout)
         try:
-            entity = await client.get_entity(PeerChannel(channel_id=gid))
+            entity = await asyncio.wait_for(
+                client.get_entity(PeerChannel(channel_id=gid)),
+                timeout=10,
+            )
             self._cache_entity(entity)
             return entity
+        except asyncio.TimeoutError:
+            logger.debug("PeerChannel(%s) final retry timed out", gid)
         except Exception as e:
             logger.debug("PeerChannel(%s) still failed after cache warm: %s", gid, e)
 
@@ -990,7 +1081,11 @@ class LiveCrawlerService:
     # ------------------------------------------------------------------
 
     async def _periodic_gap_fill(self) -> None:
-        """Every 30 minutes, re-fetch the last hour of messages per group.
+        """Every 30 minutes, re-fetch recent messages per group.
+
+        Uses dynamic lookback: normally 1 hour, but if the last gap-fill was
+        more than GAP_FILL_LOOKBACK_HOURS ago (e.g. after a long outage or
+        restart), it looks back to the gap-fill interval or 24 hours max.
 
         This catches any messages missed during brief disconnects that
         Telethon's auto_reconnect may not recover. Uses ON CONFLICT DO NOTHING
@@ -1003,10 +1098,26 @@ class LiveCrawlerService:
             await asyncio.sleep(GAP_FILL_INTERVAL)
             if not self.running:
                 break
-            logger.info("[GAP-FILL] Starting gap-fill re-check (%d groups)...", len(self.group_id_map))
+
+            # Dynamic lookback: if last gap-fill was long ago (restart/outage), look back further
+            now_mono = time.monotonic()
+            if self._last_gap_fill_at > 0:
+                hours_since_last = (now_mono - self._last_gap_fill_at) / 3600
+                lookback_hours = min(max(hours_since_last + 0.5, GAP_FILL_LOOKBACK_HOURS), 24)
+            else:
+                lookback_hours = GAP_FILL_LOOKBACK_HOURS
+
+            logger.info("[GAP-FILL] Starting gap-fill re-check (%d groups, lookback=%.1fh)...",
+                        len(self.group_id_map), lookback_hours)
             filled = 0
             skipped_flood = 0
             now = time.monotonic()
+            # Cleanup expired FloodWait penalties (prevents unbounded dict growth)
+            expired_penalties = [gid for gid, until in self._flood_wait_until.items() if now >= until]
+            for gid in expired_penalties:
+                del self._flood_wait_until[gid]
+            if expired_penalties:
+                logger.debug("[GAP-FILL] Cleaned up %d expired FloodWait penalties", len(expired_penalties))
             for gid in list(self.group_id_map.keys()):
                 if not self.running:
                     break
@@ -1036,17 +1147,19 @@ class LiveCrawlerService:
                     if not entity or not working_client:
                         continue
 
-                    lookback = datetime.now(timezone.utc) - timedelta(hours=GAP_FILL_LOOKBACK_HOURS)
+                    lookback = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
                     count = 0
+                    iterated = 0
                     async for message in working_client.iter_messages(entity, offset_date=lookback, reverse=True):
                         if not self.running:
                             break
+                        iterated += 1
                         if message.text or message.media:
                             await self._enqueue_message(message, gid, group_uuid, client=working_client, broadcast=False)
                             count += 1
                         if count >= GAP_FILL_MAX_MESSAGES:
                             break
-                        if count % 200 == 0 and count > 0:
+                        if iterated % 200 == 0:
                             await asyncio.sleep(1.5)
                     filled += count
 
@@ -1056,24 +1169,36 @@ class LiveCrawlerService:
                 except Exception as e:
                     logger.debug("[GAP-FILL] Error for group %s: %s", gid, e)
 
+                # Inter-group delay to avoid rapid successive API calls
+                await asyncio.sleep(2.0)
+
+            self._last_gap_fill_at = time.monotonic()
             if skipped_flood:
                 logger.info("[GAP-FILL] Skipped %d groups with active FloodWait penalties", skipped_flood)
-            logger.info("[GAP-FILL] Complete — %d messages re-enqueued (duplicates ignored via ON CONFLICT)", filled)
+            logger.info("[GAP-FILL] Complete — %d messages re-enqueued (lookback=%.1fh, duplicates ignored via ON CONFLICT)",
+                        filled, lookback_hours)
 
     # ------------------------------------------------------------------
     # Historical crawl (14-day backfill)
     # ------------------------------------------------------------------
 
     async def _crawl_all_groups_historical(self) -> None:
-        """Crawl historical messages for all groups that need it."""
+        """Crawl historical messages for all groups that need it.
+
+        Two passes:
+        1. Initial pass: crawl all groups, skip FloodWait-penalized ones
+        2. Retry loop: wait for penalties to expire, retry skipped groups (30min deadline)
+        """
         self._historical_crawl_running = True
         try:
-            for gid in list(self.group_id_map.keys()):
+            all_gids = list(self.group_id_map.keys())
+
+            # --- Pass 1: crawl everything we can ---
+            for gid in all_gids:
                 if not self.running:
                     break
                 if gid in self._crawled_groups:
                     continue
-                # Skip groups with active FloodWait penalty
                 if time.monotonic() < self._flood_wait_until.get(gid, 0):
                     logger.info("Skipping historical crawl for group %s — FloodWait penalty active", gid)
                     continue
@@ -1095,6 +1220,55 @@ class LiveCrawlerService:
                     pass
 
                 await self._crawl_historical_for_group(gid)
+
+            # --- Pass 2: retry FloodWait-skipped groups ---
+            retry_deadline = time.monotonic() + 1800  # 30 minutes max
+            while self.running:
+                pending_gids = [
+                    gid for gid in all_gids
+                    if gid not in self._crawled_groups and gid in self.group_id_map
+                ]
+                if not pending_gids:
+                    break
+                if time.monotonic() > retry_deadline:
+                    logger.warning("Historical crawl retry deadline reached — %d groups still pending", len(pending_gids))
+                    for gid in pending_gids:
+                        group_uuid = self.group_id_map.get(gid)
+                        if group_uuid:
+                            await self._update_crawler_status(
+                                group_uuid, "error",
+                                error="Historical crawl skipped: FloodWait retry deadline exceeded",
+                            )
+                    break
+
+                # Find earliest penalty expiry among pending groups
+                earliest_expiry = min(
+                    (self._flood_wait_until.get(gid, 0) for gid in pending_gids),
+                    default=0,
+                )
+                wait_time = max(0, earliest_expiry - time.monotonic())
+                if wait_time > 0:
+                    logger.info(
+                        "Waiting %.0fs for FloodWait penalties to expire (%d groups pending)",
+                        wait_time, len(pending_gids),
+                    )
+                    await asyncio.sleep(min(wait_time + 1, 60))  # Sleep in 60s chunks max
+
+                retried_any = False
+                for gid in pending_gids:
+                    if not self.running:
+                        break
+                    if gid in self._crawled_groups:
+                        continue
+                    if time.monotonic() < self._flood_wait_until.get(gid, 0):
+                        continue
+                    await self._crawl_historical_for_group(gid)
+                    retried_any = True
+
+                if not retried_any:
+                    # All still penalized — sleep and retry
+                    await asyncio.sleep(30)
+
         except Exception as e:
             logger.error("Historical crawl error: %s", e)
         finally:
@@ -1105,18 +1279,38 @@ class LiveCrawlerService:
 
         Tries each admin client until one succeeds. Messages are enqueued
         for the DB writer coroutine which handles batching.
+
+        Concurrent crawl prevention: if another task is already crawling this
+        group (e.g. startup crawl vs batch crawl), this call returns immediately.
         """
         group_uuid = self.group_id_map.get(gid)
         if not group_uuid:
             return
+
+        # Prevent concurrent crawl of the same group
+        if gid in self._crawling_groups_lock:
+            logger.info("Skipping historical crawl for group %s — already being crawled by another task", gid)
+            return
+        self._crawling_groups_lock.add(gid)
+
+        # Check is_enabled flag (admin can disable crawling for a group)
+        try:
+            if not await self._is_group_enabled(group_uuid):
+                logger.info("Skipping historical crawl for group %s — crawling is disabled", gid)
+                self._crawling_groups_lock.discard(gid)
+                return
+        except Exception:
+            pass
 
         title = self._get_group_title(gid)
         logger.info("=" * 50)
         logger.info("Historical crawl starting: %s (id=%s)", title, gid)
         logger.info("=" * 50)
 
+        self._currently_crawling_group_id = gid
+
         try:
-            await self._update_crawler_status(group_uuid, "initializing")
+            await self._update_crawler_status(group_uuid, "initializing", progress=0, total=0)
 
             group_entity = None
             working_client = None
@@ -1134,36 +1328,67 @@ class LiveCrawlerService:
             if not group_entity or not working_client:
                 raise ValueError(f"Could not resolve entity for group ID {gid} with any admin client")
 
+            # Estimate total message count from Telegram (limit=0 trick)
+            estimated_total = 0
+            try:
+                total_result = await working_client.get_messages(group_entity, limit=0)
+                estimated_total = getattr(total_result, 'total', 0) or 0
+                logger.info("  [%s] Estimated total messages: %d", title, estimated_total)
+            except Exception as e:
+                logger.debug("  Could not estimate message count for %s: %s", title, e)
+
+            await self._update_crawler_status(group_uuid, "initializing", progress=0, total=estimated_total)
+
             date_threshold = datetime.now(timezone.utc) - timedelta(days=HISTORICAL_CRAWL_DAYS)
 
             enqueued_count = 0
-            async for message in working_client.iter_messages(group_entity, offset_date=date_threshold, reverse=True):
-                if not self.running:
-                    break
-                try:
-                    if message.text or message.media:
-                        await self._enqueue_message(message, gid, group_uuid, client=working_client)
-                        enqueued_count += 1
+            iterated_count = 0  # Count ALL messages (including empty) for accurate rate limiting
 
-                        if enqueued_count % 100 == 0:
-                            logger.info("  [%s] %d messages enqueued...", title, enqueued_count)
-                            await self._update_crawler_status(
-                                group_uuid, "initializing",
-                                progress=enqueued_count, total=enqueued_count
-                            )
+            async def _do_historical_iteration():
+                """Inner iteration — wrapped with timeout to prevent hanging."""
+                nonlocal enqueued_count, iterated_count
+                async for message in working_client.iter_messages(group_entity, offset_date=date_threshold, reverse=True):
+                    if not self.running:
+                        break
+                    iterated_count += 1
+                    try:
+                        if message.text or message.media:
+                            await self._enqueue_message(message, gid, group_uuid, client=working_client)
+                            enqueued_count += 1
 
-                        # Rate limiting
-                        if enqueued_count % 200 == 0:
+                            if enqueued_count % 100 == 0:
+                                logger.info("  [%s] %d messages enqueued...", title, enqueued_count)
+                                await self._update_crawler_status(
+                                    group_uuid, "initializing",
+                                    progress=enqueued_count, total=estimated_total
+                                )
+
+                        # Rate limiting based on iterated count (not enqueued) to avoid
+                        # bursts when many empty/system messages are skipped
+                        if iterated_count % 200 == 0:
                             await asyncio.sleep(1.5)
-                except FloodWaitError as e:
-                    logger.warning(
-                        "FloodWait during historical crawl for %s: %ds — recording penalty, breaking iteration",
-                        title, e.seconds,
-                    )
-                    self._flood_wait_until[gid] = time.monotonic() + e.seconds
-                    break  # Exit iter_messages; group retries on next _periodic_group_refresh cycle
-                except Exception as e:
-                    logger.warning("Error enqueuing msg %d: %s", message.id, e)
+                    except FloodWaitError as e:
+                        logger.warning(
+                            "FloodWait during historical crawl for %s: %ds — recording penalty, breaking iteration",
+                            title, e.seconds,
+                        )
+                        self._flood_wait_until[gid] = time.monotonic() + e.seconds
+                        break  # Exit iter_messages; group retries on next _periodic_group_refresh cycle
+                    except Exception as e:
+                        logger.warning("Error enqueuing msg %d: %s", message.id, e)
+
+            # Per-group timeout: 10 minutes max to prevent one group blocking the batch
+            try:
+                await asyncio.wait_for(_do_historical_iteration(), timeout=600)
+            except asyncio.TimeoutError:
+                logger.warning("Historical crawl timeout (10min) for %s — %d messages enqueued so far", title, enqueued_count)
+                await self._update_crawler_status(
+                    group_uuid, "error",
+                    progress=enqueued_count, total=estimated_total,
+                    error="Historical crawl timeout (10min)"
+                )
+                # Do NOT add to _crawled_groups — allow retry via manual trigger
+                return
 
             # Wait for queue to drain before marking complete (with timeout)
             drain_start = time.monotonic()
@@ -1176,35 +1401,55 @@ class LiveCrawlerService:
                     break
                 await asyncio.sleep(0.5)
 
-            # Only mark fully "active" if queue drained completely (P2-1.24)
             if drained:
                 await self._update_crawler_status(
                     group_uuid, "active",
-                    progress=enqueued_count, total=enqueued_count
+                    progress=enqueued_count, total=estimated_total
                 )
             else:
+                # Mark as error, not active — messages still processing in queue
                 await self._update_crawler_status(
-                    group_uuid, "active",
-                    progress=enqueued_count, total=enqueued_count,
-                    error=f"Queue drain timeout — {self._msg_queue.qsize()} items pending"
+                    group_uuid, "error",
+                    progress=enqueued_count, total=estimated_total,
+                    error=f"Queue drain timeout ({QUEUE_DRAIN_TIMEOUT}s) — {self._msg_queue.qsize()} items pending"
                 )
             self._crawled_groups.add(gid)
-            await self._update_group_last_error(gid, "")
+            await self._update_group_last_error(gid, None)
             logger.info("Historical crawl complete: %s — %d messages enqueued", title, enqueued_count)
 
         except (ChannelPrivateError, ChatAdminRequiredError) as e:
             logger.error("Access denied for %s: %s", title, e)
             await self._update_crawler_status(group_uuid, "error", error=str(e))
             await self._update_group_last_error(gid, str(e))
+            await self._log_crawler_error(gid, "access_denied", str(e))
         except FloodWaitError as e:
             logger.warning("FloodWait for %s: %ds — recording penalty, moving to next group", title, e.seconds)
             await self._update_crawler_status(group_uuid, "error", error=f"FloodWait: {e.seconds}s")
             self._flood_wait_until[gid] = time.monotonic() + e.seconds
+            await self._log_crawler_error(gid, "flood_wait", f"FloodWait: {e.seconds}s")
         except Exception as e:
             logger.error("Historical crawl failed for %s: %s", title, e)
             logger.error(traceback.format_exc())
             await self._update_crawler_status(group_uuid, "error", error=str(e))
             await self._update_group_last_error(gid, str(e))
+            await self._log_crawler_error(gid, "crawl_error", str(e), traceback.format_exc())
+        finally:
+            # Release per-group crawl lock
+            self._crawling_groups_lock.discard(gid)
+            if self._currently_crawling_group_id == gid:
+                self._currently_crawling_group_id = None
+            # Safety net: if status is still "initializing", force it to "error"
+            try:
+                current_status = await db.fetchval(
+                    "SELECT status FROM crawler_status WHERE group_id = $1", int(group_uuid)
+                )
+                if current_status == "initializing" and gid not in self._crawled_groups:
+                    await self._update_crawler_status(
+                        group_uuid, "error",
+                        error="Crawl exited unexpectedly while initializing",
+                    )
+            except Exception:
+                pass
 
     async def _update_crawler_status(
         self, group_uuid: str, status: str,
@@ -1218,7 +1463,12 @@ class LiveCrawlerService:
             args: list = [status, now]
             idx = 3
 
-            if error:
+            if status == "initializing":
+                # Clear stale errors when starting a new crawl
+                sets.append(f"last_error = ${idx}")
+                args.append(None)
+                idx += 1
+            elif error:
                 sets.append(f"last_error = ${idx}")
                 args.append(error)
                 idx += 1
@@ -1241,12 +1491,26 @@ class LiveCrawlerService:
         except Exception as e:
             logger.warning("Failed to update crawler_status for %s: %s", group_uuid, e)
 
-    async def _update_group_last_error(self, gid: int, error: str) -> None:
-        """Update groups.last_error so admin dashboard can show it."""
+    async def _update_group_last_error(self, gid: int, error: str | None) -> None:
+        """Update groups.last_error so admin dashboard can show it. Pass None to clear."""
         try:
-            await db.execute("UPDATE groups SET last_error = $1 WHERE id = $2", error, gid)
+            await db.execute("UPDATE groups SET last_error = $1 WHERE id = $2", error or None, gid)
         except Exception as e:
             logger.warning("Failed to update groups.last_error for %s: %s", gid, e)
+
+    async def _log_crawler_error(
+        self, gid: int, error_type: str, error_message: str, details: str | None = None
+    ) -> None:
+        """Write an error entry to crawler_error_logs table (populates admin error dashboard)."""
+        try:
+            await db.execute(
+                """INSERT INTO crawler_error_logs (group_id, error_type, error_message, error_details)
+                   VALUES ($1, $2, $3, $4::jsonb)""",
+                gid, error_type, error_message[:500],
+                json.dumps({"traceback": details[:2000]}) if details else None,
+            )
+        except Exception as e:
+            logger.debug("Failed to write crawler_error_log: %s", e)
 
     # ------------------------------------------------------------------
     # Enabled check (cached)
@@ -1306,6 +1570,7 @@ class LiveCrawlerService:
                         download_media=True, client=_c,
                     )
                     self._message_count += 1
+                    self._last_event_received_at = time.monotonic()
                     await self._update_crawler_status(group_uuid, "active")
                 except Exception as e:
                     logger.error("Live crawler new message error: %s", e)
@@ -1376,11 +1641,66 @@ class LiveCrawlerService:
                     logger.error("Chat action handler error: %s", e)
 
     # ------------------------------------------------------------------
+    # Listener watchdog — detect and recover from all-listeners-dead
+    # ------------------------------------------------------------------
+
+    async def _listener_watchdog(self) -> None:
+        """Periodically check listener health and restart dead ones.
+
+        Restarts INDIVIDUAL dead listeners (not just when ALL are dead),
+        so a single admin's connection drop doesn't cause permanent event loss
+        for that admin's groups.
+        """
+        while self.running:
+            await asyncio.sleep(60)
+            if not self.running:
+                break
+
+            alive = 0
+            dead_user_ids: list[int] = []
+            for user_id, task in self._listener_tasks.items():
+                if task and not task.done():
+                    alive += 1
+                else:
+                    dead_user_ids.append(user_id)
+
+            total = len(self._listener_tasks)
+
+            if dead_user_ids:
+                severity = "CRITICAL" if alive == 0 else "WARNING"
+                logger.log(
+                    logging.CRITICAL if alive == 0 else logging.WARNING,
+                    "WATCHDOG: %d/%d listeners dead (%s). Restarting: %s",
+                    len(dead_user_ids), total, severity, dead_user_ids,
+                )
+                for user_id in dead_user_ids:
+                    client = self.clients.get(user_id)
+                    if not client:
+                        continue
+                    try:
+                        if not client.is_connected():
+                            await asyncio.wait_for(client.connect(), timeout=10)
+                            me = await client.get_me()
+                            if not me:
+                                logger.error("WATCHDOG: Reconnect auth failed for user_id=%s", user_id)
+                                continue
+                        self._listener_tasks[user_id] = asyncio.create_task(
+                            self._run_listener_with_reconnect(user_id, client)
+                        )
+                        logger.info("WATCHDOG: Restarted listener for user_id=%s", user_id)
+                    except Exception as e:
+                        logger.error("WATCHDOG: Failed to restart listener for user_id=%s: %s", user_id, e)
+
+    # ------------------------------------------------------------------
     # Listener with auto-reconnect
     # ------------------------------------------------------------------
 
     async def _run_listener_with_reconnect(self, user_id: int, client: TelegramClient) -> None:
-        """Keep a Telethon client running with auto-reconnect."""
+        """Keep a Telethon client running with auto-reconnect.
+
+        Telethon's auto_reconnect=True handles brief disconnections internally.
+        This loop catches cases where the connection truly drops and run_until_disconnected returns.
+        """
         attempts = 0
         while self.running:
             try:
@@ -1417,18 +1737,26 @@ class LiveCrawlerService:
     # Media upload
     # ------------------------------------------------------------------
 
+    MEDIA_DOWNLOAD_TIMEOUT = 30  # seconds — max time for downloading a single media file
+
     async def _upload_media(self, message, group_uuid: str, media_type: str, client: TelegramClient) -> tuple[str | None, str | None]:
         """Download media from Telegram and upload to Supabase Storage."""
         try:
             buffer = io.BytesIO()
             if media_type == "photo":
-                await client.download_media(message, buffer)
+                await asyncio.wait_for(
+                    client.download_media(message, buffer),
+                    timeout=self.MEDIA_DOWNLOAD_TIMEOUT,
+                )
                 content_type = "image/jpeg"
             else:
                 if hasattr(message.media, "document") and message.media.document:
                     thumbs = message.media.document.thumbs
                     if thumbs:
-                        await client.download_media(message, buffer, thumb=0)
+                        await asyncio.wait_for(
+                            client.download_media(message, buffer, thumb=0),
+                            timeout=self.MEDIA_DOWNLOAD_TIMEOUT,
+                        )
                         content_type = "image/jpeg"
                     else:
                         return None, None
@@ -1448,10 +1776,13 @@ class LiveCrawlerService:
             file_path = f"{group_uuid}/{message.id}.{file_ext}"
 
             storage = self._storage_client or get_storage_client()
-            await asyncio.to_thread(
-                lambda: storage.storage.from_("message-media").upload(
-                    file_path, file_bytes, {"content-type": content_type}
-                )
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: storage.storage.from_("message-media").upload(
+                        file_path, file_bytes, {"content-type": content_type}
+                    )
+                ),
+                timeout=30.0,
             )
             public_url = storage.storage.from_("message-media").get_public_url(file_path)
 
@@ -1459,6 +1790,9 @@ class LiveCrawlerService:
                 return public_url, None
             else:
                 return None, public_url
+        except asyncio.TimeoutError:
+            logger.warning("Media download/upload timeout for msg %d (limit=%ds)", message.id, self.MEDIA_DOWNLOAD_TIMEOUT)
+            return None, None
         except Exception as e:
             if "not found" not in str(e).lower() and "bucket" not in str(e).lower():
                 logger.warning("Media upload failed for msg %d: %s", message.id, e)

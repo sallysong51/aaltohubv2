@@ -2,12 +2,14 @@
 Telethon client manager for Telegram API interactions
 """
 import asyncio
+import logging
 import time
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
     FloodWaitError,
     PhoneNumberInvalidError,
     PhoneNumberBannedError,
@@ -15,6 +17,17 @@ from telethon.errors import (
     UsernameNotOccupiedError,
     PasswordHashInvalidError,
 )
+
+
+class TelegramAuthError(Exception):
+    """User-facing Telegram auth error with HTTP status code.
+    These are NOT server errors — they should become 400-level responses."""
+
+    def __init__(self, detail: str, status_code: int = 400):
+        self.detail = detail
+        self.status_code = status_code
+        super().__init__(detail)
+
 from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.tl.types import InputUser, Chat, Channel
 from typing import Optional, List, Dict
@@ -22,6 +35,12 @@ from app.config import settings
 from app.encryption import session_encryption, ENCRYPTION_VERSION
 from app.database import db
 from app.models import UserRole
+
+logger = logging.getLogger(__name__)
+
+# Telegram warm client ping interval (seconds)
+# Reduced from 120s to 45s for faster disconnection detection (#7)
+_TELEGRAM_PING_INTERVAL = 45
 
 
 # Auth flow client entry: stores the TelegramClient between send_code → verify_code → verify_2fa
@@ -44,8 +63,8 @@ class _CachedSession:
 class TelegramClientManager:
     """Manage Telethon clients for users"""
 
-    # Auth flow clients expire after 5 minutes (user has 5 min to complete login)
-    AUTH_FLOW_TTL = 300
+    # Auth flow clients expire after 15 minutes (user has 15 min to complete login)
+    AUTH_FLOW_TTL = 900
     # Session cache entries expire after 30 minutes
     SESSION_CACHE_TTL = 1800
 
@@ -65,17 +84,24 @@ class TelegramClientManager:
     # ------------------------------------------------------------------
 
     def _make_client(self, session: Optional[str] = None) -> TelegramClient:
-        """Create a TelegramClient with optimized connection parameters."""
+        """Create a TelegramClient with optimized connection parameters.
+
+        Optimizations applied:
+        - use_ipv6=False (default): avoids 2-10s delay on hosts without IPv6 (#3)
+        - timeout=5: faster failure detection, was 10 (#4)
+        - flood_sleep_threshold=5: raise FloodWaitError for waits >5s instead of
+          silently sleeping up to 60s with no user feedback (#5)
+        - request_retries=1: was 2, avoid tripling wait time on failure (#6)
+        """
         return TelegramClient(
             StringSession(session or ""),
             settings.TELEGRAM_API_ID,
             settings.TELEGRAM_API_HASH,
             connection_retries=1,
             retry_delay=0.5,
-            request_retries=2,
-            timeout=10,
-            flood_sleep_threshold=60,
-            use_ipv6=True,
+            request_retries=1,
+            timeout=5,
+            flood_sleep_threshold=5,
         )
 
     async def warm_up(self):
@@ -97,6 +123,34 @@ class TelegramClientManager:
         """Schedule a background warm-up (non-blocking)."""
         if not self._warming and (self._warm_client is None or not self._warm_client.is_connected()):
             asyncio.create_task(self.warm_up())
+
+    async def ping_loop(self) -> None:
+        """Periodically verify warm client connectivity and re-warm if disconnected.
+
+        BUG FIX (#2): Previously used get_me() which ALWAYS fails on
+        unauthenticated warm clients, causing the warm client to be destroyed
+        and recreated every ping cycle. This meant the warm client was often
+        unavailable when a user tried to send_code, forcing a cold TCP+TLS
+        connection (1-3s delay). Now uses is_connected() only — Telethon's
+        internal keepalive pings already verify TCP liveness.
+        """
+        while True:
+            await asyncio.sleep(_TELEGRAM_PING_INTERVAL)
+            try:
+                if self._warm_client and self._warm_client.is_connected():
+                    logger.debug("[TELEGRAM] Warm client alive")
+                else:
+                    logger.warning("[TELEGRAM] Warm client disconnected — re-warming")
+                    if self._warm_client:
+                        asyncio.create_task(self._safe_disconnect(self._warm_client))
+                    self._warm_client = None
+                    self._schedule_warm_up()
+            except Exception as e:
+                logger.warning("[TELEGRAM] Warm client check failed: %s — re-warming", e)
+                if self._warm_client:
+                    asyncio.create_task(self._safe_disconnect(self._warm_client))
+                self._warm_client = None
+                self._schedule_warm_up()
 
     async def _take_warm_client(self) -> Optional[TelegramClient]:
         """Take the pre-warmed client. Returns None if unavailable."""
@@ -187,22 +241,24 @@ class TelegramClientManager:
                 wait_str = f"{minutes // 60}시간 {minutes % 60}분"
             else:
                 wait_str = f"{minutes}분"
-            raise Exception(f"너무 많은 요청으로 {wait_str} 후 다시 시도해주세요")
+            raise TelegramAuthError(f"너무 많은 요청으로 {wait_str} 후 다시 시도해주세요", 429)
         except PhoneNumberInvalidError:
             await self._finish_auth_flow(phone_or_username)
-            raise Exception("올바르지 않은 전화번호 형식입니다. 국제번호 형식(+358...)으로 입력해주세요")
+            raise TelegramAuthError("올바르지 않은 전화번호 형식입니다. 국제번호 형식(+358...)으로 입력해주세요")
         except PhoneNumberBannedError:
             await self._finish_auth_flow(phone_or_username)
-            raise Exception("이 전화번호는 텔레그램에서 차단되었습니다")
+            raise TelegramAuthError("이 전화번호는 텔레그램에서 차단되었습니다")
         except UsernameInvalidError:
             await self._finish_auth_flow(phone_or_username)
-            raise Exception("올바르지 않은 username 형식입니다")
+            raise TelegramAuthError("올바르지 않은 username 형식입니다")
         except UsernameNotOccupiedError:
             await self._finish_auth_flow(phone_or_username)
-            raise Exception("존재하지 않는 username입니다")
+            raise TelegramAuthError("존재하지 않는 username입니다")
+        except TelegramAuthError:
+            raise
         except Exception as e:
             await self._finish_auth_flow(phone_or_username)
-            raise Exception(f"코드 전송 실패: {str(e)}")
+            raise
 
     async def verify_code(
         self,
@@ -211,7 +267,15 @@ class TelegramClientManager:
         phone_code_hash: str
     ) -> Dict:
         """Verify authentication code. Reuses the client from send_code (same session)."""
-        client = await self._get_or_create_auth_client(phone_or_username)
+        # Check if auth flow exists — if not, user took too long or never called send_code
+        flow = self._auth_flows.get(phone_or_username)
+        if not flow or not flow.client.is_connected():
+            raise TelegramAuthError(
+                "인증 세션이 만료되었습니다. 처음부터 다시 시도해주세요",
+                408,
+            )
+
+        client = flow.client
 
         try:
             await client.sign_in(phone_or_username, code, phone_code_hash=phone_code_hash)
@@ -243,10 +307,23 @@ class TelegramClientManager:
             }
         except PhoneCodeInvalidError:
             await self._finish_auth_flow(phone_or_username)
-            raise Exception("올바르지 않은 인증 코드입니다")
+            raise TelegramAuthError("올바르지 않은 인증 코드입니다")
+        except PhoneCodeExpiredError:
+            await self._finish_auth_flow(phone_or_username)
+            raise TelegramAuthError("인증 코드가 만료되었습니다. 코드를 재전송해주세요")
+        except FloodWaitError as e:
+            await self._finish_auth_flow(phone_or_username)
+            minutes = e.seconds // 60
+            if minutes >= 60:
+                wait_str = f"{minutes // 60}시간 {minutes % 60}분"
+            else:
+                wait_str = f"{minutes}분"
+            raise TelegramAuthError(f"너무 많은 요청으로 {wait_str} 후 다시 시도해주세요", 429)
+        except TelegramAuthError:
+            raise
         except Exception as e:
             await self._finish_auth_flow(phone_or_username)
-            raise Exception(f"코드 검증 실패: {str(e)}")
+            raise
 
     async def verify_2fa(
         self,
@@ -256,7 +333,7 @@ class TelegramClientManager:
         """Verify 2FA password. Reuses the SAME client that got SessionPasswordNeededError."""
         flow = self._auth_flows.get(phone_or_username)
         if not flow or not flow.client.is_connected():
-            raise Exception("세션이 만료되었습니다. 처음부터 다시 시작해주세요")
+            raise TelegramAuthError("세션이 만료되었습니다. 처음부터 다시 시작해주세요", 408)
 
         client = flow.client
 
@@ -282,10 +359,12 @@ class TelegramClientManager:
             }
         except PasswordHashInvalidError:
             await self._finish_auth_flow(phone_or_username)
-            raise Exception("2FA 비밀번호가 올바르지 않습니다")
+            raise TelegramAuthError("2FA 비밀번호가 올바르지 않습니다")
+        except TelegramAuthError:
+            raise
         except Exception as e:
             await self._finish_auth_flow(phone_or_username)
-            raise Exception(f"2FA 검증 실패: {str(e)}")
+            raise
 
     # ------------------------------------------------------------------
     # Session persistence (with in-memory cache)
@@ -317,7 +396,11 @@ class TelegramClientManager:
             raise Exception(f"Failed to save session: {str(e)}")
 
     async def load_session(self, user_id: str) -> Optional[str]:
-        """Load Telethon session — from cache first, then DB.
+        """Load Telethon session — from cache first, then telegram_connections, then telethon_sessions.
+
+        Migration strategy:
+        1. Check telegram_connections first (new system for Supabase Auth users)
+        2. Fall back to telethon_sessions (legacy system during migration)
 
         Handles migration from legacy encryption (no KDF, no AAD) to v2
         (PBKDF2 + AAD). If a legacy session is detected, it is decrypted
@@ -345,6 +428,40 @@ class TelegramClientManager:
                     del self._session_cache[k]
 
         try:
+            # Try telegram_connections first (new system for Supabase Auth users)
+            row = await db.fetchrow(
+                """SELECT session_encrypted, key_hash FROM telegram_connections
+                   WHERE user_id = $1
+                   ORDER BY last_used_at DESC LIMIT 1""",
+                int(user_id)
+            )
+
+            if row:
+                # Found in telegram_connections (new system)
+                aad = str(user_id)  # Same AAD as before — user_id unchanged!
+                encrypted_session = row["session_encrypted"]
+                key_hash = row.get("key_hash", "")
+
+                if key_hash == ENCRYPTION_VERSION:
+                    session_string = session_encryption.decrypt(encrypted_session, aad=aad)
+                else:
+                    # Legacy encryption in telegram_connections (rare)
+                    from app.encryption import get_legacy_encryption
+                    legacy = get_legacy_encryption()
+                    session_string = legacy.decrypt(encrypted_session)
+
+                # Update last_used_at
+                await db.execute(
+                    "UPDATE telegram_connections SET last_used_at = NOW() WHERE user_id = $1",
+                    int(user_id)
+                )
+
+                # Populate cache
+                self._session_cache[user_id] = _CachedSession(session_string)
+                logger.debug("Loaded session from telegram_connections for user %s", user_id)
+                return session_string
+
+            # Fall back to telethon_sessions (legacy system during migration)
             row = await db.fetchrow(
                 "SELECT * FROM telethon_sessions WHERE user_id = $1", int(user_id)
             )
@@ -375,11 +492,17 @@ class TelegramClientManager:
                     new_encrypted, ENCRYPTION_VERSION, int(user_id),
                 )
 
+            if not session_string:
+                raise TelegramAuthError("세션 데이터를 복호화할 수 없습니다. 다시 로그인해주세요.", status_code=401)
+
             # Populate cache
             self._session_cache[user_id] = _CachedSession(session_string)
             return session_string
+        except TelegramAuthError:
+            raise
         except Exception as e:
-            raise Exception(f"Failed to load session: {str(e)}")
+            logger.warning("Session load failed for user %s: %s", user_id, e)
+            raise TelegramAuthError("텔레그램 세션을 불러올 수 없습니다. 다시 로그인해주세요.", status_code=401)
 
     # ------------------------------------------------------------------
     # User / admin client helpers
@@ -396,10 +519,14 @@ class TelegramClientManager:
         """
         session_string = await self.load_session(user_id)
         if not session_string:
-            raise Exception("Session not found for user")
+            raise TelegramAuthError("텔레그램 계정이 연결되지 않았습니다. 프로필에서 텔레그램 계정을 먼저 추가해주세요.", status_code=401)
 
         client = self._make_client(session_string)
-        await client.connect()
+        try:
+            await asyncio.wait_for(client.connect(), timeout=10.0)
+        except asyncio.TimeoutError:
+            await self._safe_disconnect(client)
+            raise TelegramAuthError("텔레그램 서버 연결 시간 초과. 잠시 후 다시 시도해주세요.", status_code=504)
 
         return client
 
@@ -436,7 +563,8 @@ class TelegramClientManager:
         client = await self.get_user_client(user_id)
 
         try:
-            dialogs = await client.get_dialogs()
+            # Timeout: get_dialogs() can hang on slow/unreachable Telegram servers
+            dialogs = await asyncio.wait_for(client.get_dialogs(), timeout=15.0)
             groups = []
 
             for dialog in dialogs:
@@ -459,8 +587,18 @@ class TelegramClientManager:
                     groups.append(group_info)
 
             return groups
+        except asyncio.TimeoutError:
+            raise TelegramAuthError("텔레그램 그룹 목록 로딩 시간 초과. 잠시 후 다시 시도해주세요.", status_code=504)
+        except (ConnectionError, OSError) as e:
+            raise TelegramAuthError(f"텔레그램 네트워크 오류: {e}", status_code=502)
+        except TelegramAuthError:
+            raise
         except Exception as e:
-            raise Exception(f"Failed to get user groups: {str(e)}")
+            err_str = str(e).lower()
+            # Detect expired/revoked Telegram sessions
+            if any(kw in err_str for kw in ("auth key", "unauthorized", "session revoked", "user deactivated")):
+                raise TelegramAuthError("텔레그램 세션이 만료되었습니다. 다시 로그인해주세요.", status_code=401)
+            raise TelegramAuthError(f"텔레그램 그룹 목록을 불러올 수 없습니다.", status_code=500)
         finally:
             await client.disconnect()
 

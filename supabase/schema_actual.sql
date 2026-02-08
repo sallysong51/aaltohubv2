@@ -20,18 +20,24 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- ============================================================
 CREATE TABLE IF NOT EXISTS users (
     id BIGSERIAL PRIMARY KEY,
-    telegram_id BIGINT UNIQUE NOT NULL,
+    telegram_id BIGINT,
     phone_number TEXT,
     username TEXT,
     first_name TEXT,
     last_name TEXT,
     role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
+    auth_user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+    email_link_required BOOLEAN DEFAULT FALSE,
+    email_linked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT users_must_have_identity CHECK (telegram_id IS NOT NULL OR auth_user_id IS NOT NULL)
 );
 
--- telegram_id already has a UNIQUE index; idx_users_telegram_id is redundant — removed
+-- Partial unique index on telegram_id (allows multiple NULL values, enforces uniqueness for non-NULL)
+CREATE UNIQUE INDEX IF NOT EXISTS users_telegram_id_key ON users(telegram_id) WHERE telegram_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+CREATE INDEX IF NOT EXISTS idx_users_auth_user_id ON users(auth_user_id) WHERE auth_user_id IS NOT NULL;
 
 -- ============================================================
 -- Admin Credentials Table (Multi-Admin Support)
@@ -51,27 +57,14 @@ CREATE TABLE IF NOT EXISTS admin_credentials (
 CREATE INDEX IF NOT EXISTS idx_admin_credentials_phone ON admin_credentials(phone_number) WHERE phone_number IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_admin_credentials_username ON admin_credentials(username) WHERE username IS NOT NULL;
 
--- RLS and policies for admin_credentials
+-- RLS for admin_credentials — block anon, service role bypasses.
+-- Previous policies referenced auth.uid() which is unavailable (custom JWT, not Supabase Auth).
+-- Backend connects via service_role_key which bypasses RLS entirely.
 ALTER TABLE admin_credentials ENABLE ROW LEVEL SECURITY;
-
--- Policy: All authenticated users can read (needed for auth checks)
-CREATE POLICY IF NOT EXISTS "admin_credentials_readable" ON admin_credentials
-    FOR SELECT TO authenticated USING (true);
-
--- Policy: Only admins can insert
-CREATE POLICY IF NOT EXISTS "admin_credentials_admin_insert" ON admin_credentials
-    FOR INSERT TO authenticated WITH CHECK (
-        EXISTS(SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin')
-    );
-
--- Policy: Only admins can delete
-CREATE POLICY IF NOT EXISTS "admin_credentials_admin_delete" ON admin_credentials
-    FOR DELETE TO authenticated USING (
-        EXISTS(SELECT 1 FROM users WHERE id = auth.uid() AND role = 'admin')
-    );
 
 -- ============================================================
 -- Telethon Sessions Table (Encrypted)
+-- DEPRECATED: Being migrated to telegram_connections table
 -- ============================================================
 CREATE TABLE IF NOT EXISTS telethon_sessions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -82,6 +75,50 @@ CREATE TABLE IF NOT EXISTS telethon_sessions (
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(user_id)
 );
+
+-- ============================================================
+-- Telegram Connections Table
+-- Links Supabase Auth users to Telegram accounts (optional)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS telegram_connections (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    auth_user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    telegram_user_id BIGINT NOT NULL,
+    phone_masked TEXT,
+    username TEXT,
+    session_encrypted TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    first_name TEXT,
+    last_name TEXT,
+    connected_at TIMESTAMPTZ DEFAULT NOW(),
+    last_used_at TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(auth_user_id, telegram_user_id),
+    UNIQUE(telegram_user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_connections_user_id ON telegram_connections(user_id);
+CREATE INDEX IF NOT EXISTS idx_telegram_connections_auth_user_id ON telegram_connections(auth_user_id);
+CREATE INDEX IF NOT EXISTS idx_telegram_connections_telegram_user_id ON telegram_connections(telegram_user_id);
+
+-- ============================================================
+-- Email Linking Attempts (Rate Limiting & Tracking)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS email_linking_attempts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    verification_token TEXT,
+    expires_at TIMESTAMPTZ,
+    attempt_count INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_linking_attempts_user_id ON email_linking_attempts(user_id);
+CREATE INDEX IF NOT EXISTS idx_email_linking_attempts_expires_at ON email_linking_attempts(expires_at);
 
 -- ============================================================
 -- Groups Table (Telegram Groups)
@@ -137,17 +174,14 @@ CREATE TABLE IF NOT EXISTS messages (
     group_id BIGINT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
     sender_id BIGINT,
     sender_name TEXT,
-    sender_username TEXT,
-    content TEXT,
-    media_type TEXT DEFAULT 'text' CHECK (media_type IN ('text', 'photo', 'video', 'document', 'audio', 'sticker', 'voice', 'video_note')),
+    "text" TEXT,  -- NOTE: column name is "text" (reserved word, requires double-quotes in SQL)
+    media_type TEXT DEFAULT NULL CHECK (media_type IS NULL OR media_type IN ('text', 'photo', 'video', 'document', 'audio', 'sticker', 'voice', 'video_note')),
     media_url TEXT,
     media_thumbnail_url TEXT,
     reply_to_message_id BIGINT,
     topic_id INTEGER,
-    topic_title TEXT,
     is_deleted BOOLEAN DEFAULT FALSE,
-    edited_at TIMESTAMPTZ,
-    edit_count INTEGER DEFAULT 0,
+    is_edited BOOLEAN DEFAULT FALSE,  -- was edited_at TIMESTAMPTZ; actual DB uses boolean
     sent_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(telegram_message_id, group_id)
@@ -299,6 +333,12 @@ CREATE TRIGGER update_crawler_status_updated_at BEFORE UPDATE ON crawler_status
 CREATE TRIGGER update_entity_cache_updated_at BEFORE UPDATE ON entity_cache
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+CREATE TRIGGER update_telegram_connections_updated_at BEFORE UPDATE ON telegram_connections
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_email_linking_attempts_updated_at BEFORE UPDATE ON email_linking_attempts
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
 -- ============================================================
 -- Message Retention Cleanup Function (14-day policy)
 -- ============================================================
@@ -352,6 +392,8 @@ $$ LANGUAGE plpgsql;
 
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE telethon_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE telegram_connections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE email_linking_attempts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE groups ENABLE ROW LEVEL SECURITY;
 ALTER TABLE user_groups ENABLE ROW LEVEL SECURITY;
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;

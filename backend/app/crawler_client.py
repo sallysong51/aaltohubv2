@@ -76,6 +76,29 @@ async def trigger_historical_crawl(group_id: str) -> Optional[dict]:
         return None
 
 
+async def trigger_batch_historical_crawl(group_ids: list[str]) -> Optional[dict]:
+    """Trigger sequential historical crawl for multiple groups.
+
+    Groups are crawled one at a time to avoid Telegram rate limits.
+    Returns None if crawler is unreachable.
+    """
+    try:
+        resp = await _get_client().post(
+            "/groups/batch-crawl",
+            json={"group_ids": group_ids},
+            timeout=15.0,
+        )
+        if resp.status_code == 400:
+            return {"error": "not_running", "detail": resp.json().get("detail", "Crawler not running")}
+        if resp.status_code == 404:
+            return {"error": "not_found", "detail": resp.json().get("detail", "No valid groups")}
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.warning("Batch crawl trigger failed: %s", e)
+        return None
+
+
 async def close():
     """Close the HTTP client (call at app shutdown)."""
     global _client

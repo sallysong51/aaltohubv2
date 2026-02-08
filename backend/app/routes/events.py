@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from app.auth import decode_token
+from app.database import db
 from app.sse import sse_manager
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,28 @@ async def event_stream(request: Request, token: str, groups: str):
     group_ids = [g.strip() for g in groups.split(",") if g.strip()]
     if not group_ids:
         raise HTTPException(status_code=400, detail="No groups specified")
+
+    # Authorization check: only subscribe to groups the user has access to.
+    # Public groups are accessible to all authenticated users; private groups
+    # require a user_groups entry.
+    try:
+        authorized_rows = await db.fetch(
+            """SELECT g.id::text AS gid FROM groups g
+               WHERE g.id = ANY($1::bigint[])
+                 AND (g.visibility = 'public'
+                      OR EXISTS(SELECT 1 FROM user_groups ug
+                                WHERE ug.group_id = g.id AND ug.user_id = $2))""",
+            [int(gid) for gid in group_ids],
+            int(user_id),
+        )
+        authorized_ids = {row["gid"] for row in authorized_rows}
+        group_ids = [gid for gid in group_ids if gid in authorized_ids]
+    except Exception as e:
+        logger.warning("SSE auth check failed (allowing none): %s", e)
+        group_ids = []
+
+    if not group_ids:
+        raise HTTPException(status_code=403, detail="No authorized groups")
 
     queue = sse_manager.subscribe(group_ids)
 

@@ -80,13 +80,14 @@ class MetricsRegistry:
 
     def __init__(self) -> None:
         # Counters
-        self.messages_total = _Counter()
-        self.db_operations_total = _Counter()
         self.http_requests_total = _LabeledCounter()
 
-        # Gauges
+        # Gauges — these are set to absolute values from the crawler process,
+        # not monotonically incremented, so _Gauge (not _Counter) is correct.
+        self.messages_total = _Gauge()
         self.crawler_groups_active = _Gauge()
         self.queue_size = _Gauge()
+        self.sse_connections = _Gauge()
 
         self._start_time = time.time()
 
@@ -96,7 +97,7 @@ class MetricsRegistry:
 
         # -- aaltohub_messages_total --
         lines.append("# HELP aaltohub_messages_total Total messages processed by the crawler.")
-        lines.append("# TYPE aaltohub_messages_total counter")
+        lines.append("# TYPE aaltohub_messages_total gauge")
         lines.append(f"aaltohub_messages_total {self.messages_total.value}")
 
         # -- aaltohub_crawler_groups_active --
@@ -109,6 +110,11 @@ class MetricsRegistry:
         lines.append("# TYPE aaltohub_queue_size gauge")
         lines.append(f"aaltohub_queue_size {self.queue_size.value}")
 
+        # -- aaltohub_sse_connections --
+        lines.append("# HELP aaltohub_sse_connections Active SSE client connections.")
+        lines.append("# TYPE aaltohub_sse_connections gauge")
+        lines.append(f"aaltohub_sse_connections {self.sse_connections.value}")
+
         # -- aaltohub_http_requests_total --
         lines.append("# HELP aaltohub_http_requests_total Total HTTP requests by method, path, and status.")
         lines.append("# TYPE aaltohub_http_requests_total counter")
@@ -117,11 +123,6 @@ class MetricsRegistry:
             lines.append(
                 f'aaltohub_http_requests_total{{method="{method}",path="{path}",status="{status}"}} {value}'
             )
-
-        # -- aaltohub_db_operations_total --
-        lines.append("# HELP aaltohub_db_operations_total Total database operations executed.")
-        lines.append("# TYPE aaltohub_db_operations_total counter")
-        lines.append(f"aaltohub_db_operations_total {self.db_operations_total.value}")
 
         # -- aaltohub_uptime_seconds --
         lines.append("# HELP aaltohub_uptime_seconds Seconds since the metrics registry was created.")
