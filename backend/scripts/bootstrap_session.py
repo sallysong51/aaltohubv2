@@ -92,14 +92,26 @@ async def main(phone: str, force: bool = False, code: str = None, password: str 
         )
         await client.connect()
 
-        hash_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".phone_code_hash")
+        state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bootstrap_state")
 
-        if code and os.path.exists(hash_file):
-            # Non-interactive step 2: reuse saved phone_code_hash (no new code sent)
-            with open(hash_file, "r") as f:
-                phone_code_hash = f.read().strip()
-            print(f"Using saved phone_code_hash from previous --send-code run")
-            os.remove(hash_file)
+        if code and os.path.exists(state_file):
+            # Non-interactive step 2: restore session + hash from step 1
+            import json
+            with open(state_file, "r") as f:
+                state = json.load(f)
+            phone_code_hash = state["phone_code_hash"]
+            saved_session = state["session_string"]
+            os.remove(state_file)
+
+            # Reconnect using the SAME session that sent the code
+            await client.disconnect()
+            client = TelegramClient(
+                StringSession(saved_session),
+                settings.TELEGRAM_API_ID,
+                settings.TELEGRAM_API_HASH,
+            )
+            await client.connect()
+            print(f"Restored session from previous --send-code run")
         else:
             # Send a new code
             try:
@@ -119,16 +131,18 @@ async def main(phone: str, force: bool = False, code: str = None, password: str 
                 await client.disconnect()
                 return
 
-            if send_code_only or code is None:
-                # Save hash for step 2
-                with open(hash_file, "w") as f:
-                    f.write(phone_code_hash)
-
-                if send_code_only:
-                    print("\n--send-code mode: Code has been sent to your Telegram app.")
-                    print(f"Now run again with: --code <THE_CODE>")
-                    await client.disconnect()
-                    return
+            if send_code_only:
+                # Save session + hash for step 2
+                import json
+                with open(state_file, "w") as f:
+                    json.dump({
+                        "phone_code_hash": phone_code_hash,
+                        "session_string": client.session.save(),
+                    }, f)
+                print("\n--send-code mode: Code has been sent to your Telegram app.")
+                print(f"Now run again with: --code <THE_CODE>")
+                await client.disconnect()
+                return
 
         if not code:
             code = input("Enter the code from Telegram: ").strip()
