@@ -23,9 +23,71 @@ from app.models import (
 from app.auth import get_current_user, get_current_admin_user
 from app.database import db
 from app.telegram_client import telegram_manager, TelegramAuthError
+from telethon.errors import (
+    FloodWaitError, ChannelPrivateError, ChatAdminRequiredError,
+    InviteHashInvalidError, InviteHashExpiredError
+)
 
 
 router = APIRouter(prefix="/groups", tags=["Groups"])
+
+
+async def _auto_join_admin_to_group(
+    group_id: int, group_name: str, invite_link: str = None, username: str = None
+) -> bool:
+    """Auto-join admin to a group via invite link or username (non-blocking, best-effort)."""
+    try:
+        from app.live_crawler import live_crawler
+
+        if not live_crawler.clients:
+            logger.debug(f"No admin clients available to join group {group_name}")
+            return False
+
+        for admin_id, client in list(live_crawler.clients.items()):
+            try:
+                if not client.is_connected():
+                    logger.debug(f"Admin client {admin_id} disconnected, trying next")
+                    continue
+
+                # Try invite link first (works for both public and private)
+                if invite_link:
+                    await client.join_chat(invite_link)
+                    logger.info(f"Admin {admin_id} auto-joined group {group_name} (id={group_id}) via invite link")
+                    return True
+
+                # Fallback: try username
+                elif username:
+                    await client.join_chat(f"@{username}")
+                    logger.info(f"Admin {admin_id} auto-joined group {group_name} (id={group_id}) via username")
+                    return True
+
+            except FloodWaitError as e:
+                logger.debug(f"FloodWait on join {group_name}: wait {e.seconds}s")
+                await asyncio.sleep(min(e.seconds + 2, 10))
+                continue
+
+            except (InviteHashInvalidError, InviteHashExpiredError):
+                logger.debug(f"Invalid/expired invite link for {group_name}")
+                continue
+
+            except ChannelPrivateError:
+                logger.debug(f"Cannot access private group {group_name} — admin not member")
+                continue
+
+            except ChatAdminRequiredError:
+                logger.debug(f"Admin permission required for {group_name}")
+                continue
+
+            except Exception as e:
+                logger.debug(f"Failed to auto-join {group_name}: {type(e).__name__}: {e}")
+                continue
+
+        logger.warning(f"All admin clients failed to join {group_name}")
+        return False
+
+    except Exception as e:
+        logger.warning(f"Unexpected error in auto_join: {e}")
+        return False
 
 
 async def _filter_accessible_group_ids(group_ids: list, current_user: UserResponse) -> list:
@@ -165,6 +227,10 @@ async def register_groups(
                            VALUES ($1, 'inactive', TRUE, 0, 0, 0) ON CONFLICT (group_id) DO NOTHING""",
                         telegram_id,
                     )
+
+            # Auto-join admin to the group (enable crawling)
+            # Use invite_link if available, fallback to username
+            await _auto_join_admin_to_group(telegram_id, group_data.title, group_data.invite_link, group_data.username)
 
             # Build API response from the inserted row (outside txn — read committed)
             updated = await db.fetchrow("SELECT * FROM groups WHERE id = $1", telegram_id)
