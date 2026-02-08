@@ -92,33 +92,49 @@ async def main(phone: str, force: bool = False, code: str = None, password: str 
         )
         await client.connect()
 
-        try:
-            sent = await client.send_code_request(phone)
-            print(f"Code sent to Telegram app (phone_code_hash: {sent.phone_code_hash[:8]}...)")
-        except PhoneNumberInvalidError:
-            print("ERROR: Invalid phone number format.")
-            await client.disconnect()
-            return
-        except PhoneNumberBannedError:
-            print("ERROR: This phone number is banned by Telegram.")
-            await client.disconnect()
-            return
-        except FloodWaitError as e:
-            print(f"ERROR: Telegram rate limit. Retry after {e.seconds} seconds.")
-            await client.disconnect()
-            return
+        hash_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".phone_code_hash")
 
-        if send_code_only:
-            print("\n--send-code mode: Code has been sent to your Telegram app.")
-            print(f"Now run again with: --code <THE_CODE>")
-            await client.disconnect()
-            return
+        if code and os.path.exists(hash_file):
+            # Non-interactive step 2: reuse saved phone_code_hash (no new code sent)
+            with open(hash_file, "r") as f:
+                phone_code_hash = f.read().strip()
+            print(f"Using saved phone_code_hash from previous --send-code run")
+            os.remove(hash_file)
+        else:
+            # Send a new code
+            try:
+                sent = await client.send_code_request(phone)
+                phone_code_hash = sent.phone_code_hash
+                print(f"Code sent to Telegram app (phone_code_hash: {phone_code_hash[:8]}...)")
+            except PhoneNumberInvalidError:
+                print("ERROR: Invalid phone number format.")
+                await client.disconnect()
+                return
+            except PhoneNumberBannedError:
+                print("ERROR: This phone number is banned by Telegram.")
+                await client.disconnect()
+                return
+            except FloodWaitError as e:
+                print(f"ERROR: Telegram rate limit. Retry after {e.seconds} seconds.")
+                await client.disconnect()
+                return
+
+            if send_code_only or code is None:
+                # Save hash for step 2
+                with open(hash_file, "w") as f:
+                    f.write(phone_code_hash)
+
+                if send_code_only:
+                    print("\n--send-code mode: Code has been sent to your Telegram app.")
+                    print(f"Now run again with: --code <THE_CODE>")
+                    await client.disconnect()
+                    return
 
         if not code:
             code = input("Enter the code from Telegram: ").strip()
 
         try:
-            await client.sign_in(phone, code, phone_code_hash=sent.phone_code_hash)
+            await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
         except SessionPasswordNeededError:
             if not password:
                 password = getpass.getpass("2FA password required: ")
@@ -128,7 +144,7 @@ async def main(phone: str, force: bool = False, code: str = None, password: str 
             await client.disconnect()
             return
         except PhoneCodeExpiredError:
-            print("ERROR: Code expired. Run the script again.")
+            print("ERROR: Code expired. Run with --send-code again.")
             await client.disconnect()
             return
 
