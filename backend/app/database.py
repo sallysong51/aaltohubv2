@@ -57,7 +57,7 @@ class Database:
                 min_size=5,
                 max_size=20,
                 command_timeout=10,
-                statement_cache_size=100,
+                statement_cache_size=0,  # Must be 0 for pgbouncer/Supabase pooler compatibility
             )
             logger.info("asyncpg pool created (min=5, max=20)")
         except asyncpg.InternalServerError as e:
