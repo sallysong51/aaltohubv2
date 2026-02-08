@@ -28,6 +28,8 @@ from telethon.errors import (
     ChannelPrivateError,
     ChatAdminRequiredError,
     SessionPasswordNeededError,
+    InviteHashInvalidError,
+    InviteHashExpiredError,
 )
 from telethon.tl.types import (
     InputPeerChannel,
@@ -200,6 +202,10 @@ class LiveCrawlerService:
         self._last_gap_fill_at: float = 0
         # Last start failure reason, cleared on success — exposed via get_status()
         self._start_error: str | None = None
+        # Auto-join unmapped groups task
+        self._auto_join_task: asyncio.Task | None = None
+        # Track last auto-join to avoid too frequent attempts
+        self._last_auto_join_at: float = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -277,16 +283,72 @@ class LiveCrawlerService:
                 self._release_lock()
                 return
 
+            admin_ids = [r["id"] for r in admin_rows]
             logger.info("Live crawler: Found %d admin user(s)", len(admin_rows))
 
-            # Initialize a Telethon client for each admin user
+            # Load sessions: try telegram_connections first (multi-account), then telethon_sessions (legacy)
+            tc_rows = await db.fetch(
+                """SELECT tc.id AS connection_id, tc.user_id, tc.telegram_user_id,
+                          tc.session_encrypted, tc.key_hash, tc.username, tc.first_name
+                   FROM telegram_connections tc
+                   WHERE tc.user_id = ANY($1::bigint[])""",
+                admin_ids,
+            )
+
+            # Track which admin_ids have connections (to fallback for those without)
+            admins_with_connections = set()
+            for tc_row in tc_rows:
+                conn_id = str(tc_row["connection_id"])
+                admin_id = tc_row["user_id"]
+                admin_name = tc_row.get("first_name") or "?"
+                admin_username = tc_row.get("username") or "N/A"
+                admins_with_connections.add(admin_id)
+
+                try:
+                    aad = str(admin_id)
+                    if tc_row["key_hash"] == ENCRYPTION_VERSION:
+                        session_string = session_encryption.decrypt(tc_row["session_encrypted"], aad=aad)
+                    else:
+                        from app.encryption import get_legacy_encryption
+                        session_string = get_legacy_encryption().decrypt(tc_row["session_encrypted"])
+
+                    client = TelegramClient(
+                        StringSession(session_string),
+                        settings.TELEGRAM_API_ID,
+                        settings.TELEGRAM_API_HASH,
+                        use_ipv6=False,
+                        request_retries=3,
+                        connection_retries=5,
+                        retry_delay=3,
+                        timeout=120,
+                        flood_sleep_threshold=300,
+                        auto_reconnect=True,
+                    )
+                    logger.info("Live crawler: Connecting for %s (@%s) [conn=%s]...", admin_name, admin_username, conn_id[:8])
+                    await client.connect()
+
+                    me = await client.get_me()
+                    if not me:
+                        logger.warning("Live crawler: Auth failed for connection %s. Skipping.", conn_id[:8])
+                        await client.disconnect()
+                        continue
+
+                    self.clients[admin_id] = client
+                    logger.info("Live crawler: ✓ Connected as %s (@%s) [conn=%s]", me.first_name, me.username, conn_id[:8])
+                except Exception as e:
+                    logger.error("Live crawler: Failed connection %s: %s", conn_id[:8], e)
+                    continue
+
+            # Fallback: load from telethon_sessions for admins WITHOUT telegram_connections
             for admin_user in admin_rows:
                 admin_id = admin_user["id"]
+                if admin_id in admins_with_connections or admin_id in self.clients:
+                    continue
+
                 admin_name = admin_user.get("first_name") or "?"
                 admin_username = admin_user.get("username") or "N/A"
 
                 try:
-                    # Load encrypted session
                     row = await db.fetchrow(
                         "SELECT session_data, key_hash FROM telethon_sessions WHERE user_id = $1",
                         admin_id,
@@ -298,7 +360,6 @@ class LiveCrawlerService:
                     if row["key_hash"] == ENCRYPTION_VERSION:
                         session_string = session_encryption.decrypt(row["session_data"], aad=aad)
                     else:
-                        # Legacy session — try to decrypt and re-encrypt with v2
                         try:
                             from app.encryption import get_legacy_encryption
                             session_string = get_legacy_encryption().decrypt(row["session_data"])
@@ -310,14 +371,11 @@ class LiveCrawlerService:
                             logger.info("Live crawler: Migrated session for admin %s to v2 encryption", admin_name)
                         except Exception as decrypt_err:
                             logger.warning(
-                                "Live crawler: Cannot decrypt legacy session for %s (id=%s). "
-                                "ENCRYPTION_KEY may have changed. This user should re-login. "
-                                "Error: %s",
+                                "Live crawler: Cannot decrypt legacy session for %s (id=%s). Error: %s",
                                 admin_name, admin_id, type(decrypt_err).__name__,
                             )
                             continue
 
-                    # Create Telethon client
                     client = TelegramClient(
                         StringSession(session_string),
                         settings.TELEGRAM_API_ID,
@@ -399,6 +457,7 @@ class LiveCrawlerService:
             self._historical_task = asyncio.create_task(self._crawl_all_groups_historical())
             self._gap_fill_task = asyncio.create_task(self._periodic_gap_fill())
             self._watchdog_task = asyncio.create_task(self._listener_watchdog())
+            self._auto_join_task = asyncio.create_task(self._periodic_auto_join_groups())
 
             logger.info("Live crawler started!")
             logger.info("  - %d admin account(s) connected", len(self.clients))
@@ -428,7 +487,7 @@ class LiveCrawlerService:
         self.running = False
 
         # Cancel background housekeeping tasks first
-        for task in [self._refresh_task, self._historical_task, self._gap_fill_task, self._watchdog_task]:
+        for task in [self._refresh_task, self._historical_task, self._gap_fill_task, self._watchdog_task, self._auto_join_task]:
             if task and not task.done():
                 task.cancel()
 
@@ -572,15 +631,15 @@ class LiveCrawlerService:
             'ON CONFLICT (telegram_message_id, group_id) DO UPDATE SET "text" = EXCLUDED."text", media_type = EXCLUDED.media_type, media_url = EXCLUDED.media_url, is_edited = TRUE, is_deleted = EXCLUDED.is_deleted'
         query = f"""INSERT INTO messages
             (telegram_message_id, group_id, sender_id, sender_name, "text",
-             media_type, media_url, reply_to_message_id, topic_id, is_deleted, sent_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             media_type, media_url, reply_to_message_id, topic_id, is_deleted, sent_at, message_source)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             {conflict}"""
         args_list = [
             (
                 r.get("telegram_message_id"), r.get("group_id"), r.get("sender_id"),
                 r.get("sender_name"), r.get("content"), r.get("media_type"),
                 r.get("media_url"), r.get("reply_to_message_id"), r.get("topic_id"),
-                r.get("is_deleted", False), r.get("sent_at"),
+                r.get("is_deleted", False), r.get("sent_at"), r.get("message_source", "realtime"),
             )
             for r in rows
         ]
@@ -598,15 +657,15 @@ class LiveCrawlerService:
             'ON CONFLICT (telegram_message_id, group_id) DO UPDATE SET "text" = EXCLUDED."text", media_type = EXCLUDED.media_type, media_url = EXCLUDED.media_url, is_edited = TRUE, is_deleted = EXCLUDED.is_deleted'
         query = f"""INSERT INTO messages
             (telegram_message_id, group_id, sender_id, sender_name, "text",
-             media_type, media_url, reply_to_message_id, topic_id, is_deleted, sent_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             media_type, media_url, reply_to_message_id, topic_id, is_deleted, sent_at, message_source)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             {conflict}"""
         await db.execute(
             query,
             row.get("telegram_message_id"), row.get("group_id"), row.get("sender_id"),
             row.get("sender_name"), row.get("content"), row.get("media_type"),
             row.get("media_url"), row.get("reply_to_message_id"), row.get("topic_id"),
-            row.get("is_deleted", False), row.get("sent_at"),
+            row.get("is_deleted", False), row.get("sent_at"), row.get("message_source", "realtime"),
         )
 
     async def _broadcast(self, event: str, payload: dict) -> None:
@@ -734,6 +793,7 @@ class LiveCrawlerService:
         download_media: bool = False,
         client: TelegramClient | None = None,
         broadcast: bool = True,
+        message_source: str = "realtime",
     ) -> None:
         """Prepare message data and put it on the queue for the DB writer."""
         try:
@@ -797,6 +857,7 @@ class LiveCrawlerService:
                 "topic_id": topic_id,
                 "is_deleted": False,
                 "sent_at": message.date,
+                "message_source": message_source,
             }
 
             if is_edit:
@@ -1155,7 +1216,7 @@ class LiveCrawlerService:
                             break
                         iterated += 1
                         if message.text or message.media:
-                            await self._enqueue_message(message, gid, group_uuid, client=working_client, broadcast=False)
+                            await self._enqueue_message(message, gid, group_uuid, client=working_client, broadcast=False, message_source="gap_fill")
                             count += 1
                         if count >= GAP_FILL_MAX_MESSAGES:
                             break
@@ -1353,7 +1414,7 @@ class LiveCrawlerService:
                     iterated_count += 1
                     try:
                         if message.text or message.media:
-                            await self._enqueue_message(message, gid, group_uuid, client=working_client)
+                            await self._enqueue_message(message, gid, group_uuid, client=working_client, broadcast=False, message_source="crawled")
                             enqueued_count += 1
 
                             if enqueued_count % 100 == 0:
@@ -1639,6 +1700,125 @@ class LiveCrawlerService:
                     await self._update_group_last_error(old_id, f"Supergroup migration to {new_id}")
                 except Exception as e:
                     logger.error("Chat action handler error: %s", e)
+
+    # ------------------------------------------------------------------
+    # Auto-join unmapped groups — background task
+    # ------------------------------------------------------------------
+
+    async def _periodic_auto_join_groups(self) -> None:
+        """Periodically find unmapped groups and auto-join them with admin accounts.
+
+        Checks every 30 minutes for new groups that:
+        1. Are registered in the database
+        2. But not yet accessible by any admin account (not in crawler_status active/initializing)
+
+        When found, joins them using available admin clients and initiates historical crawl.
+        """
+        # Wait a bit before first attempt (let crawler stabilize)
+        await asyncio.sleep(5 * 60)  # 5 minutes
+
+        while self.running:
+            try:
+                now = time.monotonic()
+
+                # Check if enough time has passed since last attempt
+                if now - self._last_auto_join_at < 30 * 60:  # 30 minutes
+                    await asyncio.sleep(60)  # Check again in 1 minute
+                    continue
+
+                # Skip if no clients available
+                if not self.clients:
+                    logger.debug("No admin clients available, skipping auto-join")
+                    await asyncio.sleep(5 * 60)
+                    continue
+
+                # Find unmapped groups
+                unmapped = await db.fetch(
+                    """SELECT g.id, g.name, g.invite_link, g.username
+                       FROM groups g
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM crawler_status cs
+                           WHERE cs.group_id = g.id
+                           AND cs.status IN ('active', 'initializing')
+                       )
+                       ORDER BY g.created_at ASC
+                       LIMIT 20"""
+                )
+
+                if not unmapped:
+                    logger.debug("No unmapped groups found")
+                    self._last_auto_join_at = now
+                    await asyncio.sleep(5 * 60)
+                    continue
+
+                logger.info(f"Found {len(unmapped)} unmapped groups, auto-joining with admin accounts...")
+                joined_count = 0
+
+                for group in unmapped:
+                    if not self.running:
+                        break
+
+                    gid = group["id"]
+                    gname = group["name"]
+                    invite_link = group["invite_link"]
+                    username = group["username"]
+
+                    try:
+                        # Try to join with one of the admin clients
+                        joined = False
+                        for admin_id, client in list(self.clients.items()):
+                            try:
+                                if not client.is_connected():
+                                    continue
+
+                                # Try invite link first
+                                if invite_link:
+                                    await client.join_chat(invite_link)
+                                    logger.info(f"Auto-joined group {gname} (id={gid}) via invite link")
+                                    joined = True
+                                    break
+
+                                # Fallback to username
+                                elif username:
+                                    await client.join_chat(f"@{username}")
+                                    logger.info(f"Auto-joined group {gname} (id={gid}) via username")
+                                    joined = True
+                                    break
+
+                            except FloodWaitError as e:
+                                logger.warning(f"FloodWait joining {gname}: {e.seconds}s")
+                                # Wait and try next client
+                                continue
+                            except (ChannelPrivateError, InviteHashInvalidError, InviteHashExpiredError):
+                                # Private/expired, try next client or move on
+                                continue
+                            except Exception as e:
+                                logger.warning(f"Failed to join {gname} with admin {admin_id}: {e}")
+                                continue
+
+                        if joined:
+                            joined_count += 1
+                            # Trigger historical crawl for the newly joined group
+                            asyncio.create_task(self._crawl_historical_for_group(gid))
+
+                        # Delay between groups to avoid rate limiting
+                        await asyncio.sleep(30)
+
+                    except Exception as e:
+                        logger.error(f"Unexpected error auto-joining group {gid}: {e}")
+                        continue
+
+                logger.info(f"Auto-join complete: {joined_count}/{len(unmapped)} groups joined")
+                self._last_auto_join_at = now
+                await asyncio.sleep(5 * 60)  # Check again in 5 minutes
+
+            except asyncio.CancelledError:
+                logger.info("Auto-join task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Auto-join loop error: {e}")
+                await asyncio.sleep(5 * 60)
+                continue
 
     # ------------------------------------------------------------------
     # Listener watchdog — detect and recover from all-listeners-dead

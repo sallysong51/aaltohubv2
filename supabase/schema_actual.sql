@@ -184,6 +184,7 @@ CREATE TABLE IF NOT EXISTS messages (
     is_edited BOOLEAN DEFAULT FALSE,  -- was edited_at TIMESTAMPTZ; actual DB uses boolean
     sent_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
+    message_source TEXT NOT NULL DEFAULT 'realtime' CHECK (message_source IN ('realtime', 'crawled', 'gap_fill')),  -- tracks message origin for user feed filtering
     UNIQUE(telegram_message_id, group_id)
 );
 

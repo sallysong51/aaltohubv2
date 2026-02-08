@@ -8,6 +8,10 @@ import traceback
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List
 from datetime import datetime, timedelta, timezone
+from telethon.errors import (
+    FloodWaitError, ChannelPrivateError, ChatAdminRequiredError,
+    InviteHashInvalidError, InviteHashExpiredError
+)
 from app.models import (
     TelegramGroupResponse, MessagesListResponse,
     MessageResponse, UserResponse, UserRole
@@ -15,6 +19,7 @@ from app.models import (
 from app.auth import get_current_admin_user
 from app.database import db
 from app.routes.groups import _db_group_to_api
+from app.telegram_client import telegram_manager
 
 logger = logging.getLogger(__name__)
 
@@ -28,14 +33,23 @@ async def get_all_groups(
     page_size: int = Query(100, ge=1, le=500),
     current_user: UserResponse = Depends(get_current_admin_user),
 ):
-    """Get all registered groups (admin only)"""
+    """Get all registered groups (admin only). Includes connection_id for the current admin user."""
     try:
         offset = (page - 1) * page_size
         rows = await db.fetch(
-            "SELECT * FROM groups ORDER BY created_at DESC LIMIT $1 OFFSET $2",
-            page_size, offset,
+            """SELECT g.*, ug.connection_id::text AS connection_id
+               FROM groups g
+               LEFT JOIN user_groups ug ON ug.group_id = g.id AND ug.user_id = $3
+               ORDER BY g.created_at DESC
+               LIMIT $1 OFFSET $2""",
+            page_size, offset, current_user.id,
         )
-        return [TelegramGroupResponse(**_db_group_to_api(dict(g))) for g in rows]
+        result = []
+        for g in rows:
+            api_dict = _db_group_to_api(dict(g))
+            api_dict["connection_id"] = g.get("connection_id")
+            result.append(TelegramGroupResponse(**api_dict))
+        return result
     except Exception as e:
         logger.error("get_all_groups error: %s", e)
         raise HTTPException(status_code=500, detail="Failed to fetch groups")
@@ -455,6 +469,202 @@ async def add_admin_credential(
     except Exception as e:
         logger.error("add_admin_credential error: %s", e)
         raise HTTPException(status_code=500, detail="Failed to add admin credential")
+
+
+@router.get("/unmapped-groups")
+async def get_unmapped_groups(
+    current_user: UserResponse = Depends(get_current_admin_user),
+):
+    """Get groups registered by users that admin accounts haven't joined yet.
+
+    Shows which groups need manual join + crawling setup.
+    Returns: groups registered but not yet accessible via admin accounts.
+    """
+    try:
+        # Get all registered groups
+        all_groups = await db.fetch(
+            """SELECT g.id, g.name, g.username, g.invite_link, g.type, g.member_count,
+                      g.visibility, g.crawl_status, g.registered_by,
+                      u.first_name, u.last_name, u.username as registrant_username
+               FROM groups g
+               LEFT JOIN users u ON g.registered_by = u.id
+               ORDER BY g.created_at DESC"""
+        )
+
+        # Get groups currently being crawled (accessible by admin accounts)
+        crawler_status = await db.fetch(
+            "SELECT DISTINCT group_id FROM crawler_status WHERE status IN ('active', 'initializing')"
+        )
+        accessible_group_ids = {row["group_id"] for row in crawler_status}
+
+        # Find unmapped groups (registered but not accessible)
+        unmapped = []
+        for g in all_groups:
+            gid = g["id"]
+            if gid not in accessible_group_ids:
+                registrant_name = g.get("first_name") or ""
+                if g.get("last_name"):
+                    registrant_name += f" {g['last_name']}"
+                registrant_name = registrant_name.strip() or f"@{g.get('registrant_username', 'unknown')}"
+
+                unmapped.append({
+                    "group_id": gid,
+                    "name": g.get("name") or "Unknown",
+                    "username": g.get("username"),
+                    "invite_link": g.get("invite_link"),
+                    "type": g.get("type") or "group",
+                    "member_count": g.get("member_count") or 0,
+                    "visibility": g.get("visibility", "public"),
+                    "crawl_status": g.get("crawl_status"),
+                    "registered_by": g.get("registered_by"),
+                    "registrant_name": registrant_name,
+                })
+
+        return {
+            "total": len(unmapped),
+            "groups": unmapped,
+        }
+    except Exception as e:
+        logger.error("get_unmapped_groups error: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to fetch unmapped groups")
+
+
+@router.post("/auto-join-groups")
+async def auto_join_unmapped_groups(
+    current_user: UserResponse = Depends(get_current_admin_user),
+):
+    """Automatically join unmapped groups using admin accounts.
+
+    Returns: List of join results (success/failed with reason)
+    """
+    try:
+        # Get unmapped groups
+        unmapped = await db.fetch(
+            """SELECT g.id, g.invite_link, g.username, g.name
+               FROM groups g
+               LEFT JOIN crawler_status cs ON g.id = cs.group_id
+               WHERE cs.status NOT IN ('active', 'initializing')
+               OR cs.group_id IS NULL
+               ORDER BY g.created_at ASC
+               LIMIT 50"""
+        )
+
+        if not unmapped:
+            return {"success": True, "total": 0, "joined": 0, "results": []}
+
+        # Get live crawler clients
+        from app.live_crawler import live_crawler
+        if not live_crawler or not live_crawler.running or not live_crawler.clients:
+            raise HTTPException(
+                status_code=503,
+                detail="Live crawler not running. Cannot join groups without active admin clients."
+            )
+
+        results = []
+        joined_count = 0
+
+        for group in unmapped:
+            gid = group["id"]
+            gname = group["name"]
+            invite_link = group["invite_link"]
+            username = group["username"]
+
+            try:
+                # Try to join using one of the admin clients
+                joined = False
+                last_error = None
+
+                for admin_id, client in list(live_crawler.clients.items()):
+                    try:
+                        if not client.is_connected():
+                            logger.warning(f"Admin client {admin_id} disconnected, skipping")
+                            continue
+
+                        # Try invite link first (works for both public and private)
+                        if invite_link:
+                            await client.join_chat(invite_link)
+                            logger.info(f"Auto-join success: {gname} (id={gid}) via invite link")
+                            results.append({
+                                "group_id": gid,
+                                "group_name": gname,
+                                "success": True,
+                                "method": "invite_link",
+                            })
+                            joined = True
+                            joined_count += 1
+                            break
+                        # Fallback: try username
+                        elif username:
+                            await client.join_chat(f"@{username}")
+                            logger.info(f"Auto-join success: {gname} (id={gid}) via username")
+                            results.append({
+                                "group_id": gid,
+                                "group_name": gname,
+                                "success": True,
+                                "method": "username",
+                            })
+                            joined = True
+                            joined_count += 1
+                            break
+
+                    except FloodWaitError as e:
+                        last_error = f"Rate limited: wait {e.seconds}s"
+                        logger.warning(f"FloodWait for group {gname}: {e.seconds}s")
+                        # Wait and retry with next client or move to next group
+                        await asyncio.sleep(min(e.seconds + 5, 60))
+                        continue
+
+                    except (InviteHashInvalidError, InviteHashExpiredError):
+                        last_error = "Invalid or expired invite link"
+                        continue
+
+                    except ChannelPrivateError:
+                        last_error = "Channel is private (no access)"
+                        continue
+
+                    except ChatAdminRequiredError:
+                        last_error = "Admin permission required"
+                        continue
+
+                    except Exception as e:
+                        last_error = f"Error: {type(e).__name__}: {str(e)[:50]}"
+                        logger.warning(f"Failed to join {gname}: {e}")
+                        continue
+
+                if not joined:
+                    results.append({
+                        "group_id": gid,
+                        "group_name": gname,
+                        "success": False,
+                        "error": last_error or "All admin clients failed",
+                    })
+
+                # Delay between groups to avoid rate limiting
+                await asyncio.sleep(30)
+
+            except Exception as e:
+                logger.error(f"Unexpected error joining group {gid}: {e}")
+                results.append({
+                    "group_id": gid,
+                    "group_name": gname,
+                    "success": False,
+                    "error": str(e)[:100],
+                })
+
+        logger.info(f"Auto-join completed: {joined_count}/{len(unmapped)} groups joined")
+
+        return {
+            "success": True,
+            "total": len(unmapped),
+            "joined": joined_count,
+            "results": results,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("auto_join_unmapped_groups error: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to auto-join groups")
 
 
 @router.delete("/admin-credentials/{credential_id}")

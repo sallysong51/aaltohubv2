@@ -11,13 +11,14 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Label } from '@/components/ui/label';
+import { Input } from '@/components/ui/input';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Badge } from '@/components/ui/badge';
 import { Avatar, AvatarImage, AvatarFallback } from '@/components/ui/avatar';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
 import { Loader2, Users, Lock, Globe, ChevronRight, AlertCircle, Info, CheckCircle2, XCircle, Download, Send } from 'lucide-react';
-import { groupsApi, authApi, TelegramGroup, CrawlProgressItem, getApiErrorMessage } from '@/lib/api';
+import { groupsApi, telegramApi, TelegramGroup, TelegramConnection, CrawlProgressItem, getApiErrorMessage } from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
 import ProtectedRoute from '@/components/ProtectedRoute';
 
@@ -36,24 +37,53 @@ function GroupSelectionContent() {
   const [registeredGroupIds, setRegisteredGroupIds] = useState<Set<string>>(new Set());
   const [pollError, setPollError] = useState(false);
   const [showTelegramLogin, setShowTelegramLogin] = useState(false);
+  const [connections, setConnections] = useState<TelegramConnection[]>([]);
+  const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null);
+  const [connectionsLoaded, setConnectionsLoaded] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pollFailCountRef = useRef(0);
 
+  // Load connections on mount
   useEffect(() => {
-    loadGroups();
+    loadConnections();
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
   }, []);
 
-  const loadGroups = async () => {
+  // Load groups when a connection is selected
+  useEffect(() => {
+    if (selectedConnectionId) {
+      loadGroups(selectedConnectionId);
+    }
+  }, [selectedConnectionId]);
+
+  const loadConnections = async () => {
+    setIsLoading(true);
+    try {
+      const response = await telegramApi.getConnections();
+      setConnections(response.data);
+      setConnectionsLoaded(true);
+      if (response.data.length > 0) {
+        // Auto-select first connection
+        setSelectedConnectionId(response.data[0].id);
+      }
+    } catch {
+      setConnectionsLoaded(true);
+      // No connections → show connect flow
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const loadGroups = async (connectionId: string) => {
     setIsLoading(true);
     setShowTelegramLogin(false);
     try {
-      const response = await groupsApi.getMyTelegramGroups();
+      const response = await groupsApi.getMyTelegramGroups(connectionId);
       setGroups(response.data);
+      setSelectedGroups(new Set());
 
-      // Initialize all groups as public by default
       const visibilityMap = new Map<number, 'public' | 'private'>();
       response.data.forEach(group => {
         if (!group.is_registered) {
@@ -63,7 +93,6 @@ function GroupSelectionContent() {
       setGroupVisibility(visibilityMap);
     } catch (error) {
       if (axios.isAxiosError(error) && error.response?.status === 401) {
-        // Show Telegram login UI instead of error
         setShowTelegramLogin(true);
         return;
       }
@@ -176,7 +205,10 @@ function GroupSelectionContent() {
           visibility: groupVisibility.get(g.telegram_id) || 'public',
         }));
 
-      const response = await groupsApi.registerGroups({ groups: groupsToRegister });
+      const response = await groupsApi.registerGroups({
+        groups: groupsToRegister,
+        connection_id: selectedConnectionId || undefined,
+      });
 
       if (response.data.success) {
         const registeredCount = response.data.registered_groups.length;
@@ -230,15 +262,15 @@ function GroupSelectionContent() {
     );
   }
 
-  if (showTelegramLogin) {
+  // Show connect flow when no connections exist
+  if (connectionsLoaded && connections.length === 0 || showTelegramLogin) {
     return (
-      <TelegramLoginFlow
-        onLoginSuccess={async () => {
-          await refreshUser();
+      <TelegramConnectFlow
+        onConnectSuccess={async () => {
           setShowTelegramLogin(false);
-          await loadGroups();
+          await loadConnections();
         }}
-        onCancel={() => setShowTelegramLogin(false)}
+        onCancel={() => setLocation(user?.role === 'admin' ? '/admin' : '/feed')}
       />
     );
   }
@@ -253,6 +285,47 @@ function GroupSelectionContent() {
               <p className="text-muted-foreground">
                 등록할 텔레그램 그룹을 선택하세요
               </p>
+
+              {/* Connection picker */}
+              {connections.length > 1 && (
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {connections.map(conn => (
+                    <Button
+                      key={conn.id}
+                      variant={selectedConnectionId === conn.id ? 'default' : 'outline'}
+                      size="sm"
+                      onClick={() => setSelectedConnectionId(conn.id)}
+                      className="border-2"
+                    >
+                      {conn.first_name || conn.username || conn.phone_masked || '텔레그램'}
+                      {conn.username && <span className="ml-1 text-xs opacity-70">@{conn.username}</span>}
+                    </Button>
+                  ))}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setShowTelegramLogin(true)}
+                    className="border-2 border-dashed"
+                  >
+                    + 계정 추가
+                  </Button>
+                </div>
+              )}
+              {connections.length === 1 && (
+                <div className="mt-4 flex items-center gap-2">
+                  <Badge variant="outline" className="border-2">
+                    {connections[0].first_name || connections[0].username || '텔레그램'} 계정
+                  </Badge>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setShowTelegramLogin(true)}
+                    className="text-xs"
+                  >
+                    + 다른 계정 추가
+                  </Button>
+                </div>
+              )}
               {unregisteredGroups.length > 0 && (
                 <div className="mt-4 flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -313,7 +386,7 @@ function GroupSelectionContent() {
                           텔레그램에서 그룹이나 채널에 가입한 후 아래 새로고침을 눌러주세요
                         </p>
                         <Button
-                          onClick={loadGroups}
+                          onClick={() => selectedConnectionId && loadGroups(selectedConnectionId)}
                           variant="outline"
                           className="border-2 border-border"
                         >
@@ -705,13 +778,13 @@ function GroupSelectionContent() {
   );
 }
 
-// Inline Telegram login flow component for GroupSelection
-interface TelegramLoginFlowProps {
-  onLoginSuccess: () => void;
+// Inline Telegram connect flow component for GroupSelection
+interface TelegramConnectFlowProps {
+  onConnectSuccess: () => void;
   onCancel: () => void;
 }
 
-function TelegramLoginFlow({ onLoginSuccess, onCancel }: TelegramLoginFlowProps) {
+function TelegramConnectFlow({ onConnectSuccess, onCancel }: TelegramConnectFlowProps) {
   const [step, setStep] = useState<'phone' | 'code' | '2fa'>('phone');
   const [phoneOrUsername, setPhoneOrUsername] = useState('');
   const [code, setCode] = useState('');
@@ -750,12 +823,12 @@ function TelegramLoginFlow({ onLoginSuccess, onCancel }: TelegramLoginFlowProps)
     isSubmitting.current = true;
     setIsLoading(true);
     try {
-      await authApi.verifyCode({
+      await telegramApi.verifyCode({
         phone_or_username: phoneOrUsername,
         code: codeValue,
         phone_code_hash: hash,
       });
-      onLoginSuccess();
+      onConnectSuccess();
     } catch (error) {
       if (axios.isAxiosError(error) && error.response?.status === 403) {
         setStep('2fa');
@@ -774,7 +847,7 @@ function TelegramLoginFlow({ onLoginSuccess, onCancel }: TelegramLoginFlowProps)
       setIsLoading(false);
       isSubmitting.current = false;
     }
-  }, [phoneOrUsername, onLoginSuccess]);
+  }, [phoneOrUsername, onConnectSuccess]);
 
   const submitCode = useCallback(async (codeValue: string) => {
     const hash = phoneCodeHashRef.current;
@@ -797,7 +870,7 @@ function TelegramLoginFlow({ onLoginSuccess, onCancel }: TelegramLoginFlowProps)
     setStep('code');
 
     try {
-      const response = await authApi.sendCode({ phone_or_username: phoneOrUsername });
+      const response = await telegramApi.sendCode({ phone_or_username: phoneOrUsername });
       if (response.data.success) {
         const hash = response.data.phone_code_hash || '';
         phoneCodeHashRef.current = hash;
@@ -836,12 +909,12 @@ function TelegramLoginFlow({ onLoginSuccess, onCancel }: TelegramLoginFlowProps)
     }
     setIsLoading(true);
     try {
-      await authApi.verify2FA({
+      await telegramApi.verify2FA({
         phone_or_username: phoneOrUsername,
         password,
         phone_code_hash: phoneCodeHash,
       });
-      onLoginSuccess();
+      onConnectSuccess();
     } catch (error) {
       toast.error(getApiErrorMessage(error, '2FA 검증 실패'));
     } finally {
@@ -857,7 +930,7 @@ function TelegramLoginFlow({ onLoginSuccess, onCancel }: TelegramLoginFlowProps)
             텔레그램 연결
           </CardTitle>
           <CardDescription className="text-center">
-            그룹을 추가하기 위해 텔레그램으로 로그인하세요
+            그룹을 추가하기 위해 텔레그램 계정을 연결하세요
           </CardDescription>
         </CardHeader>
         <CardContent>

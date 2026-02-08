@@ -18,7 +18,14 @@ export function getApiErrorMessage(error: unknown, fallback: string): string {
     if (error.response?.status === 503) {
       return '서비스가 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해주세요.';
     }
-    return error.response?.data?.detail || fallback;
+    const detail = error.response?.data?.detail;
+    if (!detail) return fallback;
+    // FastAPI validation errors return detail as array of objects
+    if (Array.isArray(detail)) {
+      return detail.map((d: { msg?: string }) => d.msg || '').filter(Boolean).join(', ') || fallback;
+    }
+    if (typeof detail === 'string') return detail;
+    return fallback;
   }
   return fallback;
 }
@@ -263,6 +270,7 @@ export interface RegisteredGroup {
   invite_link?: string;
   description?: string;
   registered_by?: string;
+  connection_id?: string;
   created_at: string;
 }
 
@@ -275,6 +283,23 @@ export interface RegisterGroupsRequest {
     group_type?: string;
     visibility: 'public' | 'private';
   }>;
+  connection_id?: string;
+}
+
+export interface TelegramConnection {
+  id: string;
+  telegram_user_id: number;
+  phone_masked?: string;
+  username?: string;
+  first_name?: string;
+  last_name?: string;
+  connected_at?: string;
+  last_used_at?: string;
+}
+
+export interface ConnectVerifyResponse {
+  success: boolean;
+  connection: TelegramConnection;
 }
 
 export interface RegisterGroupsResponse {
@@ -341,9 +366,28 @@ export interface CrawlProgressItem {
   is_currently_crawling?: boolean;
 }
 
+export const telegramApi = {
+  getConnections: () =>
+    apiClient.get<TelegramConnection[]>('/telegram/connections'),
+
+  sendCode: (data: { phone_or_username: string }) =>
+    apiClient.post<{ success: boolean; phone_code_hash?: string; message?: string; requires_2fa?: boolean }>('/telegram/send-code', data),
+
+  verifyCode: (data: { phone_or_username: string; code: string; phone_code_hash: string }) =>
+    apiClient.post<ConnectVerifyResponse>('/telegram/verify-code', data),
+
+  verify2FA: (data: { phone_or_username: string; password: string; phone_code_hash: string }) =>
+    apiClient.post<ConnectVerifyResponse>('/telegram/verify-2fa', data),
+
+  deleteConnection: (connectionId: string) =>
+    apiClient.delete(`/telegram/connections/${connectionId}`),
+};
+
 export const groupsApi = {
-  getMyTelegramGroups: () =>
-    apiClient.get<TelegramGroup[]>('/groups/my-telegram-groups'),
+  getMyTelegramGroups: (connectionId?: string) =>
+    apiClient.get<TelegramGroup[]>('/groups/my-telegram-groups', {
+      params: connectionId ? { connection_id: connectionId } : {},
+    }),
 
   registerGroups: (data: RegisterGroupsRequest) =>
     apiClient.post<RegisterGroupsResponse>('/groups/register', data),
@@ -441,6 +485,37 @@ export const adminApi = {
 
   retryFailedMessage: (messageId: string) =>
     apiClient.post(`/admin/failed-messages/${messageId}/retry`),
+
+  getUnmappedGroups: () =>
+    apiClient.get<{
+      total: number;
+      groups: Array<{
+        group_id: number;
+        name: string;
+        username: string | null;
+        invite_link: string | null;
+        type: string;
+        member_count: number;
+        visibility: string;
+        crawl_status: string | null;
+        registered_by: number | null;
+        registrant_name: string;
+      }>;
+    }>('/admin/unmapped-groups'),
+
+  autoJoinGroups: () =>
+    apiClient.post<{
+      success: boolean;
+      total: number;
+      joined: number;
+      results: Array<{
+        group_id: number;
+        group_name: string;
+        success: boolean;
+        method?: string;
+        error?: string;
+      }>;
+    }>('/admin/auto-join-groups'),
 };
 
 // ============================================================

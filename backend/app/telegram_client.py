@@ -602,6 +602,140 @@ class TelegramClientManager:
         finally:
             await client.disconnect()
 
+    # ------------------------------------------------------------------
+    # Multi-connection support (one user → multiple Telegram accounts)
+    # ------------------------------------------------------------------
+
+    async def save_connection(self, user_id: str, telegram_user_id: int,
+                               session_string: str, phone_masked: str = None,
+                               username: str = None, first_name: str = None,
+                               last_name: str = None) -> str:
+        """Save a Telegram connection for a user. Returns connection UUID."""
+        import uuid
+        aad = str(user_id)
+        encrypted_session = session_encryption.encrypt(session_string, aad=aad)
+        key_hash = session_encryption.get_key_hash()
+        connection_id = str(uuid.uuid4())
+
+        await db.execute(
+            """INSERT INTO telegram_connections
+               (id, user_id, telegram_user_id, phone_masked, username,
+                session_encrypted, key_hash, first_name, last_name)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               ON CONFLICT (user_id, telegram_user_id)
+               DO UPDATE SET session_encrypted = $6, key_hash = $7,
+                             username = $5, first_name = $8, last_name = $9,
+                             last_used_at = NOW(), updated_at = NOW()
+               """,
+            connection_id, int(user_id), telegram_user_id,
+            phone_masked, username, encrypted_session, key_hash,
+            first_name, last_name,
+        )
+
+        # If conflict (ON CONFLICT DO UPDATE), fetch the existing id
+        row = await db.fetchrow(
+            "SELECT id FROM telegram_connections WHERE user_id = $1 AND telegram_user_id = $2",
+            int(user_id), telegram_user_id,
+        )
+        return str(row["id"]) if row else connection_id
+
+    async def get_connections(self, user_id: str) -> List[Dict]:
+        """Get all Telegram connections for a user."""
+        rows = await db.fetch(
+            """SELECT id, telegram_user_id, phone_masked, username,
+                      first_name, last_name, connected_at, last_used_at
+               FROM telegram_connections
+               WHERE user_id = $1
+               ORDER BY connected_at ASC""",
+            int(user_id),
+        )
+        return [dict(r) for r in rows]
+
+    async def delete_connection(self, connection_id: str, user_id: str) -> bool:
+        """Delete a Telegram connection. Returns True if deleted."""
+        result = await db.execute(
+            "DELETE FROM telegram_connections WHERE id = $1 AND user_id = $2",
+            connection_id, int(user_id),
+        )
+        # Clear cache entries that might use this connection
+        cache_key = f"conn:{connection_id}"
+        self._session_cache.pop(cache_key, None)
+        return "DELETE 1" in (result or "")
+
+    async def load_session_by_connection(self, connection_id: str, user_id: str) -> Optional[str]:
+        """Load a specific Telegram connection's session."""
+        cache_key = f"conn:{connection_id}"
+        cached = self._session_cache.get(cache_key)
+        if cached and time.monotonic() - cached.cached_at < self.SESSION_CACHE_TTL:
+            return cached.session_string
+
+        row = await db.fetchrow(
+            """SELECT session_encrypted, key_hash, user_id
+               FROM telegram_connections WHERE id = $1 AND user_id = $2""",
+            connection_id, int(user_id),
+        )
+        if not row:
+            return None
+
+        aad = str(row["user_id"])
+        if row["key_hash"] == ENCRYPTION_VERSION:
+            session_string = session_encryption.decrypt(row["session_encrypted"], aad=aad)
+        else:
+            from app.encryption import get_legacy_encryption
+            session_string = get_legacy_encryption().decrypt(row["session_encrypted"])
+
+        await db.execute(
+            "UPDATE telegram_connections SET last_used_at = NOW() WHERE id = $1",
+            connection_id,
+        )
+        self._session_cache[cache_key] = _CachedSession(session_string)
+        return session_string
+
+    async def get_user_client_by_connection(self, connection_id: str, user_id: str) -> TelegramClient:
+        """Create a Telethon client from a specific connection."""
+        session_string = await self.load_session_by_connection(connection_id, user_id)
+        if not session_string:
+            raise TelegramAuthError("텔레그램 연결을 찾을 수 없습니다.", status_code=404)
+
+        client = self._make_client(session_string)
+        try:
+            await asyncio.wait_for(client.connect(), timeout=10.0)
+        except asyncio.TimeoutError:
+            await self._safe_disconnect(client)
+            raise TelegramAuthError("텔레그램 서버 연결 시간 초과.", status_code=504)
+        return client
+
+    async def get_user_groups_by_connection(self, connection_id: str, user_id: str) -> List[Dict]:
+        """Get all groups/channels from a specific Telegram connection."""
+        client = await self.get_user_client_by_connection(connection_id, user_id)
+        try:
+            dialogs = await asyncio.wait_for(client.get_dialogs(), timeout=15.0)
+            groups = []
+            for dialog in dialogs:
+                entity = dialog.entity
+                if isinstance(entity, (Chat, Channel)):
+                    if isinstance(entity, Channel):
+                        group_type = "supergroup" if entity.megagroup else "channel"
+                    else:
+                        group_type = "group"
+                    groups.append({
+                        "telegram_id": entity.id,
+                        "title": entity.title,
+                        "username": getattr(entity, 'username', None),
+                        "member_count": getattr(entity, 'participants_count', None),
+                        "group_type": group_type,
+                    })
+            return groups
+        except asyncio.TimeoutError:
+            raise TelegramAuthError("텔레그램 그룹 목록 로딩 시간 초과.", status_code=504)
+        except Exception as e:
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in ("auth key", "unauthorized", "session revoked")):
+                raise TelegramAuthError("텔레그램 세션이 만료되었습니다. 다시 연결해주세요.", status_code=401)
+            raise TelegramAuthError("텔레그램 그룹 목록을 불러올 수 없습니다.", status_code=500)
+        finally:
+            await client.disconnect()
+
     async def invite_admin_to_group(self, group_telegram_id: int) -> Dict:
         """Invite admin to a public group"""
         try:

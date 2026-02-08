@@ -310,12 +310,7 @@ function EventFeedContent() {
     return date.toLocaleDateString('ko-KR');
   };
 
-  // If no groups registered (confirmed, not API error), redirect to group selection
-  useEffect(() => {
-    if (!isLoading && groups.length === 0 && !groupsLoadFailed) {
-      setLocation('/groups/select');
-    }
-  }, [isLoading, groups.length, groupsLoadFailed, setLocation]);
+  // No forced redirect — users can add groups from the empty state UI
 
   if (isLoading) {
     return (
@@ -354,8 +349,39 @@ function EventFeedContent() {
 
   if (groups.length === 0) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      <div className="min-h-screen bg-background">
+        <div className="border-b border-border bg-card">
+          <div className="container py-6">
+            <div className="flex items-center justify-between">
+              <h1 className="text-4xl font-bold">이벤트 피드</h1>
+              <div className="flex gap-2">
+                {!isAuthLoading && user?.role === 'admin' && (
+                  <Button variant="outline" onClick={() => setLocation('/admin')} size="sm">
+                    <LayoutDashboard className="h-4 w-4 mr-2" />
+                    관리자
+                  </Button>
+                )}
+                <Button variant="outline" onClick={logout} size="sm">로그아웃</Button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="container py-8">
+          <Card className="refined-card">
+            <CardContent className="pt-6">
+              <div className="text-center py-12">
+                <Users className="h-16 w-16 mx-auto mb-4 text-muted-foreground" />
+                <h2 className="text-xl font-bold mb-2">등록된 그룹이 없습니다</h2>
+                <p className="text-muted-foreground mb-6">
+                  텔레그램 그룹을 추가하면 메시지가 여기에 표시됩니다
+                </p>
+                <Button onClick={() => setLocation('/groups/select')} size="lg">
+                  그룹 추가하기
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
       </div>
     );
   }

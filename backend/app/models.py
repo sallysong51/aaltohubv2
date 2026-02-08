@@ -160,6 +160,7 @@ class TelegramGroupResponse(TelegramGroupBase):
     visibility: GroupVisibility
     invite_link: Optional[str] = None
     registered_by: Optional[int] = None
+    connection_id: Optional[str] = None
     created_at: Optional[datetime] = None
 
     class Config:
@@ -177,6 +178,7 @@ class RegisterGroupItem(BaseModel):
 
 class RegisterGroupsRequest(BaseModel):
     groups: List[RegisterGroupItem] = Field(..., description="List of groups to register")
+    connection_id: Optional[str] = Field(None, description="Telegram connection ID used to fetch these groups")
 
 
 class RegisterGroupsResponse(BaseModel):

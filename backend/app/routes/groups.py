@@ -82,12 +82,19 @@ def _db_group_to_api(g: Dict) -> Dict:
 
 @router.get("/my-telegram-groups", response_model=List[TelegramGroupInfo])
 async def get_my_groups(
+    connection_id: str = None,
     current_user: UserResponse = Depends(get_current_user),
 ):
-    """Get all Telegram groups user is member of"""
+    """Get all Telegram groups user is member of.
+    If connection_id is provided, uses that specific Telegram connection.
+    Otherwise falls back to legacy single-session lookup."""
     try:
-        # Get groups from Telegram
-        groups = await telegram_manager.get_user_groups(current_user.id)
+        if connection_id:
+            groups = await telegram_manager.get_user_groups_by_connection(
+                connection_id, str(current_user.id)
+            )
+        else:
+            groups = await telegram_manager.get_user_groups(current_user.id)
 
         # Get registered group IDs from database (groups.id = telegram group ID)
         rows = await db.fetch("SELECT id FROM groups")
@@ -146,10 +153,10 @@ async def register_groups(
                         True,
                     )
 
-                    # Add to user's group membership
+                    # Add to user's group membership (with optional connection_id)
                     await conn.execute(
-                        "INSERT INTO user_groups (user_id, group_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                        current_user.id, telegram_id,
+                        "INSERT INTO user_groups (user_id, group_id, connection_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                        current_user.id, telegram_id, request.connection_id,
                     )
 
                     # Create crawler_status row for this group
@@ -287,7 +294,7 @@ async def get_aggregated_messages(
 
         if topic_id is not None:
             total = await db.fetchval(
-                "SELECT COUNT(*) FROM messages WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE AND topic_id = $2",
+                "SELECT COUNT(*) FROM messages WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE AND message_source = 'realtime' AND topic_id = $2",
                 int_ids, topic_id,
             )
             messages_rows = await db.fetch(
@@ -295,13 +302,13 @@ async def get_aggregated_messages(
                           "text" AS content, media_type, media_url,
                           reply_to_message_id, topic_id, sent_at, is_deleted, created_at
                    FROM messages
-                   WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE AND topic_id = $2
+                   WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE AND message_source = 'realtime' AND topic_id = $2
                    ORDER BY sent_at DESC LIMIT $3 OFFSET $4""",
                 int_ids, topic_id, page_size, offset,
             )
         else:
             total = await db.fetchval(
-                "SELECT COUNT(*) FROM messages WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE",
+                "SELECT COUNT(*) FROM messages WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE AND message_source = 'realtime'",
                 int_ids,
             )
             messages_rows = await db.fetch(
@@ -309,7 +316,7 @@ async def get_aggregated_messages(
                           "text" AS content, media_type, media_url,
                           reply_to_message_id, topic_id, sent_at, is_deleted, created_at
                    FROM messages
-                   WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE
+                   WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE AND message_source = 'realtime'
                    ORDER BY sent_at DESC LIMIT $2 OFFSET $3""",
                 int_ids, page_size, offset,
             )
@@ -413,7 +420,7 @@ async def get_group_messages(
 
         if topic_id is not None:
             total = await db.fetchval(
-                "SELECT COUNT(*) FROM messages WHERE group_id = $1 AND is_deleted = FALSE AND topic_id = $2",
+                "SELECT COUNT(*) FROM messages WHERE group_id = $1 AND is_deleted = FALSE AND message_source = 'realtime' AND topic_id = $2",
                 gid, topic_id,
             )
             messages_rows = await db.fetch(
@@ -421,13 +428,13 @@ async def get_group_messages(
                           "text" AS content, media_type, media_url,
                           reply_to_message_id, topic_id, sent_at, is_deleted, created_at
                    FROM messages
-                   WHERE group_id = $1 AND is_deleted = FALSE AND topic_id = $2
+                   WHERE group_id = $1 AND is_deleted = FALSE AND message_source = 'realtime' AND topic_id = $2
                    ORDER BY sent_at DESC LIMIT $3 OFFSET $4""",
                 gid, topic_id, page_size, offset,
             )
         else:
             total = await db.fetchval(
-                "SELECT COUNT(*) FROM messages WHERE group_id = $1 AND is_deleted = FALSE",
+                "SELECT COUNT(*) FROM messages WHERE group_id = $1 AND is_deleted = FALSE AND message_source = 'realtime'",
                 gid,
             )
             messages_rows = await db.fetch(
@@ -435,7 +442,7 @@ async def get_group_messages(
                           "text" AS content, media_type, media_url,
                           reply_to_message_id, topic_id, sent_at, is_deleted, created_at
                    FROM messages
-                   WHERE group_id = $1 AND is_deleted = FALSE
+                   WHERE group_id = $1 AND is_deleted = FALSE AND message_source = 'realtime'
                    ORDER BY sent_at DESC LIMIT $2 OFFSET $3""",
                 gid, page_size, offset,
             )
