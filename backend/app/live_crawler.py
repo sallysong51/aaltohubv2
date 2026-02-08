@@ -206,6 +206,8 @@ class LiveCrawlerService:
         self._auto_join_task: asyncio.Task | None = None
         # Track last auto-join to avoid too frequent attempts
         self._last_auto_join_at: float = 0
+        # Background task that waits for an admin session to appear
+        self._admin_wait_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -278,9 +280,11 @@ class LiveCrawlerService:
                 "SELECT * FROM users WHERE role = $1", UserRole.ADMIN.value
             )
             if not admin_rows:
-                self._start_error = "No admin user found. Please login as admin first."
-                logger.error("Live crawler: %s", self._start_error)
+                self._start_error = "No admin user found. Run: python scripts/bootstrap_session.py --phone +PHONE"
+                logger.warning("Live crawler: %s", self._start_error)
+                logger.warning("Live crawler: Will retry every 60s until an admin session is available...")
                 self._release_lock()
+                self._admin_wait_task = asyncio.create_task(self._wait_for_admin_session())
                 return
 
             admin_ids = [r["id"] for r in admin_rows]
@@ -405,9 +409,11 @@ class LiveCrawlerService:
                     continue
 
             if not self.clients:
-                self._start_error = "Failed to initialize any admin Telegram clients."
-                logger.error("Live crawler: %s", self._start_error)
+                self._start_error = "Admin users found but no sessions available. Run: python scripts/bootstrap_session.py --phone +PHONE"
+                logger.warning("Live crawler: %s", self._start_error)
+                logger.warning("Live crawler: Will retry every 60s until a session is available...")
                 self._release_lock()
+                self._admin_wait_task = asyncio.create_task(self._wait_for_admin_session())
                 return
 
             self.running = True
@@ -527,6 +533,46 @@ class LiveCrawlerService:
                 pass
             self._lock_file = None
 
+    async def _wait_for_admin_session(self) -> None:
+        """Periodically check for admin sessions and auto-start when available."""
+        attempt = 0
+        while not self.running:
+            await asyncio.sleep(60)
+            attempt += 1
+            try:
+                admin_rows = await db.fetch(
+                    "SELECT id FROM users WHERE role = $1", UserRole.ADMIN.value
+                )
+                if not admin_rows:
+                    if attempt % 5 == 0:  # log every 5 minutes
+                        logger.warning(
+                            "Live crawler: Still no admin user (check #%d). "
+                            "Run: python scripts/bootstrap_session.py --phone +PHONE",
+                            attempt,
+                        )
+                    continue
+
+                admin_ids = [r["id"] for r in admin_rows]
+                session_count = await db.fetchval(
+                    "SELECT COUNT(*) FROM telethon_sessions WHERE user_id = ANY($1::bigint[])",
+                    admin_ids,
+                )
+                if session_count > 0:
+                    logger.info("Live crawler: Admin session detected! Starting crawler (attempt #%d)...", attempt)
+                    self._start_error = None
+                    self._admin_wait_task = None
+                    await self.start()
+                    return
+                else:
+                    if attempt % 5 == 0:
+                        logger.warning(
+                            "Live crawler: %d admin(s) found but no sessions stored (check #%d).",
+                            len(admin_rows), attempt,
+                        )
+            except Exception as e:
+                if attempt % 5 == 0:
+                    logger.warning("Live crawler: Admin session check failed: %s", e)
+
     async def _cleanup(self) -> None:
         self.connected = False
         for user_id, client in self.clients.items():
@@ -560,6 +606,11 @@ class LiveCrawlerService:
             "seconds_since_last_event": (
                 int(time.monotonic() - self._last_event_received_at)
                 if self._last_event_received_at > 0 else None
+            ),
+            "waiting_for_admin": (
+                not self.running
+                and self._admin_wait_task is not None
+                and not self._admin_wait_task.done()
             ),
         }
 

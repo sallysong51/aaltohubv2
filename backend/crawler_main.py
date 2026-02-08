@@ -104,6 +104,8 @@ async def health():
         reasons.append("not_connected")
     if not live_crawler.clients:
         reasons.append("no_telegram_clients")
+    if status.get("waiting_for_admin"):
+        reasons.append("no_admin_session")
 
     # Circuit breaker stuck open for > 5 minutes
     cb = live_crawler._circuit_breaker
