@@ -55,6 +55,52 @@ async def get_all_groups(
         raise HTTPException(status_code=500, detail="Failed to fetch groups")
 
 
+@router.patch("/groups/{group_id}")
+async def update_group_settings(
+    group_id: str,
+    current_user: UserResponse = Depends(get_current_admin_user),
+    crawl_enabled: bool = Query(..., description="Enable or disable crawling"),
+):
+    """Toggle crawl_enabled for a group (admin only)."""
+    try:
+        gid = int(group_id)
+        result = await db.execute(
+            "UPDATE groups SET crawl_enabled = $1, updated_at = NOW() WHERE id = $2",
+            crawl_enabled, gid,
+        )
+        if "UPDATE 0" in result:
+            raise HTTPException(status_code=404, detail="Group not found")
+        return {"success": True, "group_id": gid, "crawl_enabled": crawl_enabled}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("update_group_settings error: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to update group")
+
+
+@router.delete("/groups/{group_id}")
+async def delete_group_admin(
+    group_id: str,
+    current_user: UserResponse = Depends(get_current_admin_user),
+):
+    """Delete a group and all related data (admin only)."""
+    try:
+        gid = int(group_id)
+        # Delete cascade: messages, user_groups, crawler_status
+        await db.execute("DELETE FROM crawler_status WHERE group_id = $1", gid)
+        await db.execute("DELETE FROM user_groups WHERE group_id = $1", gid)
+        await db.execute("DELETE FROM messages WHERE group_id = $1", gid)
+        result = await db.execute("DELETE FROM groups WHERE id = $1", gid)
+        if "DELETE 0" in result:
+            raise HTTPException(status_code=404, detail="Group not found")
+        return {"success": True, "group_id": gid}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("delete_group_admin error: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to delete group")
+
+
 @router.get("/groups/{group_id}/messages", response_model=MessagesListResponse)
 async def get_group_messages_admin(
     group_id: str,

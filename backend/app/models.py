@@ -161,6 +161,7 @@ class TelegramGroupResponse(TelegramGroupBase):
     invite_link: Optional[str] = None
     registered_by: Optional[int] = None
     connection_id: Optional[str] = None
+    crawl_enabled: Optional[bool] = True
     created_at: Optional[datetime] = None
 
     class Config:

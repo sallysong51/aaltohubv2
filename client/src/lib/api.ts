@@ -271,6 +271,7 @@ export interface RegisteredGroup {
   description?: string;
   registered_by?: string;
   connection_id?: string;
+  crawl_enabled?: boolean;
   created_at: string;
 }
 
@@ -516,6 +517,12 @@ export const adminApi = {
         error?: string;
       }>;
     }>('/admin/auto-join-groups'),
+
+  updateGroupCrawl: (groupId: string, crawlEnabled: boolean) =>
+    apiClient.patch(`/admin/groups/${groupId}`, null, { params: { crawl_enabled: crawlEnabled } }),
+
+  deleteGroup: (groupId: string) =>
+    apiClient.delete(`/admin/groups/${groupId}`),
 };
 
 // ============================================================

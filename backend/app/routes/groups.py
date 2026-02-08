@@ -139,6 +139,7 @@ def _db_group_to_api(g: Dict) -> Dict:
         "description": g.get("description"),
         "registered_by": g.get("registered_by"),
         "created_at": g.get("created_at"),
+        "crawl_enabled": g.get("crawl_enabled", True),
     }
 
 

@@ -421,6 +421,9 @@ class LiveCrawlerService:
             self._started_at = datetime.now(timezone.utc)
             self._message_count = 0
 
+            # Auto-register all groups admin is member of
+            await self._auto_register_admin_groups()
+
             # Load groups (shared across all clients)
             await self.refresh_groups()
 
@@ -959,6 +962,49 @@ class LiveCrawlerService:
     # ------------------------------------------------------------------
     # Group management
     # ------------------------------------------------------------------
+
+    async def _auto_register_admin_groups(self) -> None:
+        """Auto-register all groups that admin accounts are members of.
+
+        Called on crawler start — ensures any new groups the admin has joined
+        since last restart are automatically picked up for crawling.
+        """
+        from telethon.tl.types import Channel, Chat
+
+        registered = 0
+        for admin_id, client in self.clients.items():
+            try:
+                dialogs = await asyncio.wait_for(client.get_dialogs(), timeout=30)
+                for d in dialogs:
+                    entity = d.entity
+                    if not isinstance(entity, (Channel, Chat)):
+                        continue
+
+                    gid = entity.id
+                    name = d.title or "Unknown"
+                    is_channel = getattr(entity, "broadcast", False)
+                    username = getattr(entity, "username", None)
+                    visibility = "public" if username else "private"
+                    gtype = "channel" if is_channel else "supergroup"
+                    members = getattr(entity, "participants_count", None)
+
+                    await db.execute(
+                        """INSERT INTO groups (id, name, username, visibility, type, member_count, crawl_enabled, registered_by)
+                           VALUES ($1, $2, $3, $4, $5, $6, true, $7)
+                           ON CONFLICT (id) DO UPDATE SET name=$2, username=$3, member_count=$6, updated_at=NOW()""",
+                        gid, name, username, visibility, gtype, members, admin_id,
+                    )
+                    await db.execute(
+                        "INSERT INTO user_groups (user_id, group_id) VALUES ($1, $2) ON CONFLICT (user_id, group_id) DO NOTHING",
+                        admin_id, gid,
+                    )
+                    registered += 1
+
+                logger.info("Auto-registered %d groups for admin %s", registered, admin_id)
+            except asyncio.TimeoutError:
+                logger.warning("Auto-register: get_dialogs timed out for admin %s", admin_id)
+            except Exception as e:
+                logger.warning("Auto-register failed for admin %s: %s", admin_id, e)
 
     async def refresh_groups(self) -> None:
         """Load crawl-enabled groups from DB."""
