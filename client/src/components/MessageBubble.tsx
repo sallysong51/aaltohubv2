@@ -5,34 +5,25 @@
 import { Badge } from '@/components/ui/badge';
 import { Image, File, Video, Music, Sticker, Mic, Reply } from 'lucide-react';
 import { Message } from '@/lib/api';
+import { formatTime } from '@/lib/dateFormat';
+import { getMediaLabel, isValidMediaUrl } from '@/lib/mediaHelpers';
 
 interface MessageBubbleProps {
   message: Message;
   onReplyClick?: (messageId: number) => void;
+  onPhotoClick?: (messageId: number) => void;
 }
 
-export default function MessageBubble({ message, onReplyClick }: MessageBubbleProps) {
-  const formatTime = (dateString: string) => {
-    const date = new Date(dateString);
-    return date.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
-  };
-
+export default function MessageBubble({ message, onReplyClick, onPhotoClick }: MessageBubbleProps) {
   const getMediaIcon = (mediaType: string) => {
     switch (mediaType) {
-      case 'photo':
-        return <Image className="h-3 w-3" />;
-      case 'video':
-        return <Video className="h-3 w-3" />;
-      case 'document':
-        return <File className="h-3 w-3" />;
-      case 'audio':
-        return <Music className="h-3 w-3" />;
-      case 'sticker':
-        return <Sticker className="h-3 w-3" />;
-      case 'voice':
-        return <Mic className="h-3 w-3" />;
-      default:
-        return null;
+      case 'photo': return <Image className="h-3 w-3" />;
+      case 'video': return <Video className="h-3 w-3" />;
+      case 'document': return <File className="h-3 w-3" />;
+      case 'audio': return <Music className="h-3 w-3" />;
+      case 'sticker': return <Sticker className="h-3 w-3" />;
+      case 'voice': return <Mic className="h-3 w-3" />;
+      default: return null;
     }
   };
 
@@ -82,11 +73,13 @@ export default function MessageBubble({ message, onReplyClick }: MessageBubblePr
       {/* Media preview */}
       {message.media_type && (
         <div className="mb-1">
-          {message.media_url && message.media_type === 'photo' && /^https?:\/\//i.test(message.media_url) && (
+          {message.media_type === 'photo' && isValidMediaUrl(message.media_url) && (
             <img
               src={message.media_url}
               alt="Media"
-              className="max-w-xs rounded border border-border mt-0.5"
+              className={`max-w-xs rounded border border-border mt-0.5 ${onPhotoClick ? 'cursor-pointer hover:opacity-80 transition-opacity' : ''}`}
+              loading="lazy"
+              onClick={onPhotoClick ? () => onPhotoClick(message.telegram_message_id) : undefined}
             />
           )}
 
@@ -95,13 +88,9 @@ export default function MessageBubble({ message, onReplyClick }: MessageBubblePr
               {getMediaIcon(message.media_type)}
               <div className="flex-1 truncate">
                 <div className="font-medium text-xs">
-                  {message.media_type === 'document' ? '문서' :
-                   message.media_type === 'video' ? '비디오' :
-                   message.media_type === 'audio' ? '오디오' :
-                   message.media_type === 'voice' ? '음성 메시지' :
-                   message.media_type === 'sticker' ? '스티커' : '미디어'}
+                  {getMediaLabel(message.media_type)}
                 </div>
-                {message.media_url && /^https?:\/\//i.test(message.media_url) && (
+                {isValidMediaUrl(message.media_url) && (
                   <a
                     href={message.media_url}
                     target="_blank"
@@ -119,7 +108,7 @@ export default function MessageBubble({ message, onReplyClick }: MessageBubblePr
 
       {/* Message content */}
       {message.content && (
-        <div className="whitespace-pre-wrap break-words line-clamp-3 text-xs leading-relaxed">
+        <div className="whitespace-pre-wrap break-words text-xs leading-relaxed">
           {message.content}
         </div>
       )}

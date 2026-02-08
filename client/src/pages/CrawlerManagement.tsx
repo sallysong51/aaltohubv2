@@ -13,7 +13,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { toast } from 'sonner';
 import { Loader2, AlertCircle, CheckCircle, XCircle, RefreshCw, ArrowLeft } from 'lucide-react';
 import ProtectedRoute from '@/components/ProtectedRoute';
-import apiClient, { getApiErrorMessage } from '@/lib/api';
+import { formatDateFull } from '@/lib/dateFormat';
+import apiClient, { getApiErrorMessage, LiveCrawlerStatus, BackendHealth, CrawlerHealthStatus } from '@/lib/api';
 
 interface CrawlerStatus {
   id: string;
@@ -39,16 +40,6 @@ interface ErrorLog {
   created_at: string;
 }
 
-interface LiveCrawlerStatus {
-  running: boolean;
-  connected: boolean;
-  groups_count: number;
-  messages_received: number;
-  historical_crawl_running: boolean;
-  crawled_groups: number;
-  uptime_seconds: number;
-}
-
 function CrawlerManagementContent() {
   const [, setLocation] = useLocation();
   const [crawlerStatuses, setCrawlerStatuses] = useState<CrawlerStatus[]>([]);
@@ -56,19 +47,38 @@ function CrawlerManagementContent() {
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingLogs, setIsLoadingLogs] = useState(false);
   const [liveStatus, setLiveStatus] = useState<LiveCrawlerStatus | null>(null);
+  const [lastCrawlerContact, setLastCrawlerContact] = useState<number | null>(null);
+  const [health, setHealth] = useState<BackendHealth | null>(null);
 
   useEffect(() => {
     loadCrawlerStatuses();
     loadLiveStatus();
+    loadHealth();
     const interval = setInterval(loadLiveStatus, 30_000);
     return () => clearInterval(interval);
   }, []);
+
+  const loadHealth = async () => {
+    try {
+      const res = await fetch(`${import.meta.env.VITE_API_URL || ''}/health`);
+      if (res.ok) {
+        const data = await res.json();
+        setHealth(data);
+      }
+    } catch (err) {
+      console.debug('Health check failed:', err);
+    }
+  };
 
   const loadLiveStatus = async () => {
     try {
       const res = await apiClient.get('/admin/live-crawler/status');
       setLiveStatus(res.data);
-    } catch { /* ignore */ }
+      setLastCrawlerContact(Date.now());
+    } catch (err: any) {
+      console.error('Live crawler status failed:', err);
+      setLiveStatus(null);
+    }
   };
 
   const handleRestartLiveCrawler = async () => {
@@ -153,10 +163,7 @@ function CrawlerManagementContent() {
     }
   };
 
-  const formatDate = (dateString: string) => {
-    const date = new Date(dateString);
-    return date.toLocaleString('ko-KR');
-  };
+  const formatDate = formatDateFull;
 
   return (
     <div className="min-h-screen bg-background">
@@ -190,11 +197,69 @@ function CrawlerManagementContent() {
 
           <TabsContent value="status">
             {/* Live Crawler Status */}
-            {liveStatus && (
+            {!liveStatus ? (
+              <Card className="mb-4">
+                <CardContent className="pt-6">
+                  <div className="text-center space-y-4">
+                    <AlertCircle className="mx-auto h-12 w-12 text-muted-foreground" />
+                    <div>
+                      <p className="text-lg font-medium">
+                        {health?.environment === "production"
+                          ? "프로덕션 크롤러에 연결할 수 없습니다"
+                          : "크롤러 프로세스를 찾을 수 없습니다"}
+                      </p>
+                      <p className="text-sm text-muted-foreground mt-2">
+                        {health?.environment === "development"
+                          ? "백엔드 터미널에서 크롤러 프로세스가 실행 중인지 확인하세요"
+                          : "systemd 서비스 상태를 확인하세요: systemctl status aaltohub-live-crawler"}
+                      </p>
+                      {lastCrawlerContact && (
+                        <p className="text-xs text-muted-foreground mt-2">
+                          마지막 정상 연결: {Math.floor((Date.now() - lastCrawlerContact) / 1000)}초 전
+                        </p>
+                      )}
+                    </div>
+                    <Button onClick={loadLiveStatus} variant="outline">
+                      <RefreshCw className="mr-2 h-4 w-4" />
+                      다시 시도
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            ) : (
               <Card className="mb-4">
                 <CardHeader>
                   <div className="flex items-center justify-between">
-                    <CardTitle>라이브 크롤러</CardTitle>
+                    <div className="flex items-center gap-2">
+                      <CardTitle>라이브 크롤러</CardTitle>
+                      {/* Environment badge */}
+                      {health && (
+                        <Badge variant={health.environment === "production" ? "default" : "secondary"} className="text-xs">
+                          {health.environment === "production" ? "프로덕션" : "로컬 개발"}
+                        </Badge>
+                      )}
+                      {/* Health status badge */}
+                      {liveStatus.health_status && (
+                        <Badge
+                          variant={liveStatus.health_status === "healthy" ? "default" : "outline"}
+                          className={
+                            liveStatus.health_status === "healthy"
+                              ? "bg-green-500"
+                              : liveStatus.health_status === "degraded"
+                              ? "border-orange-500 text-orange-600"
+                              : liveStatus.health_status === "restarting"
+                              ? "border-yellow-500 text-yellow-600"
+                              : "border-red-500 text-red-600"
+                          }
+                        >
+                          {liveStatus.health_status === "healthy" && "활성"}
+                          {liveStatus.health_status === "degraded" && "성능 저하"}
+                          {liveStatus.health_status === "restarting" && "재시작 중"}
+                          {liveStatus.health_status === "stopped" && "정지됨"}
+                          {liveStatus.health_status === "unreachable" && "연결 불가"}
+                        </Badge>
+                      )}
+                    </div>
                     <Button
                       variant="outline"
                       size="sm"
@@ -206,6 +271,13 @@ function CrawlerManagementContent() {
                   </div>
                 </CardHeader>
                 <CardContent>
+                  {/* Health message */}
+                  {liveStatus.health_status !== "healthy" && liveStatus.health_message && (
+                    <div className="mb-4 p-3 border rounded-md bg-muted text-sm">
+                      {liveStatus.health_message}
+                    </div>
+                  )}
+
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                     <div>
                       <p className="text-sm text-muted-foreground">상태</p>
@@ -232,6 +304,30 @@ function CrawlerManagementContent() {
                       </p>
                     </div>
                   </div>
+
+                  {/* Circuit breaker warning */}
+                  {liveStatus.circuit_breaker?.state === "open" && (
+                    <div className="mt-4 p-3 border border-orange-500 rounded-md bg-orange-50 text-sm">
+                      <p className="font-medium text-orange-900">
+                        ⚠️ DB 쓰기 차단됨 (circuit breaker open)
+                      </p>
+                      {liveStatus.circuit_breaker.next_retry_at && (
+                        <p className="text-xs text-orange-700 mt-1">
+                          다음 재시도: {new Date(liveStatus.circuit_breaker.next_retry_at).toLocaleTimeString()}
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Dead letter queue */}
+                  {liveStatus.dead_letter_count > 0 && (
+                    <div className="mt-4 p-3 border border-blue-500 rounded-md bg-blue-50 text-sm">
+                      <p className="font-medium text-blue-900">
+                        📬 {liveStatus.dead_letter_count}개의 메시지가 대기 중입니다
+                      </p>
+                    </div>
+                  )}
+
                   {liveStatus.uptime_seconds > 0 && (
                     <p className="text-xs text-muted-foreground mt-2">
                       Uptime: {Math.floor(liveStatus.uptime_seconds / 3600)}시간 {Math.floor((liveStatus.uptime_seconds % 3600) / 60)}분

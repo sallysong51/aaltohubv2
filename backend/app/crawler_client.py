@@ -4,14 +4,27 @@ Async HTTP client for the API server to call the crawler process.
 All methods return None or a default value on failure, so the API
 server degrades gracefully when the crawler is unreachable.
 """
+import asyncio
 import logging
-from typing import Optional
+import time
+from dataclasses import dataclass, field
+from typing import Literal, Optional
 
 import httpx
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CrawlerHealth:
+    """Structured health status for the crawler process."""
+
+    status: Literal["healthy", "degraded", "restarting", "unreachable", "stopped"]
+    message: str
+    details: Optional[dict] = None
+    timestamp: float = field(default_factory=time.time)
 
 _client: Optional[httpx.AsyncClient] = None
 
@@ -40,14 +53,92 @@ async def get_crawler_status() -> Optional[dict]:
         return None
 
 
-async def get_crawler_health() -> Optional[dict]:
-    """Get crawler health. Returns None if unreachable."""
-    try:
-        resp = await _get_client().get("/health")
-        return resp.json()
-    except Exception as e:
-        logger.debug("Crawler health unreachable: %s", e)
-        return None
+async def get_crawler_health() -> CrawlerHealth:
+    """Get crawler health with retry logic and structured status.
+
+    Retries up to 3 times with exponential backoff (1s, 2s, 4s) to handle
+    transient network issues or brief restarts.
+
+    Returns CrawlerHealth with one of 5 states:
+    - healthy: All systems operational
+    - degraded: Running but has issues (DB down, circuit breaker open)
+    - restarting: Detected recent restart (< 30s uptime)
+    - unreachable: Connection failed after retries
+    - stopped: Process responded but running=False
+    """
+    for attempt in range(3):
+        try:
+            resp = await _get_client().get("/health", timeout=3.0)
+            data = resp.json()
+
+            # Check if crawler is stopped
+            if data.get("running") is False:
+                return CrawlerHealth(
+                    status="stopped",
+                    message="Crawler process is stopped",
+                    details=data,
+                )
+
+            # Check for recent restart (< 30s uptime)
+            uptime = data.get("uptime_seconds", float("inf"))
+            if uptime < 30:
+                return CrawlerHealth(
+                    status="restarting",
+                    message=f"Crawler recently restarted ({int(uptime)}s uptime)",
+                    details=data,
+                )
+
+            # Check for degraded conditions
+            circuit_breaker_state = data.get("circuit_breaker", {}).get("state")
+            if circuit_breaker_state == "open":
+                return CrawlerHealth(
+                    status="degraded",
+                    message="Circuit breaker is open (DB write failures)",
+                    details=data,
+                )
+
+            if data.get("db_connected") is False:
+                return CrawlerHealth(
+                    status="degraded",
+                    message="Database connection lost",
+                    details=data,
+                )
+
+            # All checks passed - healthy
+            return CrawlerHealth(
+                status="healthy",
+                message="All systems operational",
+                details=data,
+            )
+
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            # Retry on connection errors
+            if attempt < 2:
+                backoff = 2**attempt  # 1s, 2s, 4s
+                logger.debug(
+                    "Crawler health check failed (attempt %d/3), retrying in %ds: %s",
+                    attempt + 1,
+                    backoff,
+                    type(e).__name__,
+                )
+                await asyncio.sleep(backoff)
+                continue
+
+            # All retries exhausted
+            return CrawlerHealth(
+                status="unreachable",
+                message=f"Connection failed after 3 attempts: {type(e).__name__}",
+            )
+
+        except Exception as e:
+            logger.error("Unexpected crawler health error: %s", e)
+            return CrawlerHealth(
+                status="unreachable",
+                message=f"Unexpected error: {str(e)}",
+            )
+
+    # Should never reach here due to return in loop, but type checker needs it
+    return CrawlerHealth(status="unreachable", message="Unknown error after retries")
 
 
 async def restart_crawler() -> Optional[dict]:

@@ -59,6 +59,19 @@ export default defineConfig({
           });
         },
       },
+      "/health": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+        timeout: 6000, // Must exceed BackendConnectivityContext's HEALTH_TIMEOUT (5s)
+        configure: (proxy) => {
+          proxy.on("error", (_err, _req, res) => {
+            if ("writeHead" in res && typeof res.writeHead === "function") {
+              res.writeHead(502, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ status: "unreachable" }));
+            }
+          });
+        },
+      },
     },
     fs: {
       strict: true,

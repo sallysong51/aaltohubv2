@@ -17,12 +17,14 @@ logger = logging.getLogger(__name__)
 from app.models import (
     TelegramGroupInfo, TelegramGroupResponse,
     RegisterGroupsRequest, RegisterGroupsResponse,
-    MessagesListResponse, MessageResponse,
+    MessagesListResponse,
     UserResponse, GroupVisibility, UserRole
 )
 from app.auth import get_current_user, get_current_admin_user
 from app.database import db
 from app.telegram_client import telegram_manager, TelegramAuthError
+from app.queries.groups import db_group_to_api, filter_accessible_group_ids
+from app.queries.messages import fetch_messages_paginated
 from telethon.errors import (
     FloodWaitError, ChannelPrivateError, ChatAdminRequiredError,
     InviteHashInvalidError, InviteHashExpiredError
@@ -90,57 +92,6 @@ async def _auto_join_admin_to_group(
         return False
 
 
-async def _filter_accessible_group_ids(group_ids: list, current_user: UserResponse) -> list:
-    """Return only group IDs the user is allowed to access (public or member of private)."""
-    if not group_ids:
-        return []
-    int_ids = [int(gid) for gid in group_ids]
-    rows = await db.fetch(
-        "SELECT id, visibility FROM groups WHERE id = ANY($1::bigint[])", int_ids
-    )
-    if not rows:
-        return []
-
-    public_ids = []
-    private_ids = []
-    for g in rows:
-        if g["visibility"] == GroupVisibility.PRIVATE.value:
-            private_ids.append(g["id"])
-        else:
-            public_ids.append(g["id"])
-
-    accessible = [str(gid) for gid in public_ids]
-
-    if private_ids:
-        membership_rows = await db.fetch(
-            "SELECT group_id FROM user_groups WHERE user_id = $1 AND group_id = ANY($2::bigint[])",
-            current_user.id, private_ids,
-        )
-        accessible.extend(str(m["group_id"]) for m in membership_rows)
-
-    return accessible
-
-
-def _db_group_to_api(g: Dict) -> Dict:
-    """Map DB groups row → API response fields expected by the frontend.
-
-    DB has: id, name, type, photo_url, member_count, visibility, registered_by, created_at
-    API returns: id, telegram_id, title, group_type, visibility, etc.
-    """
-    return {
-        "id": str(g["id"]),
-        "telegram_id": g["id"],
-        "title": g.get("name") or "Unknown",
-        "username": g.get("username"),
-        "member_count": g.get("member_count"),
-        "group_type": g.get("type"),
-        "visibility": g.get("visibility", "public"),
-        "invite_link": g.get("invite_link"),
-        "description": g.get("description"),
-        "registered_by": g.get("registered_by"),
-        "created_at": g.get("created_at"),
-        "crawl_enabled": g.get("crawl_enabled", True),
-    }
 
 
 @router.get("/my-telegram-groups", response_model=List[TelegramGroupInfo])
@@ -198,6 +149,15 @@ async def register_groups(
             # Check if group already exists (groups.id = telegram group ID)
             existing = await db.fetchrow("SELECT id FROM groups WHERE id = $1", telegram_id)
             if existing:
+                # Group exists — still upsert user_groups to link connection_id
+                await db.execute(
+                    """INSERT INTO user_groups (user_id, group_id, connection_id)
+                       VALUES ($1, $2, $3)
+                       ON CONFLICT (user_id, group_id)
+                       DO UPDATE SET connection_id = EXCLUDED.connection_id
+                       WHERE user_groups.connection_id IS NULL""",
+                    current_user.id, telegram_id, request.connection_id,
+                )
                 continue
 
             # Wrap all per-group DB ops in a transaction to prevent orphaned rows
@@ -235,7 +195,7 @@ async def register_groups(
 
             # Build API response from the inserted row (outside txn — read committed)
             updated = await db.fetchrow("SELECT * FROM groups WHERE id = $1", telegram_id)
-            registered_groups.append(TelegramGroupResponse(**_db_group_to_api(dict(updated))))
+            registered_groups.append(TelegramGroupResponse(**db_group_to_api(dict(updated))))
 
         # Trigger sequential historical crawl for newly registered groups.
         # Uses asyncio.wait_for with 5s timeout so the API response is fast,
@@ -290,7 +250,7 @@ async def get_registered_groups(
             "SELECT * FROM groups WHERE id = ANY($1::bigint[])", group_ids
         )
 
-        return [TelegramGroupResponse(**_db_group_to_api(dict(g))) for g in groups]
+        return [TelegramGroupResponse(**db_group_to_api(dict(g))) for g in groups]
     except Exception as e:
         logger.error("Groups API error: %s", e)
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -337,6 +297,43 @@ async def get_crawl_progress(
         raise HTTPException(status_code=500, detail="Failed to fetch crawl progress")
 
 
+@router.get("/messages/search", response_model=MessagesListResponse)
+async def search_messages(
+    q: str = Query(..., min_length=2, description="Search query"),
+    group_ids: str = Query(None, description="Comma-separated group IDs (optional)"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Search messages by text content using ILIKE."""
+    try:
+        # Determine which groups to search
+        if group_ids:
+            ids = [gid.strip() for gid in group_ids.split(",") if gid.strip()]
+        else:
+            follows = await db.fetch(
+                "SELECT group_id FROM user_groups WHERE user_id = $1", current_user.id
+            )
+            ids = [str(f["group_id"]) for f in follows]
+
+        if not ids:
+            return MessagesListResponse(messages=[], total=0, page=page, page_size=page_size, has_more=False)
+
+        ids = await filter_accessible_group_ids(ids, current_user)
+        if not ids:
+            return MessagesListResponse(messages=[], total=0, page=page, page_size=page_size, has_more=False)
+
+        return await fetch_messages_paginated(
+            group_ids=[int(i) for i in ids],
+            page=page,
+            page_size=page_size,
+            search_pattern=f"%{q}%",
+        )
+    except Exception as e:
+        logger.error("search_messages error: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to search messages")
+
+
 @router.get("/messages/aggregated", response_model=MessagesListResponse)
 async def get_aggregated_messages(
     group_ids: str = Query(..., description="Comma-separated group IDs"),
@@ -352,52 +349,15 @@ async def get_aggregated_messages(
             return MessagesListResponse(messages=[], total=0, page=page, page_size=page_size, has_more=False)
 
         # IDOR fix: filter out groups the user cannot access
-        ids = await _filter_accessible_group_ids(ids, current_user)
+        ids = await filter_accessible_group_ids(ids, current_user)
         if not ids:
             return MessagesListResponse(messages=[], total=0, page=page, page_size=page_size, has_more=False)
 
-        int_ids = [int(i) for i in ids]
-        offset = (page - 1) * page_size
-
-        if topic_id is not None:
-            total = await db.fetchval(
-                "SELECT COUNT(*) FROM messages WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE AND message_source = 'realtime' AND topic_id = $2",
-                int_ids, topic_id,
-            )
-            messages_rows = await db.fetch(
-                """SELECT id, telegram_message_id, group_id, sender_id, sender_name,
-                          "text" AS content, media_type, media_url,
-                          reply_to_message_id, topic_id, sent_at, is_deleted, created_at
-                   FROM messages
-                   WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE AND message_source = 'realtime' AND topic_id = $2
-                   ORDER BY sent_at DESC LIMIT $3 OFFSET $4""",
-                int_ids, topic_id, page_size, offset,
-            )
-        else:
-            total = await db.fetchval(
-                "SELECT COUNT(*) FROM messages WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE AND message_source = 'realtime'",
-                int_ids,
-            )
-            messages_rows = await db.fetch(
-                """SELECT id, telegram_message_id, group_id, sender_id, sender_name,
-                          "text" AS content, media_type, media_url,
-                          reply_to_message_id, topic_id, sent_at, is_deleted, created_at
-                   FROM messages
-                   WHERE group_id = ANY($1::bigint[]) AND is_deleted = FALSE AND message_source = 'realtime'
-                   ORDER BY sent_at DESC LIMIT $2 OFFSET $3""",
-                int_ids, page_size, offset,
-            )
-
-        messages = []
-        for m in messages_rows:
-            try:
-                messages.append(MessageResponse(**dict(m)))
-            except Exception as exc:
-                logger.warning("Skipping malformed message row id=%s: %s", dict(m).get('id'), exc)
-
-        return MessagesListResponse(
-            messages=messages, total=total, page=page, page_size=page_size,
-            has_more=offset + page_size < total,
+        return await fetch_messages_paginated(
+            group_ids=[int(i) for i in ids],
+            page=page,
+            page_size=page_size,
+            topic_id=topic_id,
         )
     except Exception as e:
         logger.error("get_aggregated_messages error: %s", e)
@@ -483,47 +443,11 @@ async def get_group_messages(
             if not access:
                 raise HTTPException(status_code=403, detail="Access denied: Private group")
 
-        offset = (page - 1) * page_size
-
-        if topic_id is not None:
-            total = await db.fetchval(
-                "SELECT COUNT(*) FROM messages WHERE group_id = $1 AND is_deleted = FALSE AND message_source = 'realtime' AND topic_id = $2",
-                gid, topic_id,
-            )
-            messages_rows = await db.fetch(
-                """SELECT id, telegram_message_id, group_id, sender_id, sender_name,
-                          "text" AS content, media_type, media_url,
-                          reply_to_message_id, topic_id, sent_at, is_deleted, created_at
-                   FROM messages
-                   WHERE group_id = $1 AND is_deleted = FALSE AND message_source = 'realtime' AND topic_id = $2
-                   ORDER BY sent_at DESC LIMIT $3 OFFSET $4""",
-                gid, topic_id, page_size, offset,
-            )
-        else:
-            total = await db.fetchval(
-                "SELECT COUNT(*) FROM messages WHERE group_id = $1 AND is_deleted = FALSE AND message_source = 'realtime'",
-                gid,
-            )
-            messages_rows = await db.fetch(
-                """SELECT id, telegram_message_id, group_id, sender_id, sender_name,
-                          "text" AS content, media_type, media_url,
-                          reply_to_message_id, topic_id, sent_at, is_deleted, created_at
-                   FROM messages
-                   WHERE group_id = $1 AND is_deleted = FALSE AND message_source = 'realtime'
-                   ORDER BY sent_at DESC LIMIT $2 OFFSET $3""",
-                gid, page_size, offset,
-            )
-
-        messages = []
-        for m in messages_rows:
-            try:
-                messages.append(MessageResponse(**dict(m)))
-            except Exception as exc:
-                logger.warning("Skipping malformed message row id=%s: %s", dict(m).get('id'), exc)
-
-        return MessagesListResponse(
-            messages=messages, total=total, page=page, page_size=page_size,
-            has_more=offset + page_size < total,
+        return await fetch_messages_paginated(
+            group_ids=[gid],
+            page=page,
+            page_size=page_size,
+            topic_id=topic_id,
         )
     except HTTPException:
         raise
@@ -554,7 +478,7 @@ async def get_group(
                 if not follow:
                     raise HTTPException(status_code=403, detail="Access denied")
 
-        return TelegramGroupResponse(**_db_group_to_api(g))
+        return TelegramGroupResponse(**db_group_to_api(g))
     except HTTPException:
         raise
     except Exception as e:

@@ -115,7 +115,17 @@ class Settings(BaseSettings):
                 return True
             return False
         return check
-    
+
+    @property
+    def is_development(self) -> bool:
+        """Check if running in development environment."""
+        return self.ENVIRONMENT == "development"
+
+    @property
+    def is_production(self) -> bool:
+        """Check if running in production environment."""
+        return self.ENVIRONMENT == "production"
+
     class Config:
         env_file = ".env"
         case_sensitive = True

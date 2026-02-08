@@ -162,6 +162,7 @@ class TelegramGroupResponse(TelegramGroupBase):
     registered_by: Optional[int] = None
     connection_id: Optional[str] = None
     crawl_enabled: Optional[bool] = True
+    message_count_total: Optional[int] = None
     created_at: Optional[datetime] = None
 
     class Config:
@@ -172,6 +173,7 @@ class RegisterGroupItem(BaseModel):
     telegram_id: int
     title: str = Field(..., min_length=1, max_length=256)
     username: Optional[str] = Field(None, max_length=64)
+    invite_link: Optional[str] = Field(None, max_length=512)
     member_count: Optional[int] = None
     group_type: Optional[GroupType] = GroupType.GROUP
     visibility: Optional[GroupVisibility] = GroupVisibility.PUBLIC

@@ -155,12 +155,14 @@ CREATE TABLE IF NOT EXISTS user_groups (
     id BIGSERIAL PRIMARY KEY,
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     group_id BIGINT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    connection_id UUID REFERENCES telegram_connections(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(user_id, group_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_user_groups_user_id ON user_groups(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_groups_group_id ON user_groups(group_id);
+CREATE INDEX IF NOT EXISTS idx_user_groups_connection_id ON user_groups(connection_id);
 
 -- ============================================================
 -- Messages Table

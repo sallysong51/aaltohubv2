@@ -13,19 +13,35 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
 import {
   Loader2, Users, AlertCircle, RefreshCw, LogOut, Circle, Plus,
-  UserCog, BarChart3, ArrowLeft, Zap, Download, LinkIcon, Smartphone,
-  Settings2, Trash2, Power, PowerOff,
+  UserCog, BarChart3, ArrowLeft, Download, LinkIcon,
+  Settings2, Sun, Moon,
 } from 'lucide-react';
-import { adminApi, telegramApi, TelegramConnection, RegisteredGroup, Message, getApiErrorMessage, SSE_BASE_URL } from '@/lib/api';
+import {
+  adminApi,
+  telegramApi,
+  TelegramConnection,
+  RegisteredGroup,
+  Message,
+  getApiErrorMessage,
+  LiveCrawlerStatus,
+  BackendHealth,
+} from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
+import { useBackendConnectivity } from '@/contexts/BackendConnectivityContext';
 import ProtectedRoute from '@/components/ProtectedRoute';
 import { useLocation } from 'wouter';
-import MessageBubble from '@/components/MessageBubble';
-import TopicFilter from '@/components/TopicFilter';
+import { useTheme } from 'next-themes';
+import { useSSE } from '@/hooks/useSSE';
+import GroupManagementTable from '@/components/admin/GroupManagementTable';
+import AdminMessageViewer from '@/components/admin/AdminMessageViewer';
+import CrawlerStatusBadge from '@/components/admin/CrawlerStatusBadge';
+import ConnectionTabs from '@/components/admin/ConnectionTabs';
 
 function AdminDashboardContent() {
   const [, setLocation] = useLocation();
   const { user, logout } = useAuth();
+  const { isBackendConnected } = useBackendConnectivity();
+  const { theme, setTheme } = useTheme();
 
   const [groups, setGroups] = useState<RegisteredGroup[]>([]);
   const [groupsLoadFailed, setGroupsLoadFailed] = useState(false);
@@ -37,17 +53,12 @@ function AdminDashboardContent() {
   const [hasMore, setHasMore] = useState(false);
   const [selectedTopicId, setSelectedTopicId] = useState<number | null>(null);
   const [crawlerStatusMap, setCrawlerStatusMap] = useState<Map<string, { status: string; progress: number; total: number }>>(new Map());
-  const [liveCrawlerStatus, setLiveCrawlerStatus] = useState<{
-    running: boolean; connected: boolean; groups_count: number;
-    messages_received: number; historical_crawl_running: boolean;
-    crawled_groups: number; uptime_seconds: number;
-    currently_crawling_group_id?: number | null;
-    currently_crawling_group_title?: string | null;
-    seconds_since_last_event?: number | null;
-    start_error?: string | null;
-  } | null>(null);
+  const [liveCrawlerStatus, setLiveCrawlerStatus] = useState<LiveCrawlerStatus | null>(null);
   const [crawlerUnreachable, setCrawlerUnreachable] = useState(false);
-  const [realtimeConnected, setRealtimeConnected] = useState(false);
+  const [lastCrawlerContact, setLastCrawlerContact] = useState<number | null>(null);
+  const [crawlerConsecutiveFailures, setCrawlerConsecutiveFailures] = useState(0);
+  const [health, setHealth] = useState<BackendHealth | null>(null);
+  // realtimeConnected comes from useSSE hook below
   const [groupSearch, setGroupSearch] = useState('');
   const [viewMode, setViewMode] = useState<'messages' | 'groups'>('messages');
 
@@ -58,17 +69,39 @@ function AdminDashboardContent() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
 
+  // Load health (for environment detection)
+  const loadHealth = async () => {
+    try {
+      const res = await fetch(`${import.meta.env.VITE_API_URL || ''}/health`);
+      if (res.ok) {
+        const data = await res.json();
+        setHealth(data);
+      }
+    } catch (err) {
+      console.debug('Health check failed:', err);
+    }
+  };
+
   // Load groups + connections on mount
   useEffect(() => {
     loadGroups();
     loadLiveCrawlerStatus();
     loadConnections();
+    loadHealth();
   }, []);
 
   const loadConnections = async () => {
     try {
       const res = await telegramApi.getConnections();
       setConnections(res.data);
+      // Auto-backfill NULL connection_ids if admin has connections
+      if (res.data.length > 0) {
+        try {
+          await adminApi.backfillConnectionIds();
+        } catch {
+          // Non-critical: backfill is best-effort
+        }
+      }
     } catch {
       // Non-critical: tabs won't show
     }
@@ -79,8 +112,11 @@ function AdminDashboardContent() {
     s => s.status === 'initializing'
   );
 
-  // Poll crawler statuses: 5s during active crawling, 30s otherwise
+  // Poll crawler statuses: 5s during active crawling, 30s otherwise.
+  // Skip polling entirely when backend is unreachable to avoid wasted requests.
   useEffect(() => {
+    if (!isBackendConnected) return; // Backend down — don't poll
+
     const intervalMs = hasActiveCrawling ? 5000 : 30000;
     loadCrawlerStatuses();
     loadLiveCrawlerStatus();
@@ -89,117 +125,98 @@ function AdminDashboardContent() {
       loadLiveCrawlerStatus();
     }, intervalMs);
     return () => clearInterval(interval);
-  }, [hasActiveCrawling]);
+  }, [hasActiveCrawling, isBackendConnected]);
 
-  // SSE subscription — single persistent connection for the selected group
-  useEffect(() => {
-    if (!selectedGroup) return;
+  // SSE subscription with exponential backoff reconnection
+  // Subscribe to ALL groups to maintain connection even during group switching.
+  // Callbacks filter by selectedGroup for display purposes.
+  const sseGroupIds = groups.map(g => String(g.id));
 
-    if (!SSE_BASE_URL) {
-      console.warn('[AdminDashboard] SSE_BASE_URL not configured — realtime disabled, using polling only');
-      return;
-    }
+  const { isConnected: realtimeConnected } = useSSE({
+    groupIds: sseGroupIds,
+    onInsert: (newMessage: Message) => {
+      if (!newMessage) return;
+      if (selectedGroup && String(newMessage.group_id) !== String(selectedGroup.id)) return;
+      if (selectedTopicId !== null && newMessage.topic_id !== selectedTopicId) return;
 
-    const token = localStorage.getItem('access_token');
-    if (!token) return;
-
-    const groupId = String(selectedGroup.id);
-    const url = `${SSE_BASE_URL}/api/events/stream?token=${encodeURIComponent(token)}&groups=${encodeURIComponent(groupId)}`;
-    const es = new EventSource(url);
-
-    es.addEventListener('insert', (e: MessageEvent) => {
-      try {
-        const newMessage: Message = JSON.parse(e.data);
-        if (!newMessage) return;
-        if (selectedTopicId !== null && newMessage.topic_id !== selectedTopicId) return;
-
-        if (newMessage.content && newMessage.content.endsWith('...') && newMessage.content.length >= 200) {
-          adminApi.getGroupMessages(groupId, 1, 10, 365, selectedTopicId).then((res) => {
-            const fullMsg = res.data.messages?.find(
-              (m: Message) => m.telegram_message_id === newMessage.telegram_message_id
-            );
-            if (fullMsg) {
-              setMessages((prev) => {
-                if (prev.some(m => m.telegram_message_id === fullMsg.telegram_message_id && String(m.group_id) === String(fullMsg.group_id))) {
-                  return prev.map(m => m.telegram_message_id === fullMsg.telegram_message_id && String(m.group_id) === String(fullMsg.group_id) ? fullMsg : m);
-                }
-                const updated = [...prev, fullMsg];
-                return updated.length > 500 ? updated.slice(-500) : updated;
-              });
-            }
-          }).catch(() => { /* best-effort */ });
-          return;
-        }
-
-        setMessages((prev) => {
-          if (prev.some(m => m.telegram_message_id === newMessage.telegram_message_id && String(m.group_id) === String(newMessage.group_id))) return prev;
-          const updated = [...prev, newMessage];
-          return updated.length > 500 ? updated.slice(-500) : updated;
-        });
-        requestAnimationFrame(() => {
-          messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-        });
-      } catch (err) {
-        console.error('[AdminDashboard] SSE insert handler error:', err);
+      const groupId = selectedGroup ? String(selectedGroup.id) : '';
+      if (newMessage.content && newMessage.content.endsWith('...') && newMessage.content.length >= 200) {
+        adminApi.getGroupMessages(groupId, 1, 50, 365, selectedTopicId).then((res) => {
+          const fullMsg = res.data.messages?.find(
+            (m: Message) => m.telegram_message_id === newMessage.telegram_message_id
+          );
+          if (fullMsg) {
+            setMessages((prev) => {
+              if (prev.some(m => m.telegram_message_id === fullMsg.telegram_message_id && String(m.group_id) === String(fullMsg.group_id))) {
+                return prev.map(m => m.telegram_message_id === fullMsg.telegram_message_id && String(m.group_id) === String(fullMsg.group_id) ? fullMsg : m);
+              }
+              const updated = [...prev, fullMsg];
+              return updated.length > 500 ? updated.slice(-500) : updated;
+            });
+          }
+        }).catch(() => { /* best-effort */ });
+        return;
       }
-    });
 
-    es.addEventListener('update', (e: MessageEvent) => {
-      try {
-        const updated: Message = JSON.parse(e.data);
-        if (!updated) return;
-        setMessages((prev) =>
-          updated.is_deleted
-            ? prev.filter((m) => !(m.telegram_message_id === updated.telegram_message_id && String(m.group_id) === String(updated.group_id)))
-            : prev.map((m) =>
-                m.telegram_message_id === updated.telegram_message_id ? { ...m, ...updated } : m
-              )
-        );
-      } catch (err) {
-        console.error('[AdminDashboard] SSE update handler error:', err);
-      }
-    });
-
-    es.addEventListener('delete', (e: MessageEvent) => {
-      try {
-        const deleted: { telegram_message_id: number; group_id: string } = JSON.parse(e.data);
-        if (!deleted) return;
-        setMessages((prev) =>
-          prev.filter((m) => !(m.telegram_message_id === deleted.telegram_message_id && String(m.group_id) === String(deleted.group_id)))
-        );
-      } catch (err) {
-        console.error('[AdminDashboard] SSE delete handler error:', err);
-      }
-    });
-
-    es.addEventListener('overflow', () => {
-      console.warn('[AdminDashboard] SSE overflow — refreshing messages from server');
+      setMessages((prev) => {
+        if (prev.some(m => m.telegram_message_id === newMessage.telegram_message_id && String(m.group_id) === String(newMessage.group_id))) return prev;
+        const updated = [...prev, newMessage];
+        return updated.length > 500 ? updated.slice(-500) : updated;
+      });
+      requestAnimationFrame(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      });
+    },
+    onUpdate: (updated: Message) => {
+      if (!updated) return;
+      setMessages((prev) =>
+        updated.is_deleted
+          ? prev.filter((m) => !(m.telegram_message_id === updated.telegram_message_id && String(m.group_id) === String(updated.group_id)))
+          : prev.map((m) =>
+              m.telegram_message_id === updated.telegram_message_id ? { ...m, ...updated } : m
+            )
+      );
+    },
+    onDelete: (deleted) => {
+      if (!deleted) return;
+      setMessages((prev) =>
+        prev.filter((m) => !(m.telegram_message_id === deleted.telegram_message_id && String(m.group_id) === String(deleted.group_id)))
+      );
+    },
+    onOverflow: () => {
       if (selectedGroup) {
         loadMessages(selectedGroup.id, 1);
       }
-    });
-
-    es.onopen = () => setRealtimeConnected(true);
-    es.onerror = () => {
-      setRealtimeConnected(false);
-      console.warn('[AdminDashboard] SSE connection error — will auto-reconnect');
-    };
-
-    return () => {
-      es.close();
-      setRealtimeConnected(false);
-    };
-  }, [selectedGroup, selectedTopicId]);
+    },
+  });
 
   const loadLiveCrawlerStatus = async () => {
     try {
       const res = await adminApi.getLiveCrawlerStatus();
       setLiveCrawlerStatus(res.data);
+      setLastCrawlerContact(Date.now());
+      setCrawlerConsecutiveFailures(0);
       setCrawlerUnreachable(false);
     } catch (err: any) {
+      console.error('크롤러 상태 로드 실패:', err);
+      setLiveCrawlerStatus(null);
+      setCrawlerConsecutiveFailures(prev => prev + 1);
+
+      // Only show error if persistent (>3 failures, >2 minutes)
+      const timeSinceLastContact = lastCrawlerContact
+        ? (Date.now() - lastCrawlerContact) / 1000
+        : Infinity;
+
       if (err?.response?.status === 503) {
         setCrawlerUnreachable(true);
-        setLiveCrawlerStatus(null);
+
+        if (crawlerConsecutiveFailures >= 3 && timeSinceLastContact > 120) {
+          toast.error(
+            health?.environment === "production"
+              ? "프로덕션 크롤러 연결 실패 (시스템 관리자에게 문의)"
+              : "크롤러 연결 실패 (프로세스가 실행 중인지 확인하세요)"
+          );
+        }
       }
     }
   };
@@ -294,6 +311,7 @@ function AdminDashboardContent() {
     setSelectedGroup(group);
     setMessages([]);
     setPage(1);
+    setSelectedTopicId(null);
   };
 
   const handleLoadMore = () => {
@@ -318,21 +336,6 @@ function AdminDashboardContent() {
 
   const getCrawlerProgressInfo = (group: RegisteredGroup) => {
     return crawlerStatusMap.get(String(group.telegram_id || group.id));
-  };
-
-  const formatDate = (dateString: string) => {
-    const date = new Date(dateString);
-    const today = new Date();
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
-
-    if (date.toDateString() === today.toDateString()) {
-      return '오늘';
-    } else if (date.toDateString() === yesterday.toDateString()) {
-      return '어제';
-    } else {
-      return date.toLocaleDateString('ko-KR', { month: 'long', day: 'numeric' });
-    }
   };
 
   const groupMessagesByDate = (msgs: Message[]) => {
@@ -417,23 +420,27 @@ function AdminDashboardContent() {
               </p>
             </div>
             <div className="flex items-center gap-2 flex-wrap justify-end">
-              {crawlerUnreachable ? (
-                <Badge variant="outline" className="border-orange-500 text-orange-600 text-xs py-0.5">
-                  <Zap className="h-2.5 w-2.5 mr-1" />
-                  크롤러 오류
-                </Badge>
-              ) : liveCrawlerStatus && (
-                <Badge
-                  variant="outline"
-                  className={`text-xs py-0.5 ${liveCrawlerStatus.running && liveCrawlerStatus.connected
-                    ? 'border-green-500 text-green-600'
-                    : 'border-red-500 text-red-600'
-                  }`}
-                >
-                  <Circle className={`h-1.5 w-1.5 mr-1 ${liveCrawlerStatus.running && liveCrawlerStatus.connected ? 'fill-green-500' : 'fill-red-500'}`} />
-                  {liveCrawlerStatus.running && liveCrawlerStatus.connected ? '크롤러 활성' : '비활성'}
+              {/* Environment badge */}
+              {health && (
+                <Badge variant={health.environment === "production" ? "default" : "secondary"} className="text-xs py-0.5">
+                  {health.environment === "production" ? "🟢 프로덕션" : "🔵 로컬 개발"}
                 </Badge>
               )}
+
+              {/* Crawler status badge */}
+              <CrawlerStatusBadge
+                liveCrawlerStatus={liveCrawlerStatus}
+                lastCrawlerContact={lastCrawlerContact}
+                health={health}
+              />
+
+              {/* Helper message for development environment */}
+              {health?.environment === "development" && !liveCrawlerStatus && lastCrawlerContact && (Date.now() - lastCrawlerContact) / 1000 < 30 && (
+                <span className="text-xs text-blue-600">
+                  💡 코드 변경 시 크롤러가 자동으로 재시작됩니다
+                </span>
+              )}
+
               {selectedGroup && (
                 <Badge
                   variant="outline"
@@ -518,8 +525,17 @@ function AdminDashboardContent() {
             <Button
               variant="ghost"
               size="sm"
-              onClick={handleLogout}
+              onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
               className="h-8 px-3 text-xs ml-auto"
+            >
+              {theme === 'dark' ? <Sun className="h-3.5 w-3.5 mr-1.5" /> : <Moon className="h-3.5 w-3.5 mr-1.5" />}
+              {theme === 'dark' ? '라이트' : '다크'}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleLogout}
+              className="h-8 px-3 text-xs"
             >
               <LogOut className="h-3.5 w-3.5 mr-1.5" />
               로그아웃
@@ -530,170 +546,26 @@ function AdminDashboardContent() {
 
       {/* Main Content */}
       {viewMode === 'groups' ? (
-        /* Group Management Panel */
-        <div className="flex-1 overflow-auto p-4">
-          <div className="max-w-4xl mx-auto">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-lg font-bold">그룹 관리</h2>
-              <p className="text-xs text-muted-foreground">{groups.length}개 그룹</p>
-            </div>
-            <div className="border border-border rounded-lg overflow-hidden">
-              <table className="w-full text-sm">
-                <thead className="bg-muted/50">
-                  <tr>
-                    <th className="text-left px-3 py-2 font-medium">그룹명</th>
-                    <th className="text-center px-3 py-2 font-medium w-20">멤버</th>
-                    <th className="text-center px-3 py-2 font-medium w-20">타입</th>
-                    <th className="text-center px-3 py-2 font-medium w-24">크롤링</th>
-                    <th className="text-center px-3 py-2 font-medium w-20">상태</th>
-                    <th className="text-center px-3 py-2 font-medium w-28">액션</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-border">
-                  {groups.map((group) => {
-                    const crawlerStatus = getCrawlerStatus(group);
-                    const isEnabled = group.crawl_enabled !== false;
-                    return (
-                      <tr key={group.id} className="hover:bg-muted/30">
-                        <td className="px-3 py-2">
-                          <div className="font-medium truncate max-w-[200px]">{group.title}</div>
-                          {group.username && (
-                            <span className="text-xs text-muted-foreground">@{group.username}</span>
-                          )}
-                        </td>
-                        <td className="text-center px-3 py-2 text-xs text-muted-foreground">
-                          {group.member_count?.toLocaleString() || '-'}
-                        </td>
-                        <td className="text-center px-3 py-2">
-                          <Badge variant="outline" className="text-[10px]">
-                            {group.group_type === 'channel' ? '채널' : '그룹'}
-                          </Badge>
-                        </td>
-                        <td className="text-center px-3 py-2">
-                          <button
-                            onClick={async () => {
-                              try {
-                                await adminApi.updateGroupCrawl(group.id, !isEnabled);
-                                setGroups(prev => prev.map(g =>
-                                  g.id === group.id ? { ...g, crawl_enabled: !isEnabled } : g
-                                ));
-                                toast.success(isEnabled ? '크롤링 비활성화됨' : '크롤링 활성화됨');
-                              } catch (err) {
-                                toast.error(getApiErrorMessage(err, '설정 변경 실패'));
-                              }
-                            }}
-                            className={`inline-flex items-center gap-1 px-2 py-1 rounded text-xs font-medium transition-colors ${
-                              isEnabled
-                                ? 'bg-green-100 text-green-700 hover:bg-green-200 dark:bg-green-900/30 dark:text-green-400'
-                                : 'bg-gray-100 text-gray-500 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-400'
-                            }`}
-                          >
-                            {isEnabled ? <Power className="h-3 w-3" /> : <PowerOff className="h-3 w-3" />}
-                            {isEnabled ? 'ON' : 'OFF'}
-                          </button>
-                        </td>
-                        <td className="text-center px-3 py-2">
-                          <div className="flex items-center justify-center gap-1">
-                            {crawlerStatus === 'initializing' ? (
-                              <Loader2 className="h-3 w-3 animate-spin text-primary" />
-                            ) : (
-                              <Circle className={`h-2 w-2 ${
-                                crawlerStatus === 'active' ? 'fill-green-500 text-green-500' :
-                                crawlerStatus === 'error' ? 'fill-yellow-500 text-yellow-500' :
-                                'fill-gray-400 text-gray-400'
-                              }`} />
-                            )}
-                            <span className="text-[10px] text-muted-foreground">
-                              {crawlerStatus === 'active' ? '활성' :
-                               crawlerStatus === 'initializing' ? '수집중' :
-                               crawlerStatus === 'error' ? '오류' : '대기'}
-                            </span>
-                          </div>
-                        </td>
-                        <td className="text-center px-3 py-2">
-                          <div className="flex items-center justify-center gap-1">
-                            <button
-                              onClick={() => handleTriggerCrawl(group.id)}
-                              className="p-1 rounded hover:bg-accent text-primary"
-                              title="역사 크롤링"
-                            >
-                              <Download className="h-3.5 w-3.5" />
-                            </button>
-                            <button
-                              onClick={async () => {
-                                if (!confirm(`"${group.title}" 그룹을 삭제하시겠습니까?\n모든 메시지와 데이터가 영구 삭제됩니다.`)) return;
-                                try {
-                                  await adminApi.deleteGroup(group.id);
-                                  setGroups(prev => prev.filter(g => g.id !== group.id));
-                                  if (selectedGroup?.id === group.id) setSelectedGroup(null);
-                                  toast.success(`"${group.title}" 삭제됨`);
-                                } catch (err) {
-                                  toast.error(getApiErrorMessage(err, '삭제 실패'));
-                                }
-                              }}
-                              className="p-1 rounded hover:bg-red-100 text-red-500 dark:hover:bg-red-900/30"
-                              title="그룹 삭제"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
+        <GroupManagementTable
+          groups={groups}
+          selectedGroup={selectedGroup}
+          setSelectedGroup={setSelectedGroup}
+          setGroups={setGroups}
+          getCrawlerStatus={getCrawlerStatus}
+          onTriggerCrawl={handleTriggerCrawl}
+        />
       ) : (
       <div className="flex-1 flex overflow-hidden">
         {/* Left Sidebar: Groups List */}
         <div className="w-full sm:w-80 border-r border-border bg-sidebar flex-shrink-0 flex flex-col overflow-hidden">
-          {/* FIX #3: Telegram Account Tabs */}
-          {connections.length > 0 && (
-            <div className="border-b border-sidebar-border flex-shrink-0">
-              <div className="flex overflow-x-auto px-1 py-1 gap-0.5 no-scrollbar">
-                <button
-                  onClick={() => setActiveConnectionTab(null)}
-                  className={`flex-shrink-0 px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-                    activeConnectionTab === null
-                      ? 'bg-primary text-primary-foreground'
-                      : 'text-muted-foreground hover:bg-accent'
-                  }`}
-                >
-                  전체 ({groups.length})
-                </button>
-                {connections.map((conn) => (
-                  <button
-                    key={conn.id}
-                    onClick={() => setActiveConnectionTab(conn.id)}
-                    className={`flex-shrink-0 px-3 py-1.5 rounded text-xs font-medium transition-colors flex items-center gap-1 ${
-                      activeConnectionTab === conn.id
-                        ? 'bg-primary text-primary-foreground'
-                        : 'text-muted-foreground hover:bg-accent'
-                    }`}
-                  >
-                    <Smartphone className="h-3 w-3" />
-                    {conn.username ? `@${conn.username}` : conn.first_name || conn.phone_masked || '계정'}
-                    <span className="opacity-70">({groupCountByConnection(conn.id)})</span>
-                  </button>
-                ))}
-                {unlinkedGroupCount > 0 && (
-                  <button
-                    onClick={() => setActiveConnectionTab('__unlinked__')}
-                    className={`flex-shrink-0 px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-                      activeConnectionTab === '__unlinked__'
-                        ? 'bg-primary text-primary-foreground'
-                        : 'text-muted-foreground hover:bg-accent'
-                    }`}
-                  >
-                    기타 ({unlinkedGroupCount})
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
+          <ConnectionTabs
+            connections={connections}
+            activeConnectionTab={activeConnectionTab}
+            setActiveConnectionTab={setActiveConnectionTab}
+            totalGroupCount={groups.length}
+            groupCountByConnection={groupCountByConnection}
+            unlinkedGroupCount={unlinkedGroupCount}
+          />
 
           <div className="p-2 border-b border-sidebar-border flex-shrink-0">
             <h2 className="font-bold text-sm">그룹 ({filteredGroups.length})</h2>
@@ -775,6 +647,9 @@ function AdminDashboardContent() {
                       {group.member_count && (
                         <span>{group.member_count.toLocaleString()}명</span>
                       )}
+                      {group.message_count_total != null && (
+                        <span>{(group.message_count_total || 0).toLocaleString()}건</span>
+                      )}
                       {group.username && (
                         <a
                           href={group.invite_link || `https://t.me/${group.username}`}
@@ -801,121 +676,20 @@ function AdminDashboardContent() {
         </div>
 
         {/* Right: Message Viewer */}
-        <div className="flex-1 flex flex-col bg-background overflow-hidden">
-          {selectedGroup ? (
-            <>
-              {/* Chat Header */}
-              <div className="p-2 border-b border-border bg-card flex-shrink-0">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="min-w-0">
-                    <h2 className="font-bold text-sm truncate">{selectedGroup.title}</h2>
-                    {selectedGroup.username && (
-                      <p className="text-xs text-muted-foreground truncate">@{selectedGroup.username}</p>
-                    )}
-                  </div>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => loadMessages(selectedGroup.id, 1)}
-                    disabled={isLoadingMessages}
-                    className="h-7 px-2"
-                    title="새로고침"
-                  >
-                    <RefreshCw className={`h-3 w-3 mr-1 ${isLoadingMessages ? 'animate-spin' : ''}`} />
-                    <span className="text-xs">새로고침</span>
-                  </Button>
-                </div>
-                <div className="mt-1">
-                  <TopicFilter
-                    groupId={selectedGroup.id}
-                    selectedTopicId={selectedTopicId}
-                    onTopicSelect={(topicId: number | null) => {
-                      setSelectedTopicId(topicId);
-                      loadMessages(selectedGroup.id, 1);
-                    }}
-                  />
-                </div>
-              </div>
-
-              {/* Messages Area — FIX #1: min-h-0 for scroll */}
-              <ScrollArea className="flex-1 min-h-0 px-2 py-1" ref={scrollAreaRef}>
-                {isLoadingMessages && page === 1 ? (
-                  <div className="flex items-center justify-center h-full">
-                    <Loader2 className="h-6 w-6 animate-spin text-primary" />
-                  </div>
-                ) : messages.length === 0 ? (
-                  <div className="flex items-center justify-center h-full">
-                    <div className="text-center">
-                      <AlertCircle className="h-10 w-10 mx-auto mb-2 text-muted-foreground" />
-                      <p className="text-sm font-medium">메시지 없음</p>
-                      <p className="text-xs text-muted-foreground">
-                        이 그룹에 메시지가 없습니다
-                      </p>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="space-y-0.5">
-                    {hasMore && (
-                      <div className="text-center py-2">
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={handleLoadMore}
-                          disabled={isLoadingMessages}
-                          className="h-6 text-xs border border-border"
-                        >
-                          {isLoadingMessages ? (
-                            <>
-                              <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                              로딩
-                            </>
-                          ) : (
-                            '이전 메시지'
-                          )}
-                        </Button>
-                      </div>
-                    )}
-
-                    {Object.entries(groupedMessages).map(([dateKey, msgs]) => (
-                      <div key={dateKey}>
-                        <div className="flex items-center justify-center py-2">
-                          <div className="px-2 py-0.5 bg-muted rounded text-xs text-muted-foreground font-medium">
-                            {formatDate(msgs[0].sent_at)}
-                          </div>
-                        </div>
-
-                        <div className="border border-border rounded divide-y divide-border">
-                          {msgs.map((message) => (
-                            <MessageBubble
-                              key={message.id}
-                              message={message}
-                              onReplyClick={(replyId) => {
-                                const element = document.querySelector(`[data-message-id="${replyId}"]`);
-                                element?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                              }}
-                            />
-                          ))}
-                        </div>
-                      </div>
-                    ))}
-
-                    <div ref={messagesEndRef} />
-                  </div>
-                )}
-              </ScrollArea>
-            </>
-          ) : (
-            <div className="flex items-center justify-center h-full">
-              <div className="text-center">
-                <Users className="h-12 w-12 mx-auto mb-2 text-muted-foreground" />
-                <p className="text-sm font-medium">그룹 선택</p>
-                <p className="text-xs text-muted-foreground">
-                  왼쪽에서 그룹을 선택하세요
-                </p>
-              </div>
-            </div>
-          )}
-        </div>
+        <AdminMessageViewer
+          selectedGroup={selectedGroup}
+          messages={messages}
+          isLoadingMessages={isLoadingMessages}
+          page={page}
+          hasMore={hasMore}
+          groupedMessages={groupedMessages}
+          selectedTopicId={selectedTopicId}
+          setSelectedTopicId={setSelectedTopicId}
+          onRefresh={() => selectedGroup && loadMessages(selectedGroup.id, 1)}
+          onLoadMore={handleLoadMore}
+          messagesEndRef={messagesEndRef}
+          scrollAreaRef={scrollAreaRef}
+        />
       </div>
       )}
     </div>

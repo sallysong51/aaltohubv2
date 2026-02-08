@@ -30,6 +30,9 @@ from app.config import settings
 from app.database import db
 from app.live_crawler import live_crawler, CB_RECOVERY_TIMEOUT
 
+# Track crawler process startup time (for restart detection)
+STARTUP_TIMESTAMP = time.time()
+
 # Logging setup (matches main.py pattern)
 if settings.ENVIRONMENT != "development":
     try:
@@ -67,6 +70,37 @@ def _verify_internal_token(credentials: HTTPAuthorizationCredentials = Depends(_
         raise HTTPException(status_code=401, detail="Invalid crawler API token")
 
 
+_AUTO_RECONNECT_INTERVAL = 30  # seconds
+
+
+async def _auto_reconnect_and_start_crawler() -> None:
+    """Background task: retry DB connection and start crawler every 30s while not running."""
+    while True:
+        await asyncio.sleep(_AUTO_RECONNECT_INTERVAL)
+        if live_crawler.running:
+            continue
+        if not db.is_connected:
+            try:
+                ok = await db.try_reconnect()
+                if not ok:
+                    logger.debug("[AUTO-RECONNECT] DB reconnect attempt failed")
+                    continue
+                logger.warning("[AUTO-RECONNECT] Database connection recovered!")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("[AUTO-RECONNECT] Attempt failed: %s", e)
+                continue
+        # DB is connected but crawler is not running — start it
+        try:
+            logger.info("[AUTO-RECONNECT] Starting crawler...")
+            asyncio.create_task(live_crawler.start())
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("[AUTO-RECONNECT] Crawler start failed: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Thread pool for Storage uploads + Telethon sync calls
@@ -74,10 +108,28 @@ async def lifespan(app: FastAPI):
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="crawler-io")
     loop.set_default_executor(executor)
 
-    await db.connect()
-    asyncio.create_task(live_crawler.start())
+    # Connect with retry (matches main.py behavior) — keeps process alive if DB is temporarily down
+    db_ok = await db.connect_with_retry()
+    if db_ok:
+        asyncio.create_task(live_crawler.start())
+    else:
+        logger.critical(
+            "[CRAWLER] Database unreachable after retries — crawler will not start. "
+            "Auto-reconnect will retry every %ds.", _AUTO_RECONNECT_INTERVAL
+        )
+
+    # Always start auto-reconnect (handles DB-down-at-startup and mid-run crashes)
+    reconnect_task = asyncio.create_task(_auto_reconnect_and_start_crawler())
+
     yield
-    await live_crawler.stop()
+
+    reconnect_task.cancel()
+    try:
+        await reconnect_task
+    except asyncio.CancelledError:
+        pass
+    if live_crawler.running:
+        await live_crawler.stop()
     await db.close()
     executor.shutdown(wait=True, cancel_futures=True)
 
@@ -119,12 +171,20 @@ async def health():
     if queue_pct > 80:
         reasons.append(f"queue_{int(queue_pct)}pct")
 
+    # Periodic cleanup of completed manual crawl tasks (prevent memory accumulation)
+    live_crawler._manual_crawl_tasks = {
+        k: v for k, v in live_crawler._manual_crawl_tasks.items() if not v.done()
+    }
+
     ok = len(reasons) == 0
     return JSONResponse(
         status_code=200 if ok else 503,
         content={
             "status": "healthy" if ok else "degraded",
             "reasons": reasons if reasons else None,
+            "environment": settings.ENVIRONMENT,
+            "startup_timestamp": STARTUP_TIMESTAMP,
+            "uptime_seconds": time.time() - STARTUP_TIMESTAMP,
             **status,
         },
     )
@@ -191,18 +251,37 @@ _batch_crawl_task: asyncio.Task | None = None
 
 
 async def _batch_crawl_worker():
-    """Drain the batch crawl queue, processing groups one at a time."""
+    """Drain the batch crawl queue, processing groups one at a time.
+
+    Worker runs until queue is genuinely empty (with grace period).
+    """
     live_crawler._batch_crawl_active = True
+    consecutive_timeouts = 0
     try:
         while True:
             try:
-                gid = await asyncio.wait_for(_batch_crawl_queue.get(), timeout=5.0)
+                gid = await asyncio.wait_for(_batch_crawl_queue.get(), timeout=30.0)
+                consecutive_timeouts = 0  # Reset on successful get
             except asyncio.TimeoutError:
-                # No new items for 5 seconds — worker exits cleanly
-                break
+                # Only exit if queue is truly empty and we've waited enough
+                queue_size = _batch_crawl_queue.qsize()
+                consecutive_timeouts += 1
+
+                if queue_size == 0 and consecutive_timeouts >= 2:
+                    # Queue empty for 60s (2 × 30s), safe to exit
+                    logger.info("[BATCH-CRAWL] Queue empty for 60s, worker exiting")
+                    break
+                else:
+                    logger.warning(
+                        "[BATCH-CRAWL] Timeout waiting for next group "
+                        f"(queue size: {queue_size}, timeouts: {consecutive_timeouts}/2)"
+                    )
+                    continue
+
             if not live_crawler.running:
                 _batch_crawl_queue.task_done()
                 break
+
             try:
                 live_crawler._crawled_groups.discard(gid)
                 title = live_crawler._get_group_title(gid)

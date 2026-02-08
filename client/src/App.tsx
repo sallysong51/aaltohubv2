@@ -6,6 +6,7 @@ import { Route, Switch, Redirect } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider } from "./contexts/ThemeContext";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
+import { BackendConnectivityProvider, useBackendConnectivity } from "./contexts/BackendConnectivityContext";
 import Home from "./pages/Home";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
@@ -86,16 +87,39 @@ function OfflineBanner() {
   );
 }
 
+function BackendBanner() {
+  const { isBackendConnected } = useBackendConnectivity();
+  const [show, setShow] = useState(false);
+
+  useEffect(() => {
+    if (!isBackendConnected) {
+      const timer = setTimeout(() => setShow(true), 3000);
+      return () => clearTimeout(timer);
+    }
+    setShow(false);
+  }, [isBackendConnected]);
+
+  if (!show) return null;
+  return (
+    <div className="fixed top-0 left-0 right-0 z-50 bg-amber-500 text-white text-center py-1 text-sm">
+      백엔드에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.
+    </div>
+  );
+}
+
 function App() {
   return (
     <ErrorBoundary>
       <ThemeProvider defaultTheme="light">
         <AuthProvider>
-          <TooltipProvider>
-            <OfflineBanner />
-            <Toaster />
-            <Router />
-          </TooltipProvider>
+          <BackendConnectivityProvider>
+            <TooltipProvider>
+              <OfflineBanner />
+              <BackendBanner />
+              <Toaster />
+              <Router />
+            </TooltipProvider>
+          </BackendConnectivityProvider>
         </AuthProvider>
       </ThemeProvider>
     </ErrorBoundary>

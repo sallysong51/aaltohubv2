@@ -4,7 +4,8 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "dev": "pnpm run kill-ports && pnpm run dev:backend & pnpm run dev:crawler & pnpm run dev:frontend",
+    "dev": "pnpm run kill-ports && concurrently --kill-others-on-fail -p \"[{name}]\" -n \"backend,crawler,frontend\" -c \"blue,magenta,green\" \"pnpm:dev:backend\" \"pnpm:dev:crawler\" \"pnpm:dev:frontend\"",
+    "dev:resilient": "pnpm run kill-ports && concurrently --restart-tries 3 --restart-after 2000 -p \"[{name}]\" -n \"backend,crawler,frontend\" -c \"blue,magenta,green\" \"pnpm:dev:backend\" \"pnpm:dev:crawler\" \"pnpm:dev:frontend\"",
     "kill-ports": "lsof -ti :3000 -ti :8000 -ti :8001 | xargs kill -9 2>/dev/null; true",
     "dev:frontend": "vite --host",
     "dev:backend": "cd backend && source venv/bin/activate && python scripts/preflight.py && python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app",
@@ -81,6 +82,7 @@
     "@vitejs/plugin-react": "^5.0.4",
     "add": "^2.0.6",
     "autoprefixer": "^10.4.20",
+    "concurrently": "^9.2.1",
     "esbuild": "^0.25.0",
     "pnpm": "^10.15.1",
     "postcss": "^8.4.47",

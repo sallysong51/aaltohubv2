@@ -34,9 +34,6 @@ from telethon.errors import (
 from telethon.tl.types import (
     InputPeerChannel,
     InputPeerChat,
-    MessageMediaPhoto,
-    MessageMediaDocument,
-    MessageMediaWebPage,
     MessageActionChatMigrateTo,
     PeerChannel,
     PeerChat,
@@ -56,6 +53,8 @@ from app.config import settings
 from app.database import db, get_storage_client
 from app.encryption import session_encryption, ENCRYPTION_VERSION
 from app.models import UserRole
+from app.crawler.circuit_breaker import CircuitBreaker, CB_FAILURE_THRESHOLD, CB_FAILURE_WINDOW, CB_RECOVERY_TIMEOUT
+from app.crawler.utils import normalize_chat_id, detect_media_type, select_photo_size
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +74,8 @@ QUEUE_DRAIN_TIMEOUT = 60  # seconds — max wait for queue to drain after histor
 MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB — skip media larger than this
 ENTITY_CACHE_MAX_SIZE = 5000  # max entries before LRU-style eviction
 ENABLED_CACHE_MAX_SIZE = 1000  # max entries before eviction
+MEDIA_CONCURRENCY = 5  # max concurrent media downloads during batch operations
+MEDIA_DOWNLOAD_BATCH = 50  # process media in chunks for progress tracking
 
 
 def _safe_create_task(coro, *, name: str | None = None) -> asyncio.Task:
@@ -91,53 +92,8 @@ def _safe_create_task(coro, *, name: str | None = None) -> asyncio.Task:
     task.add_done_callback(_log_exception)
     return task
 
-# Circuit breaker settings
-CB_FAILURE_THRESHOLD = 5  # failures before opening
-CB_FAILURE_WINDOW = 60  # seconds
-CB_RECOVERY_TIMEOUT = 30  # seconds to wait before retrying
 
-
-class CircuitBreaker:
-    """Simple circuit breaker for DB operations.
-
-    States: closed (normal) → open (paused) → half-open (testing).
-    Opens after CB_FAILURE_THRESHOLD failures within CB_FAILURE_WINDOW seconds.
-    Stays open for CB_RECOVERY_TIMEOUT seconds, then allows one test request.
-
-    Thread safety: This class is NOT thread-safe. It is only accessed from
-    async coroutines on the main event loop (record_success/record_failure
-    are called from _flush_batch and its callers, all in the event loop).
-    Do NOT call from asyncio.to_thread() executor threads.
-    """
-
-    def __init__(self) -> None:
-        self._failures: list[float] = []
-        self._state = "closed"  # closed | open | half-open
-        self._opened_at: float = 0
-
-    @property
-    def is_open(self) -> bool:
-        if self._state == "closed":
-            return False
-        if self._state == "open":
-            if time.monotonic() - self._opened_at >= CB_RECOVERY_TIMEOUT:
-                self._state = "half-open"
-                return False  # allow one attempt
-            return True
-        return False  # half-open allows one attempt
-
-    def record_success(self) -> None:
-        self._state = "closed"
-        self._failures.clear()
-
-    def record_failure(self) -> None:
-        now = time.monotonic()
-        self._failures = [t for t in self._failures if now - t < CB_FAILURE_WINDOW]
-        self._failures.append(now)
-        if len(self._failures) >= CB_FAILURE_THRESHOLD:
-            self._state = "open"
-            self._opened_at = now
-            logger.warning("Circuit breaker OPEN — pausing DB writes for %ds", CB_RECOVERY_TIMEOUT)
+# CircuitBreaker imported from app.crawler.circuit_breaker
 
 
 class LiveCrawlerService:
@@ -177,6 +133,7 @@ class LiveCrawlerService:
         self._entity_cache: dict[int, tuple[int, str, float]] = {}  # gid -> (access_hash, entity_type, last_access_time)
         # Circuit breaker for DB operations
         self._circuit_breaker = CircuitBreaker()
+        self._circuit_breaker_was_open = False
         # Gap-fill task
         self._gap_fill_task: asyncio.Task | None = None
         # File lock to prevent concurrent crawlers
@@ -185,6 +142,8 @@ class LiveCrawlerService:
         self._last_dialogs_fetch: float = 0
         # Semaphore to limit concurrent entity resolution (prevents FloodWaitError storms)
         self._entity_semaphore = asyncio.Semaphore(3)
+        # Semaphore for concurrent media downloads (historical crawl, gap-fill)
+        self._media_semaphore = asyncio.Semaphore(MEDIA_CONCURRENCY)
         # FloodWait penalty tracker: gid -> monotonic time when penalty expires.
         # Groups with active penalties are skipped in gap-fill/historical loops
         # instead of blocking the entire loop.
@@ -206,6 +165,11 @@ class LiveCrawlerService:
         self._auto_join_task: asyncio.Task | None = None
         # Track last auto-join to avoid too frequent attempts
         self._last_auto_join_at: float = 0
+        # Dedup set: prevents the same message being enqueued multiple times
+        # when multiple admin clients receive the same NewMessage event.
+        # Key: (telegram_message_id, group_id) → enqueue timestamp (monotonic)
+        self._enqueue_dedup: dict[tuple[int, int], float] = {}
+        self._enqueue_dedup_last_cleanup: float = 0
         # Background task that waits for an admin session to appear
         self._admin_wait_task: asyncio.Task | None = None
 
@@ -441,9 +405,7 @@ class LiveCrawlerService:
 
             # Start listener tasks (one per admin client)
             for user_id, client in self.clients.items():
-                self._listener_tasks[user_id] = asyncio.create_task(
-                    self._run_listener_with_reconnect(user_id, client)
-                )
+                self._start_listener_task(user_id, client)
 
             # Restore previously crawled groups to avoid re-crawling on restart
             try:
@@ -658,7 +620,18 @@ class LiveCrawlerService:
                 break
 
             if batch:
-                await self._flush_batch(batch)
+                try:
+                    await self._flush_batch(batch)
+                except Exception as e:
+                    logger.error(
+                        "[DB-WRITER] _flush_batch crashed — writing %d messages to dead letter: %s\n%s",
+                        len(batch), e, traceback.format_exc(),
+                    )
+                    for item in batch:
+                        try:
+                            await self._write_to_dead_letter(item.get("data", item), f"flush_batch_crash: {e}")
+                        except Exception:
+                            pass
 
         # Final drain on shutdown
         remaining_items: list[dict] = []
@@ -668,7 +641,15 @@ class LiveCrawlerService:
             except asyncio.QueueEmpty:
                 break
         if remaining_items:
-            await self._flush_batch(remaining_items)
+            try:
+                await self._flush_batch(remaining_items)
+            except Exception as e:
+                logger.error("[DB-WRITER] Final drain flush failed: %s", e)
+                for item in remaining_items:
+                    try:
+                        await self._write_to_dead_letter(item.get("data", item), f"final_drain_crash: {e}")
+                    except Exception:
+                        pass
 
         logger.info("DB writer stopped.")
 
@@ -681,13 +662,8 @@ class LiveCrawlerService:
     )
     async def _db_upsert_batch(self, rows: list[dict], ignore_duplicates: bool = True) -> None:
         """Batch upsert messages via asyncpg executemany."""
-        conflict = "ON CONFLICT (telegram_message_id, group_id) DO NOTHING" if ignore_duplicates else \
-            'ON CONFLICT (telegram_message_id, group_id) DO UPDATE SET "text" = EXCLUDED."text", media_type = EXCLUDED.media_type, media_url = EXCLUDED.media_url, is_edited = TRUE, is_deleted = EXCLUDED.is_deleted'
-        query = f"""INSERT INTO messages
-            (telegram_message_id, group_id, sender_id, sender_name, "text",
-             media_type, media_url, reply_to_message_id, topic_id, is_deleted, sent_at, message_source)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            {conflict}"""
+        from app.queries.messages import message_upsert_sql
+        query = message_upsert_sql(ignore_duplicates)
         args_list = [
             (
                 r.get("telegram_message_id"), r.get("group_id"), r.get("sender_id"),
@@ -707,13 +683,8 @@ class LiveCrawlerService:
     )
     async def _db_upsert_single(self, row: dict, ignore_duplicates: bool = True) -> None:
         """Single message upsert via asyncpg."""
-        conflict = "ON CONFLICT (telegram_message_id, group_id) DO NOTHING" if ignore_duplicates else \
-            'ON CONFLICT (telegram_message_id, group_id) DO UPDATE SET "text" = EXCLUDED."text", media_type = EXCLUDED.media_type, media_url = EXCLUDED.media_url, is_edited = TRUE, is_deleted = EXCLUDED.is_deleted'
-        query = f"""INSERT INTO messages
-            (telegram_message_id, group_id, sender_id, sender_name, "text",
-             media_type, media_url, reply_to_message_id, topic_id, is_deleted, sent_at, message_source)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            {conflict}"""
+        from app.queries.messages import message_upsert_sql
+        query = message_upsert_sql(ignore_duplicates)
         await db.execute(
             query,
             row.get("telegram_message_id"), row.get("group_id"), row.get("sender_id"),
@@ -721,6 +692,19 @@ class LiveCrawlerService:
             row.get("media_url"), row.get("reply_to_message_id"), row.get("topic_id"),
             row.get("is_deleted", False), row.get("sent_at"), row.get("message_source", "realtime"),
         )
+
+    async def _check_cb_recovery(self) -> None:
+        """If circuit breaker was open and just recovered, notify SSE clients to refresh."""
+        if self._circuit_breaker_was_open and not self._circuit_breaker.is_open:
+            self._circuit_breaker_was_open = False
+            logger.info("[CB] Circuit breaker recovered — sending refresh signal to SSE clients")
+            try:
+                await db.execute(
+                    "SELECT pg_notify('new_message', $1)",
+                    json.dumps({"event": "refresh", "payload": {"reason": "circuit_breaker_recovery"}}),
+                )
+            except Exception as e:
+                logger.warning("[CB] Failed to send recovery refresh: %s", e)
 
     async def _broadcast(self, event: str, payload: dict) -> None:
         """Send a Postgres NOTIFY for SSE fan-out by the API process.
@@ -732,18 +716,28 @@ class LiveCrawlerService:
         Postgres NOTIFY payload limit is 8000 bytes — typical messages are
         ~500-1500 bytes, well within the limit.
         """
-        try:
+        notification = json.dumps({"event": event, "payload": payload}, default=str)
+        # Truncate content if notification exceeds Postgres NOTIFY limit (8000 bytes)
+        if len(notification) > 7900:
+            payload = payload.copy()
+            content = payload.get("content", "")
+            if content and len(content) > 200:
+                payload["content"] = content[:200] + "..."
             notification = json.dumps({"event": event, "payload": payload}, default=str)
-            # Truncate content if notification exceeds Postgres NOTIFY limit (8000 bytes)
-            if len(notification) > 7900:
-                payload = payload.copy()
-                content = payload.get("content", "")
-                if content and len(content) > 200:
-                    payload["content"] = content[:200] + "..."
-                notification = json.dumps({"event": event, "payload": payload}, default=str)
-            await db.execute("SELECT pg_notify('new_message', $1)", notification)
-        except Exception as e:
-            logger.warning("NOTIFY failed for event=%s: %s", event, e)
+
+        last_err = None
+        for attempt in range(3):
+            try:
+                await db.execute("SELECT pg_notify('new_message', $1)", notification)
+                return
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    await asyncio.sleep(0.5)
+        logger.error(
+            "NOTIFY failed after 3 attempts for event=%s group=%s msg=%s: %s",
+            event, payload.get("group_id"), payload.get("telegram_message_id"), last_err,
+        )
 
     _DEAD_LETTER_FILE_MAX_BYTES = 50 * 1024 * 1024  # 50 MB cap
 
@@ -760,10 +754,28 @@ class LiveCrawlerService:
         except Exception as e:
             logger.error("Dead letter DB write failed: %s — writing to local file", e)
             try:
+                import sentry_sdk
+                if sentry_sdk.is_initialized():
+                    sentry_sdk.capture_message(
+                        f"Dead letter DB write failed, using file fallback: {e}",
+                        level="warning",
+                    )
+            except Exception:
+                pass
+            try:
                 # Use persistent path (not /tmp which may be private-namespaced by systemd)
                 dl_path = Path(__file__).resolve().parent.parent / "dead-letters.jsonl"
                 if dl_path.exists() and dl_path.stat().st_size > self._DEAD_LETTER_FILE_MAX_BYTES:
-                    logger.error("Dead letter file exceeds %d MB — dropping message", self._DEAD_LETTER_FILE_MAX_BYTES // (1024 * 1024))
+                    logger.error("Dead letter file exceeds %d MB — DROPPING message", self._DEAD_LETTER_FILE_MAX_BYTES // (1024 * 1024))
+                    try:
+                        import sentry_sdk
+                        if sentry_sdk.is_initialized():
+                            sentry_sdk.capture_message(
+                                "Dead letter file full — messages being DROPPED",
+                                level="error",
+                            )
+                    except Exception:
+                        pass
                     return
                 with open(dl_path, "a") as f:
                     f.write(json.dumps({"row": row, "error": str(error)[:500], "ts": time.time()}) + "\n")
@@ -781,6 +793,7 @@ class LiveCrawlerService:
         """
         # Circuit breaker check — send everything to dead letter if open
         if self._circuit_breaker.is_open:
+            self._circuit_breaker_was_open = True
             logger.warning("[CB] Circuit breaker open — sending %d messages to dead letter", len(batch))
             for item in batch:
                 await self._write_to_dead_letter(item["data"], "circuit_breaker_open")
@@ -797,11 +810,25 @@ class LiveCrawlerService:
 
         # --- Handle new messages (batch upsert, ON CONFLICT DO NOTHING) ---
         if inserts:
+            # Deduplicate within batch by (telegram_message_id, group_id)
+            # to prevent broadcasting the same message multiple times
+            seen_keys: set[tuple] = set()
+            unique_inserts = []
+            for item in inserts:
+                key = (item["data"].get("telegram_message_id"), item["data"].get("group_id"))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    unique_inserts.append(item)
+            if len(unique_inserts) < len(inserts):
+                logger.info("[BATCH] Deduplicated %d → %d inserts", len(inserts), len(unique_inserts))
+            inserts = unique_inserts
+
             rows = [item["data"] for item in inserts]
             persisted_items = inserts  # assume all persisted unless batch fails
             try:
                 await self._db_upsert_batch(rows, True)
                 self._circuit_breaker.record_success()
+                await self._check_cb_recovery()
                 logger.info("[BATCH] Upserted %d new messages", len(rows))
             except Exception as e:
                 logger.warning("[BATCH] Bulk upsert failed (%s), falling back to individual", e)
@@ -838,6 +865,10 @@ class LiveCrawlerService:
         if len(batch) > 1:
             logger.info("[BATCH] Flushed %d messages (%d inserts, %d upserts)", len(batch), len(inserts), len(upserts))
 
+    # Static helpers delegated to app.crawler.utils
+    _detect_media_type = staticmethod(detect_media_type)
+    _select_photo_size = staticmethod(select_photo_size)
+
     async def _enqueue_message(
         self,
         message,
@@ -851,36 +882,29 @@ class LiveCrawlerService:
     ) -> None:
         """Prepare message data and put it on the queue for the DB writer."""
         try:
-            media_type = None  # DB enum: photo, video, document, audio, sticker, voice (NULL = text)
+            # --- Dedup guard: skip if same message was recently enqueued ---
+            # This prevents duplicates when multiple admin clients receive
+            # the same Telegram event for a shared group.
+            dedup_key = (message.id, int(group_uuid))
+            now_mono = time.monotonic()
+            if not is_edit and dedup_key in self._enqueue_dedup:
+                logger.debug("Dedup: skipping duplicate enqueue for msg %d in group %s", message.id, group_uuid)
+                return
+            if not is_edit:
+                self._enqueue_dedup[dedup_key] = now_mono
+                # Cleanup: size-based (>500) OR time-based (every 5 min)
+                should_cleanup = (
+                    len(self._enqueue_dedup) > 500
+                    or (now_mono - self._enqueue_dedup_last_cleanup > 300)
+                )
+                if should_cleanup:
+                    cutoff = now_mono - 60
+                    self._enqueue_dedup = {
+                        k: v for k, v in self._enqueue_dedup.items() if v > cutoff
+                    }
+                    self._enqueue_dedup_last_cleanup = now_mono
+            media_type = self._detect_media_type(message)
             media_url = None
-
-            if message.media:
-                if isinstance(message.media, MessageMediaPhoto):
-                    media_type = "photo"
-                elif isinstance(message.media, MessageMediaDocument):
-                    doc = message.media.document
-                    if doc.mime_type:
-                        if doc.mime_type.startswith("video"):
-                            media_type = "video"
-                        elif doc.mime_type.startswith("audio"):
-                            media_type = "audio"
-                        elif "sticker" in doc.mime_type or "webp" in doc.mime_type or "tgsticker" in doc.mime_type:
-                            media_type = "sticker"
-                        elif "ogg" in doc.mime_type:
-                            media_type = "voice"
-                        else:
-                            media_type = "document"
-                    if hasattr(doc, "attributes"):
-                        for attr in doc.attributes:
-                            attr_name = type(attr).__name__
-                            if attr_name == "DocumentAttributeVideo" and getattr(attr, "round_message", False):
-                                media_type = "video"  # DB enum has no video_note
-                            elif attr_name == "DocumentAttributeAudio" and getattr(attr, "voice", False):
-                                media_type = "voice"
-                            elif attr_name == "DocumentAttributeSticker":
-                                media_type = "sticker"
-                elif isinstance(message.media, MessageMediaWebPage):
-                    media_type = None  # WebPage links are just text
 
             if download_media and media_type is not None and client:
                 media_url, _ = await self._upload_media(message, group_uuid, media_type, client)
@@ -899,6 +923,11 @@ class LiveCrawlerService:
                         message.reply_to, "reply_to_msg_id", None
                     )
 
+            # Ensure sent_at is timezone-aware (Telethon may return naive datetime)
+            sent_at = message.date
+            if sent_at and not sent_at.tzinfo:
+                sent_at = sent_at.replace(tzinfo=timezone.utc)
+
             message_data = {
                 "telegram_message_id": message.id,
                 "group_id": int(group_uuid),  # Convert to int - DB expects BIGINT
@@ -910,8 +939,9 @@ class LiveCrawlerService:
                 "reply_to_message_id": message.reply_to_msg_id,
                 "topic_id": topic_id,
                 "is_deleted": False,
-                "sent_at": message.date,
+                "sent_at": sent_at,
                 "message_source": message_source,
+                "created_at": datetime.now(timezone.utc),
             }
 
             if is_edit:
@@ -1046,17 +1076,8 @@ class LiveCrawlerService:
         info = self.group_info_map.get(gid, {})
         return info.get("title") or info.get("name") or str(gid)
 
-    @staticmethod
-    def _normalize_chat_id(chat_id: int) -> int:
-        """Convert Telethon's negative chat_id to the bare positive ID stored in our DB."""
-        if chat_id is None:
-            return 0
-        if chat_id < 0:
-            s = str(chat_id)
-            if s.startswith("-100"):
-                return int(s[4:])
-            return -chat_id
-        return chat_id
+    # _normalize_chat_id imported from app.crawler.utils
+    _normalize_chat_id = staticmethod(normalize_chat_id)
 
     # ------------------------------------------------------------------
     # Entity cache — avoids repeated get_entity() / get_dialogs() API calls
@@ -1313,7 +1334,11 @@ class LiveCrawlerService:
                             break
                         iterated += 1
                         if message.text or message.media:
-                            await self._enqueue_message(message, gid, group_uuid, client=working_client, broadcast=False, message_source="gap_fill")
+                            await self._enqueue_message(
+                                message, gid, group_uuid,
+                                download_media=True, client=working_client,
+                                broadcast=False, message_source="gap_fill",
+                            )
                             count += 1
                         if count >= GAP_FILL_MAX_MESSAGES:
                             break
@@ -1361,22 +1386,8 @@ class LiveCrawlerService:
                     logger.info("Skipping historical crawl for group %s — FloodWait penalty active", gid)
                     continue
                 group_uuid = self.group_id_map[gid]
-                try:
-                    existing_count = await db.fetchval(
-                        "SELECT COUNT(*) FROM messages WHERE group_id = $1 AND is_deleted = FALSE",
-                        int(group_uuid),
-                    ) or 0
-                    if existing_count > 50:
-                        logger.info(
-                            "Group %s already has %d messages, skipping historical crawl",
-                            self._get_group_title(gid), existing_count
-                        )
-                        self._crawled_groups.add(gid)
-                        await self._update_crawler_status(group_uuid, "active")
-                        continue
-                except Exception:
-                    pass
-
+                # Directly proceed to crawl (no 50-message check)
+                # Crawler handles duplicates via ON CONFLICT DO NOTHING
                 await self._crawl_historical_for_group(gid)
 
             # --- Pass 2: retry FloodWait-skipped groups ---
@@ -1501,6 +1512,7 @@ class LiveCrawlerService:
 
             enqueued_count = 0
             iterated_count = 0  # Count ALL messages (including empty) for accurate rate limiting
+            media_pending: list[tuple] = []  # (message, media_type) — collected for batch download
 
             async def _do_historical_iteration():
                 """Inner iteration — wrapped with timeout to prevent hanging."""
@@ -1514,8 +1526,13 @@ class LiveCrawlerService:
                             await self._enqueue_message(message, gid, group_uuid, client=working_client, broadcast=False, message_source="crawled")
                             enqueued_count += 1
 
+                            # Collect media messages for parallel batch download after text ingestion
+                            media_type = self._detect_media_type(message)
+                            if media_type:
+                                media_pending.append((message, media_type))
+
                             if enqueued_count % 100 == 0:
-                                logger.info("  [%s] %d messages enqueued...", title, enqueued_count)
+                                logger.info("  [%s] %d messages enqueued (%d with media)...", title, enqueued_count, len(media_pending))
                                 await self._update_crawler_status(
                                     group_uuid, "initializing",
                                     progress=enqueued_count, total=estimated_total
@@ -1558,6 +1575,22 @@ class LiveCrawlerService:
                     drained = False
                     break
                 await asyncio.sleep(0.5)
+
+            # --- Phase 2: Parallel media download for collected media messages ---
+            media_downloaded = 0
+            if drained and media_pending and self.running:
+                logger.info("  [%s] Starting parallel media download: %d items (concurrency=%d)",
+                            title, len(media_pending), MEDIA_CONCURRENCY)
+                try:
+                    media_downloaded = await asyncio.wait_for(
+                        self._download_media_parallel(media_pending, group_uuid, working_client),
+                        timeout=300,  # 5 min max for media downloads
+                    )
+                    logger.info("  [%s] Media download complete: %d/%d successful", title, media_downloaded, len(media_pending))
+                except asyncio.TimeoutError:
+                    logger.warning("  [%s] Media download timeout (5min) — %d items were pending", title, len(media_pending))
+                except Exception as e:
+                    logger.warning("  [%s] Media download error: %s", title, e)
 
             if drained:
                 await self._update_crawler_status(
@@ -1918,15 +1951,53 @@ class LiveCrawlerService:
                 continue
 
     # ------------------------------------------------------------------
-    # Listener watchdog — detect and recover from all-listeners-dead
+    # Listener task management — start, restart, and watchdog
     # ------------------------------------------------------------------
 
-    async def _listener_watchdog(self) -> None:
-        """Periodically check listener health and restart dead ones.
+    def _start_listener_task(self, user_id: int, client: TelegramClient) -> None:
+        """Start a listener task with a done callback for immediate restart."""
+        task = asyncio.create_task(
+            self._run_listener_with_reconnect(user_id, client)
+        )
+        task.add_done_callback(lambda t, uid=user_id: self._on_listener_done(uid, t))
+        self._listener_tasks[user_id] = task
 
-        Restarts INDIVIDUAL dead listeners (not just when ALL are dead),
-        so a single admin's connection drop doesn't cause permanent event loss
-        for that admin's groups.
+    def _on_listener_done(self, user_id: int, task: asyncio.Task) -> None:
+        """Immediate restart when a listener exits — don't wait for 60s watchdog cycle."""
+        if not self.running:
+            return
+        if task.cancelled():
+            return
+        logger.warning("Listener for user_id=%s exited — scheduling immediate restart", user_id)
+        asyncio.get_event_loop().call_soon(
+            lambda: asyncio.create_task(self._restart_single_listener(user_id))
+        )
+
+    async def _restart_single_listener(self, user_id: int) -> None:
+        """Reconnect a single admin client and restart its listener task."""
+        if not self.running:
+            return
+        client = self.clients.get(user_id)
+        if not client:
+            return
+        try:
+            if not client.is_connected():
+                await asyncio.wait_for(client.connect(), timeout=10)
+                me = await client.get_me()
+                if not me:
+                    logger.error("Reconnect auth failed for user_id=%s", user_id)
+                    return
+            self._start_listener_task(user_id, client)
+            logger.info("Restarted listener for user_id=%s", user_id)
+        except Exception as e:
+            logger.error("Failed to restart listener for user_id=%s: %s", user_id, e)
+
+    async def _listener_watchdog(self) -> None:
+        """Periodic fallback check for listener health.
+
+        The primary restart mechanism is _on_listener_done (immediate callback).
+        This watchdog is a safety net that catches edge cases where the callback
+        might not fire (e.g., task stuck, callback exception).
         """
         while self.running:
             await asyncio.sleep(60)
@@ -1951,22 +2022,7 @@ class LiveCrawlerService:
                     len(dead_user_ids), total, severity, dead_user_ids,
                 )
                 for user_id in dead_user_ids:
-                    client = self.clients.get(user_id)
-                    if not client:
-                        continue
-                    try:
-                        if not client.is_connected():
-                            await asyncio.wait_for(client.connect(), timeout=10)
-                            me = await client.get_me()
-                            if not me:
-                                logger.error("WATCHDOG: Reconnect auth failed for user_id=%s", user_id)
-                                continue
-                        self._listener_tasks[user_id] = asyncio.create_task(
-                            self._run_listener_with_reconnect(user_id, client)
-                        )
-                        logger.info("WATCHDOG: Restarted listener for user_id=%s", user_id)
-                    except Exception as e:
-                        logger.error("WATCHDOG: Failed to restart listener for user_id=%s: %s", user_id, e)
+                    await self._restart_single_listener(user_id)
 
     # ------------------------------------------------------------------
     # Listener with auto-reconnect
@@ -2011,20 +2067,83 @@ class LiveCrawlerService:
                 logger.error("Live crawler [user_id=%s]: Reconnect failed: %s", user_id, e)
 
     # ------------------------------------------------------------------
+    # Concurrent media download pipeline (for historical crawl / gap-fill)
+    # ------------------------------------------------------------------
+
+    async def _download_single_media(self, message, media_type: str, group_uuid: str, client: TelegramClient) -> bool:
+        """Download a single media file with semaphore control, then UPDATE DB."""
+        async with self._media_semaphore:
+            media_url, _ = await self._upload_media(message, group_uuid, media_type, client)
+            if media_url:
+                try:
+                    await db.execute(
+                        'UPDATE messages SET media_url = $1 WHERE telegram_message_id = $2 AND group_id = $3',
+                        media_url, message.id, int(group_uuid),
+                    )
+                    return True
+                except Exception as e:
+                    logger.warning("Failed to update media_url for msg %d: %s", message.id, e)
+            return False
+
+    async def _download_media_parallel(
+        self,
+        media_items: list[tuple],  # [(message, media_type), ...]
+        group_uuid: str,
+        client: TelegramClient,
+    ) -> int:
+        """Download and upload media for multiple messages concurrently.
+
+        Processes in chunks of MEDIA_DOWNLOAD_BATCH to limit memory usage
+        and provide progress logging. Concurrent downloads limited by _media_semaphore.
+        """
+        total = len(media_items)
+        downloaded = 0
+
+        for i in range(0, total, MEDIA_DOWNLOAD_BATCH):
+            chunk = media_items[i:i + MEDIA_DOWNLOAD_BATCH]
+            if not self.running:
+                break
+
+            results = await asyncio.gather(
+                *[self._download_single_media(msg, mtype, group_uuid, client) for msg, mtype in chunk],
+                return_exceptions=True,
+            )
+            downloaded += sum(1 for r in results if r is True)
+
+            if i + MEDIA_DOWNLOAD_BATCH < total:
+                logger.info("  Media progress: %d/%d downloaded (%d successful)", i + len(chunk), total, downloaded)
+
+        return downloaded
+
+    # ------------------------------------------------------------------
     # Media upload
     # ------------------------------------------------------------------
 
     MEDIA_DOWNLOAD_TIMEOUT = 30  # seconds — max time for downloading a single media file
 
     async def _upload_media(self, message, group_uuid: str, media_type: str, client: TelegramClient) -> tuple[str | None, str | None]:
-        """Download media from Telegram and upload to Supabase Storage."""
+        """Download media from Telegram and upload to Supabase Storage.
+
+        Returns (media_url, None). For photos, downloads an optimized size (800px)
+        instead of full resolution. For other types, downloads the thumbnail.
+        Uses x-upsert to handle re-crawl of already-uploaded media gracefully.
+        """
         try:
             buffer = io.BytesIO()
             if media_type == "photo":
-                await asyncio.wait_for(
-                    client.download_media(message, buffer),
-                    timeout=self.MEDIA_DOWNLOAD_TIMEOUT,
-                )
+                # Optimize: select 800px photo size instead of full resolution
+                # Frontend displays at max-w-xs (320px), 800px is ideal for retina
+                thumb = self._select_photo_size(message.media.photo) if hasattr(message.media, 'photo') else None
+                if thumb:
+                    await asyncio.wait_for(
+                        client.download_media(message.media, buffer, thumb=thumb),
+                        timeout=self.MEDIA_DOWNLOAD_TIMEOUT,
+                    )
+                else:
+                    await asyncio.wait_for(
+                        client.download_media(message, buffer),
+                        timeout=self.MEDIA_DOWNLOAD_TIMEOUT,
+                    )
                 content_type = "image/jpeg"
             else:
                 if hasattr(message.media, "document") and message.media.document:
@@ -2056,22 +2175,29 @@ class LiveCrawlerService:
             await asyncio.wait_for(
                 asyncio.to_thread(
                     lambda: storage.storage.from_("message-media").upload(
-                        file_path, file_bytes, {"content-type": content_type}
+                        file_path, file_bytes, {"content-type": content_type, "x-upsert": "true"}
                     )
                 ),
                 timeout=30.0,
             )
             public_url = storage.storage.from_("message-media").get_public_url(file_path)
-
-            if media_type == "photo":
-                return public_url, None
-            else:
-                return None, public_url
+            # Always return URL in first position (media_url) for all media types
+            return public_url, None
         except asyncio.TimeoutError:
             logger.warning("Media download/upload timeout for msg %d (limit=%ds)", message.id, self.MEDIA_DOWNLOAD_TIMEOUT)
             return None, None
         except Exception as e:
-            if "not found" not in str(e).lower() and "bucket" not in str(e).lower():
+            err_str = str(e).lower()
+            # Handle "already exists" gracefully — return existing URL
+            if "already exists" in err_str or "duplicate" in err_str:
+                try:
+                    storage = self._storage_client or get_storage_client()
+                    file_path = f"{group_uuid}/{message.id}.jpg"
+                    public_url = storage.storage.from_("message-media").get_public_url(file_path)
+                    return public_url, None
+                except Exception:
+                    pass
+            if "not found" not in err_str and "bucket" not in err_str:
                 logger.warning("Media upload failed for msg %d: %s", message.id, e)
             return None, None
 

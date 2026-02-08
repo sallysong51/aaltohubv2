@@ -83,10 +83,34 @@ async def heartbeat_log() -> None:
             db_status = "ok" if db.is_connected else "down"
             sse_status = "ok" if sse_manager.is_connected else "down"
             tg_status = "ok" if (telegram_manager._warm_client and telegram_manager._warm_client.is_connected()) else "cold"
+
+            # Crawler health (with timeout to avoid blocking heartbeat)
+            crawler_status = "N/A"
+            try:
+                crawler_health = await asyncio.wait_for(
+                    crawler_client.get_crawler_health(), timeout=3.0
+                )
+                # CrawlerHealth is now a dataclass with status field
+                crawler_status = crawler_health.status
+            except (asyncio.TimeoutError, Exception):
+                crawler_status = "timeout"
+
             logger.info(
-                "[HEARTBEAT] db=%s sse=%s telegram=%s",
-                db_status, sse_status, tg_status,
+                "[HEARTBEAT] db=%s sse=%s telegram=%s crawler=%s",
+                db_status, sse_status, tg_status, crawler_status,
             )
+
+            # Dead letter file check
+            try:
+                from pathlib import Path
+                dl_path = Path(__file__).resolve().parent.parent / "dead-letters.jsonl"
+                if dl_path.exists():
+                    dl_size_mb = dl_path.stat().st_size / (1024 * 1024)
+                    if dl_size_mb > 1:
+                        logger.warning("[HEARTBEAT] Dead letter file: %.1f MB", dl_size_mb)
+            except Exception:
+                pass
+
         except Exception as e:
             logger.warning("[HEARTBEAT] Error collecting status: %s", e)
 
@@ -323,7 +347,12 @@ _DEGRADED_EXEMPT = {"/health", "/metrics", "/"}
 
 class DegradedModeMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next) -> StarletteResponse:
-        if not db.is_connected and request.url.path.startswith("/api"):
+        path = request.url.path
+        if (
+            not db.is_connected
+            and path.startswith("/api")
+            and not path.startswith("/api/events/stream")
+        ):
             return JSONResponse(
                 status_code=503,
                 content={"detail": "서비스가 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해주세요."},
@@ -395,21 +424,38 @@ async def health_check():
         except Exception:
             pass
 
-    crawler_health = await crawler_client.get_crawler_health()
-    crawler_running = crawler_health.get("running", False) if crawler_health else False
-    queue_size = crawler_health.get("queue_size", 0) if crawler_health else 0
+    # Timeout prevents health check from hanging if crawler process is unresponsive
+    try:
+        crawler_health = await asyncio.wait_for(
+            crawler_client.get_crawler_health(), timeout=3.0
+        )
+    except (asyncio.TimeoutError, Exception) as e:
+        logger.debug("Health check: crawler health timed out: %s", e)
+        crawler_health = crawler_client.CrawlerHealth(
+            status="unreachable",
+            message="Health check timeout",
+        )
+
+    # Extract queue info from crawler details if available
+    crawler_running = crawler_health.status in ("healthy", "degraded", "restarting")
+    queue_size = crawler_health.details.get("queue_size", 0) if crawler_health.details else 0
     queue_healthy = queue_size < 8000  # 80% of 10K capacity
 
     sse_ok = sse_manager.is_connected
 
-    all_ok = db_ok and crawler_running and queue_healthy and sse_ok
+    all_ok = db_ok and crawler_health.status == "healthy" and queue_healthy and sse_ok
     status_code = 200 if all_ok else 503
     return JSONResponse(
         status_code=status_code,
         content={
             "status": "healthy" if all_ok else "degraded",
-            "database": "connected" if db_ok else "unreachable",
-            "crawler": "running" if crawler_running else ("unreachable" if crawler_health is None else "stopped"),
+            "database_connected": db_ok,
+            "environment": settings.ENVIRONMENT,
+            "crawler": {
+                "status": crawler_health.status,
+                "message": crawler_health.message,
+                "last_checked": crawler_health.timestamp,
+            },
             "queue_healthy": queue_healthy,
             "sse_listener": "connected" if sse_ok else "disconnected",
         },
@@ -417,8 +463,17 @@ async def health_check():
 
 
 @app.get("/metrics")
-async def prometheus_metrics():
-    """Prometheus-compatible metrics endpoint."""
+async def prometheus_metrics(request: StarletteRequest):
+    """Prometheus-compatible metrics endpoint.
+    Protected by bearer token in production (reuses CRAWLER_API_SECRET)."""
+    import hmac
+    if settings.ENVIRONMENT != "development":
+        auth = request.headers.get("authorization", "")
+        if not auth.startswith("Bearer ") or not hmac.compare_digest(
+            auth[7:], settings.crawler_api_secret
+        ):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
     from fastapi.responses import PlainTextResponse
 
     # Sync live values from the crawler before rendering

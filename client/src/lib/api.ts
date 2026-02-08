@@ -65,18 +65,56 @@ apiClient.interceptors.request.use(
   }
 );
 
+// Backend reachability flag — set by BackendConnectivityContext to skip
+// retries when the backend is known to be unreachable.
+let _isBackendReachable = true;
+export function setBackendReachable(reachable: boolean) {
+  _isBackendReachable = reachable;
+}
+
+// Retry configuration for transient failures
+const MAX_RETRIES = 3;
+const INITIAL_RETRY_DELAY = 1000;
+const RETRY_BACKOFF = 2;
+const MAX_RETRY_DELAY = 8000; // Cap to prevent excessively long waits
+const RETRYABLE_STATUSES = new Set([502, 503, 504]);
+
 // Token refresh mutex — prevents concurrent 401 responses from each
 // independently refreshing the token (which would invalidate the first
 // refresh and force-logout the user).
 let refreshPromise: Promise<string> | null = null;
 
-// Response interceptor to handle network errors and token refresh
+// Response interceptor to handle retries, network errors, and token refresh
 apiClient.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    // Any successful response confirms backend is reachable — reset flag immediately
+    // so retries resume without waiting for the next health check poll cycle.
+    if (!_isBackendReachable) _isBackendReachable = true;
+    return response;
+  },
   async (error: AxiosError) => {
+    const config = error.config as typeof error.config & {
+      _retry?: boolean;
+      _retryCount?: number;
+    };
+
+    // --- Auto-retry for transient failures ---
+    const isNetworkError = !error.response;
+    const isRetryableStatus = error.response && RETRYABLE_STATUSES.has(error.response.status);
+    const isSafeMethod = config?.method?.toUpperCase() !== 'POST';
+    const retryCount = config?._retryCount ?? 0;
+
+    if ((isNetworkError || isRetryableStatus) && isSafeMethod && _isBackendReachable && config && retryCount < MAX_RETRIES) {
+      config._retryCount = retryCount + 1;
+      const delay = Math.min(INITIAL_RETRY_DELAY * Math.pow(RETRY_BACKOFF, config._retryCount - 1), MAX_RETRY_DELAY);
+      console.warn(`[API] Retry ${config._retryCount}/${MAX_RETRIES} for ${config.method?.toUpperCase()} ${config.url} in ${delay}ms`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return apiClient(config);
+    }
+
     // Network error (backend unreachable) — no response at all
     if (!error.response) {
-      const networkError: Error & { isNetworkError?: boolean } = new Error('Backend server is not reachable. Please make sure the backend is running.');
+      const networkError: Error & { isNetworkError?: boolean } = new Error('서버에 연결할 수 없습니다. 백엔드가 실행 중인지 확인하세요.');
       networkError.isNetworkError = true;
       return Promise.reject(networkError);
     }
@@ -272,6 +310,7 @@ export interface RegisteredGroup {
   registered_by?: string;
   connection_id?: string;
   crawl_enabled?: boolean;
+  message_count_total?: number;
   created_at: string;
 }
 
@@ -280,6 +319,7 @@ export interface RegisterGroupsRequest {
     telegram_id: number;
     title: string;
     username?: string;
+    invite_link?: string;
     member_count?: number;
     group_type?: string;
     visibility: 'public' | 'private';
@@ -411,6 +451,16 @@ export const groupsApi = {
       },
     }),
 
+  searchMessages: (query: string, groupIds?: string[], page: number = 1, pageSize: number = 50) =>
+    apiClient.get<MessagesListResponse>('/groups/messages/search', {
+      params: {
+        q: query,
+        ...(groupIds && groupIds.length > 0 ? { group_ids: groupIds.join(',') } : {}),
+        page,
+        page_size: pageSize,
+      },
+    }),
+
   getGroup: (groupId: string) =>
     apiClient.get<RegisteredGroup>(`/groups/${groupId}`),
 
@@ -451,6 +501,53 @@ export interface AdminStats {
   total_public_groups: number;
   total_messages: number;
   messages_last_24h: number;
+}
+
+export type CrawlerHealthStatus =
+  | "healthy"
+  | "degraded"
+  | "restarting"
+  | "unreachable"
+  | "stopped";
+
+export interface LiveCrawlerStatus {
+  running: boolean;
+  connected: boolean;
+  active_groups: number;
+  total_groups: number;
+  listening_to: string[];
+  db_connected: boolean;
+  total_messages_received: number;
+  total_messages_written: number;
+  dead_letter_count: number;
+  historical_crawl_running: boolean;
+  crawled_groups: number;
+  uptime_seconds: number;
+  currently_crawling_group_id?: number | null;
+  currently_crawling_group_title?: string | null;
+  seconds_since_last_event?: number | null;
+  start_error?: string | null;
+  circuit_breaker: {
+    state: "closed" | "open";
+    failure_count: number;
+    next_retry_at: string | null;
+  };
+  health_status: CrawlerHealthStatus;
+  health_message: string;
+  environment: string;
+}
+
+export interface BackendHealth {
+  status: string;
+  database_connected: boolean;
+  environment: string;
+  crawler: {
+    status: CrawlerHealthStatus;
+    message: string;
+    last_checked: number;
+  };
+  queue_healthy: boolean;
+  sse_listener: string;
 }
 
 export const adminApi = {
@@ -523,6 +620,19 @@ export const adminApi = {
 
   deleteGroup: (groupId: string) =>
     apiClient.delete(`/admin/groups/${groupId}`),
+
+  backfillConnectionIds: () =>
+    apiClient.post<{
+      success: boolean;
+      updated: number;
+      connection_id?: string;
+      connection_username?: string;
+      connection_display_name?: string;
+      message?: string;
+      connection_count?: number;
+    }>(
+      '/admin/backfill-connection-ids'
+    ),
 };
 
 // ============================================================

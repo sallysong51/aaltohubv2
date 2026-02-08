@@ -7,6 +7,7 @@ passed as a query parameter (EventSource does not support custom headers).
 import asyncio
 import json
 import logging
+import time
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -21,6 +22,9 @@ router = APIRouter(tags=["events"])
 
 # SSE keepalive interval — prevents proxies/browsers from closing idle connections
 _KEEPALIVE_INTERVAL = 30  # seconds
+# Max connection duration — prevents zombie TCP connections from accumulating.
+# Frontend useSSE hook auto-reconnects after server-initiated close.
+_MAX_CONNECTION_SECONDS = 7200  # 2 hours
 
 
 @router.get("/events/stream")
@@ -75,10 +79,16 @@ async def event_stream(request: Request, token: str, groups: str):
     queue = sse_manager.subscribe(group_ids)
 
     async def generate():
+        started = time.monotonic()
         try:
             while True:
                 # Check if client disconnected
                 if await request.is_disconnected():
+                    break
+                # Force reconnect after max duration to prevent zombie connections.
+                # Frontend useSSE hook will auto-reconnect seamlessly.
+                if time.monotonic() - started > _MAX_CONNECTION_SECONDS:
+                    yield "event: reconnect\ndata: {}\n\n"
                     break
                 try:
                     data = await asyncio.wait_for(queue.get(), timeout=_KEEPALIVE_INTERVAL)

@@ -198,7 +198,34 @@ class SSEManager:
             logger.warning("SSE: invalid NOTIFY payload: %s", e)
             return
 
-        group_id = str(data.get("payload", {}).get("group_id", ""))
+        # Guard: entire fan-out logic in try/except to prevent exceptions from
+        # propagating into asyncpg's internal notification handler, which would
+        # corrupt the LISTEN connection and silently kill all SSE events.
+        try:
+            event_type = data.get("event")
+        except (AttributeError, TypeError):
+            logger.warning("SSE: malformed NOTIFY data structure: %s", type(data).__name__)
+            return
+
+        # Broadcast refresh event to ALL subscribers (circuit breaker recovery, etc.)
+        if event_type == "refresh":
+            all_queues: set[asyncio.Queue] = set()
+            for subscriber_set in self._subscribers.values():
+                all_queues.update(subscriber_set)
+            for queue in all_queues:
+                try:
+                    queue.put_nowait(data)
+                except asyncio.QueueFull:
+                    pass
+            logger.info("SSE: broadcast refresh event to %d client(s)", len(all_queues))
+            return
+
+        try:
+            group_id = str(data.get("payload", {}).get("group_id", ""))
+        except (AttributeError, TypeError):
+            logger.warning("SSE: malformed NOTIFY payload structure: %s", type(data).__name__)
+            return
+
         if not group_id:
             return
 
@@ -220,7 +247,7 @@ class SSEManager:
                 except (asyncio.QueueEmpty, asyncio.QueueFull):
                     pass
         if dropped:
-            logger.debug("SSE: dropped events for %d slow client(s) on group %s", dropped, group_id)
+            logger.warning("SSE: dropped events for %d slow client(s) on group %s", dropped, group_id)
 
     def subscribe(self, group_ids: list[str]) -> asyncio.Queue:
         """Register a new SSE client. Returns a queue to read events from."""
