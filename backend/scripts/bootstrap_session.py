@@ -6,10 +6,17 @@ Performs headless Telegram authentication on the server and stores the
 encrypted session directly in the database. The crawler will auto-detect
 the new session within 60 seconds (or restart it manually).
 
-Usage:
+Usage (interactive):
     cd backend && source venv/bin/activate
     python scripts/bootstrap_session.py --phone +358449598622
-    python scripts/bootstrap_session.py --phone +358449598622 --force   # overwrite existing
+
+Usage (non-interactive, e.g. via SSH):
+    # Step 1: Send code (will fail at input, but code is sent to Telegram)
+    python scripts/bootstrap_session.py --phone +358449598622 --send-code
+    # Step 2: Enter the code received
+    python scripts/bootstrap_session.py --phone +358449598622 --code 12345
+    # If 2FA is enabled:
+    python scripts/bootstrap_session.py --phone +358449598622 --code 12345 --password YOUR2FA
 """
 import argparse
 import asyncio
@@ -35,7 +42,7 @@ from app.config import settings
 from app.encryption import session_encryption, ENCRYPTION_VERSION
 
 
-async def main(phone: str, force: bool = False) -> None:
+async def main(phone: str, force: bool = False, code: str = None, password: str = None, send_code_only: bool = False) -> None:
     if not phone.startswith("+"):
         print("ERROR: Phone must include country code (e.g. +358449598622)")
         sys.exit(1)
@@ -65,10 +72,14 @@ async def main(phone: str, force: bool = False) -> None:
             if session_row and not force:
                 name = existing_user.get("first_name") or existing_user.get("username") or "?"
                 print(f"Session already exists for {name} (user_id={existing_user['id']}).")
-                confirm = input("Overwrite? [y/N]: ").strip().lower()
-                if confirm != "y":
-                    print("Aborted.")
-                    return
+                if code:
+                    # Non-interactive mode: auto-overwrite
+                    print("Non-interactive mode: overwriting existing session.")
+                else:
+                    confirm = input("Overwrite? [y/N]: ").strip().lower()
+                    if confirm != "y":
+                        print("Aborted.")
+                        return
 
         # --- Telegram authentication ---
         print(f"\nAuthenticating with Telegram for {phone}...")
@@ -83,6 +94,7 @@ async def main(phone: str, force: bool = False) -> None:
 
         try:
             sent = await client.send_code_request(phone)
+            print(f"Code sent to Telegram app (phone_code_hash: {sent.phone_code_hash[:8]}...)")
         except PhoneNumberInvalidError:
             print("ERROR: Invalid phone number format.")
             await client.disconnect()
@@ -96,12 +108,20 @@ async def main(phone: str, force: bool = False) -> None:
             await client.disconnect()
             return
 
-        code = input("Enter the code from Telegram: ").strip()
+        if send_code_only:
+            print("\n--send-code mode: Code has been sent to your Telegram app.")
+            print(f"Now run again with: --code <THE_CODE>")
+            await client.disconnect()
+            return
+
+        if not code:
+            code = input("Enter the code from Telegram: ").strip()
 
         try:
             await client.sign_in(phone, code, phone_code_hash=sent.phone_code_hash)
         except SessionPasswordNeededError:
-            password = getpass.getpass("2FA password required: ")
+            if not password:
+                password = getpass.getpass("2FA password required: ")
             await client.sign_in(password=password)
         except PhoneCodeInvalidError:
             print("ERROR: Invalid code.")
@@ -175,6 +195,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Bootstrap a Telegram session for the crawler")
     parser.add_argument("--phone", required=True, help="Phone number with country code (e.g. +358449598622)")
     parser.add_argument("--force", action="store_true", help="Overwrite existing session without prompting")
+    parser.add_argument("--code", type=str, default=None, help="Telegram verification code (for non-interactive use)")
+    parser.add_argument("--password", type=str, default=None, help="2FA password (for non-interactive use)")
+    parser.add_argument("--send-code", action="store_true", dest="send_code", help="Only send the code, then exit")
     args = parser.parse_args()
 
-    asyncio.run(main(args.phone, args.force))
+    asyncio.run(main(args.phone, args.force, args.code, args.password, args.send_code))
