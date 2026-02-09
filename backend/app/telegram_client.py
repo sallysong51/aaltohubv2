@@ -583,8 +583,16 @@ class TelegramClientManager:
                         "username": getattr(entity, 'username', None),
                         "member_count": getattr(entity, 'participants_count', None),
                         "group_type": group_type,
+                        "has_topics": getattr(entity, 'forum', False),  # NEW: Extract forum flag
                     }
                     groups.append(group_info)
+                else:
+                    # Log skipped entities for diagnostics
+                    entity_type = type(entity).__name__
+                    logger.debug(
+                        "Skipped non-group entity in get_user_groups: type=%s, id=%s, title=%s",
+                        entity_type, getattr(entity, 'id', None), getattr(entity, 'title', 'N/A')
+                    )
 
             return groups
         except asyncio.TimeoutError:

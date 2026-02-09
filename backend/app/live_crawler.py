@@ -932,9 +932,16 @@ class LiveCrawlerService:
             topic_id = None
             if hasattr(message, "reply_to") and message.reply_to:
                 if hasattr(message.reply_to, "forum_topic") and message.reply_to.forum_topic:
-                    topic_id = getattr(message.reply_to, "reply_to_top_id", None) or getattr(
-                        message.reply_to, "reply_to_msg_id", None
-                    )
+                    # Only use reply_to_top_id (canonical field for forum topics)
+                    # Do NOT fallback to reply_to_msg_id (that's for regular replies)
+                    topic_id = getattr(message.reply_to, "reply_to_top_id", None)
+
+                    # If still None, log for diagnostics (may be root message or API change)
+                    if topic_id is None:
+                        logger.debug(
+                            "Forum topic message with no reply_to_top_id: msg_id=%s, group=%s",
+                            message.id, message.peer_id
+                        )
 
             # Ensure sent_at is timezone-aware (Telethon may return naive datetime)
             sent_at = message.date
@@ -1030,12 +1037,13 @@ class LiveCrawlerService:
                     visibility = "public" if username else "private"
                     gtype = "channel" if is_channel else "supergroup"
                     members = getattr(entity, "participants_count", None)
+                    has_topics = getattr(entity, "forum", False)  # NEW: Extract forum flag
 
                     await db.execute(
-                        """INSERT INTO groups (id, name, username, visibility, type, member_count, crawl_enabled, registered_by)
-                           VALUES ($1, $2, $3, $4, $5, $6, true, $7)
-                           ON CONFLICT (id) DO UPDATE SET name=$2, username=$3, member_count=$6, updated_at=NOW()""",
-                        gid, name, username, visibility, gtype, members, admin_id,
+                        """INSERT INTO groups (id, name, username, visibility, type, member_count, has_topics, crawl_enabled, registered_by)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8)
+                           ON CONFLICT (id) DO UPDATE SET name=$2, username=$3, member_count=$6, has_topics=$7, updated_at=NOW()""",
+                        gid, name, username, visibility, gtype, members, has_topics, admin_id,
                     )
                     await db.execute(
                         "INSERT INTO user_groups (user_id, group_id) VALUES ($1, $2) ON CONFLICT (user_id, group_id) DO NOTHING",
@@ -1048,6 +1056,95 @@ class LiveCrawlerService:
                 logger.warning("Auto-register: get_dialogs timed out for admin %s", admin_id)
             except Exception as e:
                 logger.warning("Auto-register failed for admin %s: %s", admin_id, e)
+
+    async def _fetch_and_store_topics(self, group_id: int, client: TelegramClient) -> None:
+        """
+        Fetch forum topics from Telegram and store in group_topics table.
+
+        Only called for groups where has_topics=True.
+        """
+        try:
+            from telethon.tl.functions.channels import GetForumTopicsRequest
+
+            # Get entity (from cache or API)
+            entity = await self._get_entity_for_group_with_client(group_id, client)
+            if not entity:
+                logger.warning("Cannot fetch topics for group %s: entity not found", group_id)
+                return
+
+            # Verify it's actually a forum
+            if not getattr(entity, 'forum', False):
+                logger.debug("Group %s is not a forum, skipping topic fetch", group_id)
+                return
+
+            # Fetch topics (limit 100 per request, pagination not implemented in v1)
+            try:
+                result = await asyncio.wait_for(
+                    client(GetForumTopicsRequest(
+                        channel=entity,
+                        offset_date=0,
+                        offset_id=0,
+                        offset_topic=0,
+                        limit=100,
+                        q=''  # Empty query = fetch all topics
+                    )),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Timeout fetching topics for group %s", group_id)
+                return
+
+            if not result or not result.topics:
+                logger.debug("No topics found for group %s", group_id)
+                return
+
+            # Batch insert/update topics
+            topics_data = []
+            for topic in result.topics:
+                topics_data.append({
+                    'group_id': group_id,
+                    'topic_id': topic.id,
+                    'topic_title': topic.title,
+                    'icon_color': topic.icon_color,
+                    'icon_emoji_id': getattr(topic, 'icon_emoji_id', None),
+                    'is_closed': getattr(topic, 'closed', False),
+                    'is_pinned': getattr(topic, 'pinned', False),
+                    'top_message_id': topic.top_message,
+                    'unread_count': topic.unread_count,
+                })
+
+            # Upsert topics to DB
+            for topic_data in topics_data:
+                await db.execute(
+                    """INSERT INTO group_topics
+                       (group_id, topic_id, topic_title, icon_color, icon_emoji_id,
+                        is_closed, is_pinned, top_message_id, unread_count)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                       ON CONFLICT (group_id, topic_id)
+                       DO UPDATE SET
+                           topic_title = EXCLUDED.topic_title,
+                           icon_color = EXCLUDED.icon_color,
+                           icon_emoji_id = EXCLUDED.icon_emoji_id,
+                           is_closed = EXCLUDED.is_closed,
+                           is_pinned = EXCLUDED.is_pinned,
+                           top_message_id = EXCLUDED.top_message_id,
+                           unread_count = EXCLUDED.unread_count,
+                           updated_at = NOW()""",
+                    topic_data['group_id'],
+                    topic_data['topic_id'],
+                    topic_data['topic_title'],
+                    topic_data['icon_color'],
+                    topic_data['icon_emoji_id'],
+                    topic_data['is_closed'],
+                    topic_data['is_pinned'],
+                    topic_data['top_message_id'],
+                    topic_data['unread_count'],
+                )
+
+            logger.info("Fetched %d topics for group %s", len(topics_data), group_id)
+
+        except Exception as e:
+            logger.error("Failed to fetch topics for group %s: %s", group_id, e, exc_info=True)
 
     async def refresh_groups(self) -> None:
         """Load crawl-enabled groups from DB."""
@@ -1814,6 +1911,14 @@ class LiveCrawlerService:
                 logger.debug("  Could not estimate message count for %s: %s", title, e)
 
             await self._update_crawler_status(group_uuid, "initializing", progress=0, total=estimated_total)
+
+            # NEW: Fetch topics if this is a forum group
+            group_info = self.group_info_map.get(gid, {})
+            if group_info.get('has_topics', False):
+                try:
+                    await self._fetch_and_store_topics(gid, working_client)
+                except Exception as e:
+                    logger.error("Failed to fetch topics for group %s: %s", title, e)
 
             date_threshold = datetime.now(timezone.utc) - timedelta(days=HISTORICAL_CRAWL_DAYS)
 

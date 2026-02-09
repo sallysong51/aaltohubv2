@@ -148,6 +148,7 @@ class TelegramGroupBase(BaseModel):
 class TelegramGroupInfo(TelegramGroupBase):
     """Group info from Telegram API (not yet registered)"""
     is_registered: bool = False
+    has_topics: bool = False  # NEW: Whether this group has forum topics enabled
 
 
 class TelegramGroupCreate(TelegramGroupBase):

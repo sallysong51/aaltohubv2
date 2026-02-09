@@ -84,9 +84,9 @@ function EventFeedContent() {
   // Scroll detection for new message banner
   useEffect(() => {
     const onScroll = () => {
-      const atTop = window.scrollY < 100;
-      isScrolledToTop.current = atTop;
-      if (atTop) setNewMsgCount(0);
+      const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 100;
+      isScrolledToTop.current = atBottom;
+      if (atBottom) setNewMsgCount(0);
     };
     window.addEventListener('scroll', onScroll, { passive: true });
     return () => window.removeEventListener('scroll', onScroll);
@@ -143,6 +143,10 @@ function EventFeedContent() {
       setHasMore(result.hasMore);
       setPage(1);
       setLastUpdated(new Date());
+      // Auto-scroll to bottom on initial load
+      setTimeout(() => {
+        window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'auto' });
+      }, 100);
     } catch (error) {
       toast.error(getApiErrorMessage(error, '메시지를 불러오는데 실패했습니다'));
     } finally {
@@ -156,6 +160,10 @@ function EventFeedContent() {
       setMessages(result.messages);
       setHasMore(result.hasMore);
       setLastUpdated(new Date());
+      // Auto-scroll to bottom on silent refresh
+      setTimeout(() => {
+        window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'auto' });
+      }, 0);
     } catch { /* silent */ }
   };
 
@@ -176,8 +184,8 @@ function EventFeedContent() {
             if (prev.some(m => m.telegram_message_id === full.telegram_message_id && String(m.group_id) === String(full.group_id))) {
               return prev.map(m => m.telegram_message_id === full.telegram_message_id && String(m.group_id) === String(full.group_id) ? full : m);
             }
-            const updated = [full, ...prev];
-            return updated.length > 500 ? updated.slice(0, 500) : updated;
+            const updated = [...prev, full];
+            return updated.length > 500 ? updated.slice(-500) : updated;
           });
         }
       }).catch(() => {});
@@ -186,15 +194,18 @@ function EventFeedContent() {
 
     setMessages(prev => {
       if (prev.some(m => m.telegram_message_id === newMsg.telegram_message_id && String(m.group_id) === String(newMsg.group_id))) return prev;
-      const updated = [newMsg, ...prev];
-      return updated.length > 500 ? updated.slice(0, 500) : updated;
+      const updated = [...prev, newMsg];
+      return updated.length > 500 ? updated.slice(-500) : updated;
     });
     setLastUpdated(new Date());
 
-    // New message banner
+    // Auto-scroll to bottom if user is already at the bottom, otherwise show banner
     if (!isScrolledToTop.current) {
       setNewMsgCount(prev => prev + 1);
     }
+    setTimeout(() => {
+      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
+    }, 0);
   }, []);
 
   const handleSSEUpdate = useCallback((updated: Message) => {
@@ -235,6 +246,10 @@ function EventFeedContent() {
       setHasMore(result.hasMore);
       setPage(1);
       setLastUpdated(new Date());
+      // Auto-scroll to bottom on manual refresh
+      setTimeout(() => {
+        window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
+      }, 0);
     } catch (error) {
       toast.error(getApiErrorMessage(error, '새로고침에 실패했습니다'));
     } finally {
@@ -257,6 +272,10 @@ function EventFeedContent() {
       setHasMore(result.hasMore);
       setPage(nextPage);
       setLastUpdated(new Date());
+      // Auto-scroll to bottom when loading more
+      setTimeout(() => {
+        window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
+      }, 0);
     } catch (error) {
       toast.error(getApiErrorMessage(error, '추가 메시지를 불러오는데 실패했습니다'));
     } finally {

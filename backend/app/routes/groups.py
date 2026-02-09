@@ -165,13 +165,14 @@ async def register_groups(
                 async with conn.transaction():
                     # Insert group (map API fields → DB columns)
                     await conn.execute(
-                        """INSERT INTO groups (id, name, type, member_count, visibility, registered_by, crawl_enabled)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                        """INSERT INTO groups (id, name, type, member_count, visibility, has_topics, registered_by, crawl_enabled)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
                         telegram_id,
                         group_data.title,
                         group_data.group_type or "group",
                         group_data.member_count,
                         group_data.visibility or GroupVisibility.PUBLIC.value,
+                        group_data.has_topics or False,  # NEW: from frontend payload
                         current_user.id,
                         True,
                     )
@@ -376,7 +377,7 @@ async def get_group_topics(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid group ID: must be numeric")
 
-        group = await db.fetchrow("SELECT id, visibility FROM groups WHERE id = $1", gid)
+        group = await db.fetchrow("SELECT id, visibility, has_topics FROM groups WHERE id = $1", gid)
         if not group:
             raise HTTPException(status_code=404, detail="Group not found")
 
@@ -389,7 +390,26 @@ async def get_group_topics(
             if not access:
                 raise HTTPException(status_code=403, detail="Access denied: Private group")
 
-        # Query topics from recent messages (limit to 5000 to avoid memory issues)
+        # NEW: Query real topic metadata from group_topics table
+        topic_metadata = {}
+        if group["has_topics"]:
+            topic_rows = await db.fetch(
+                """SELECT topic_id, topic_title, icon_color, icon_emoji_id, is_closed, is_pinned, unread_count
+                   FROM group_topics WHERE group_id = $1""",
+                gid,
+            )
+            for row in topic_rows:
+                topic_metadata[row["topic_id"]] = {
+                    "topic_id": row["topic_id"],
+                    "topic_title": row["topic_title"],
+                    "icon_color": row["icon_color"],
+                    "icon_emoji_id": row["icon_emoji_id"],
+                    "is_closed": row["is_closed"],
+                    "is_pinned": row["is_pinned"],
+                    "message_count": 0,  # Will be populated from messages table
+                }
+
+        # Query message counts per topic (limit to 5000 to avoid memory issues)
         topics_rows = await db.fetch(
             """SELECT topic_id FROM messages
                WHERE group_id = $1 AND is_deleted = FALSE AND topic_id IS NOT NULL
@@ -397,22 +417,33 @@ async def get_group_topics(
             gid,
         )
 
-        if not topics_rows:
+        if not topics_rows and not topic_metadata:
             return []
 
-        # Deduplicate and count messages per topic
-        topic_map: Dict[int, dict] = {}
+        # Count messages per topic
+        topic_counts: Dict[int, int] = {}
         for row in topics_rows:
             tid = row["topic_id"]
-            if tid not in topic_map:
-                topic_map[tid] = {
-                    "topic_id": tid,
-                    "topic_title": f"Topic {tid}",
-                    "message_count": 0,
-                }
-            topic_map[tid]["message_count"] += 1
+            topic_counts[tid] = topic_counts.get(tid, 0) + 1
 
-        return sorted(topic_map.values(), key=lambda t: t["message_count"], reverse=True)
+        # Merge metadata + counts
+        final_topics = {}
+
+        # First, add all topics from group_topics (with real names)
+        for tid, meta in topic_metadata.items():
+            meta["message_count"] = topic_counts.get(tid, 0)
+            final_topics[tid] = meta
+
+        # Then, add topics found in messages but not in group_topics (fallback to placeholder)
+        for tid, count in topic_counts.items():
+            if tid not in final_topics:
+                final_topics[tid] = {
+                    "topic_id": tid,
+                    "topic_title": f"Topic {tid}",  # Fallback placeholder
+                    "message_count": count,
+                }
+
+        return sorted(final_topics.values(), key=lambda t: t["message_count"], reverse=True)
     except HTTPException:
         raise
     except Exception as e:

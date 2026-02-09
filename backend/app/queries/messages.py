@@ -112,7 +112,7 @@ async def fetch_messages_paginated(
         f"""SELECT {MESSAGE_SELECT_COLUMNS}
             FROM messages
             WHERE {where}
-            ORDER BY sent_at DESC LIMIT ${limit_idx} OFFSET ${offset_idx}""",
+            ORDER BY sent_at ASC LIMIT ${limit_idx} OFFSET ${offset_idx}""",
         *params, page_size, offset,
     )
 
