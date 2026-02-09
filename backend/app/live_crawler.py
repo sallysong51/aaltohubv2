@@ -190,6 +190,15 @@ class LiveCrawlerService:
         self._get_me_circuit_open: dict[int, float] = {}  # user_id -> time when circuit opens (for backoff)
         self._get_me_circuit_backoff = 30.0  # Start backoff at 30s
 
+        # Phase 2B: Logging Optimization — metrics tracking
+        # Per-group message counters for observability (group_id -> counts)
+        self._messages_handled: dict[int, int] = {}  # group_id -> count of handled messages
+        self._messages_skipped: dict[int, int] = {}  # group_id -> count of skipped messages
+        self._skip_reasons: dict[int, dict[str, int]] = {}  # group_id -> {reason: count}
+        # Sampling for verbose logging: log every Nth skipped message, don't spam logs
+        self._skipped_since_last_log: dict[int, int] = {}  # group_id -> count since last log
+        self._skip_log_interval = 100  # Log every 100 skipped messages per group
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -576,14 +585,33 @@ class LiveCrawlerService:
         self._get_me_cache.clear()
         self._get_me_failure_count.clear()
         self._get_me_circuit_open.clear()
+        # Phase 2B: Clear metrics tracking
+        self._messages_handled.clear()
+        self._messages_skipped.clear()
+        self._skip_reasons.clear()
+        self._skipped_since_last_log.clear()
 
     def get_status(self) -> dict:
+        # Phase 2B: Aggregate metrics for observability
+        total_handled = sum(self._messages_handled.values())
+        total_skipped = sum(self._messages_skipped.values())
+
+        # Aggregate skip reasons across all groups
+        aggregated_skip_reasons: dict[str, int] = {}
+        for group_reasons in self._skip_reasons.values():
+            for reason, count in group_reasons.items():
+                aggregated_skip_reasons[reason] = aggregated_skip_reasons.get(reason, 0) + count
+
         return {
             "running": self.running,
             "connected": self.connected,
             "start_error": self._start_error,
             "groups_count": len(self.group_id_map),
             "messages_received": self._message_count,
+            # Phase 2B: Message handling metrics
+            "messages_handled": total_handled,
+            "messages_skipped": total_skipped,
+            "skip_reasons": aggregated_skip_reasons,
             "historical_crawl_running": self._historical_crawl_running or self._batch_crawl_active,
             "currently_crawling_group_id": self._currently_crawling_group_id,
             "currently_crawling_group_title": (
@@ -1645,6 +1673,49 @@ class LiveCrawlerService:
         except Exception as e:
             logger.warning("_cleanup_get_me_cache error: %s", e)
 
+    def _track_message_handled(self, group_id: int) -> None:
+        """Track a handled message for per-group metrics.
+
+        Phase 2B: Logging optimization.
+        Used for observability: dashboard can show messages handled per group.
+        """
+        self._messages_handled[group_id] = self._messages_handled.get(group_id, 0) + 1
+        # Reset skipped counter when we get a handled message (shows activity)
+        self._skipped_since_last_log[group_id] = 0
+
+    def _track_message_skipped(self, group_id: int, reason: str) -> None:
+        """Track a skipped message with sampling to avoid log spam.
+
+        Phase 2B: Logging optimization.
+
+        Logs every Nth skipped message (configurable via _skip_log_interval).
+        Tracks reason for skipping for debugging.
+
+        Args:
+            group_id: Telegram group ID
+            reason: Why message was skipped (e.g., 'not_in_map', 'not_assigned', 'not_enabled')
+        """
+        self._messages_skipped[group_id] = self._messages_skipped.get(group_id, 0) + 1
+        self._skipped_since_last_log[group_id] = self._skipped_since_last_log.get(group_id, 0) + 1
+
+        # Track skip reason
+        if group_id not in self._skip_reasons:
+            self._skip_reasons[group_id] = {}
+        self._skip_reasons[group_id][reason] = self._skip_reasons[group_id].get(reason, 0) + 1
+
+        # Log with sampling to avoid spam: every Nth skipped message
+        if self._skipped_since_last_log[group_id] >= self._skip_log_interval:
+            group_title = self._get_group_title(group_id)
+            skipped_count = self._messages_skipped[group_id]
+            reasons_str = ", ".join(
+                f"{r}={c}" for r, c in sorted(self._skip_reasons[group_id].items())
+            )
+            logger.debug(
+                "[SKIP] %s: skipped %d messages (reasons: %s)",
+                group_title, skipped_count, reasons_str
+            )
+            self._skipped_since_last_log[group_id] = 0
+
     def _get_group_title(self, gid: int) -> str:
         info = self.group_info_map.get(gid, {})
         return info.get("title") or info.get("name") or str(gid)
@@ -2332,17 +2403,26 @@ class LiveCrawlerService:
                 try:
                     chat_id = self._normalize_chat_id(event.chat_id)
                     if chat_id not in self.group_id_map:
+                        # Phase 2B: Track skipped message (group not registered)
+                        self._track_message_skipped(chat_id, "not_in_map")
                         return
 
                     # Phase 2: Duplicate prevention — only handle if this client is assigned
                     if not await self._should_handle_group(chat_id, _c, user_id):
+                        # Phase 2B: Track skipped message (not assigned to this connection)
+                        self._track_message_skipped(chat_id, "not_assigned")
                         return
 
                     group_uuid = self.group_id_map[chat_id]
                     group_title = self._get_group_title(chat_id)
 
                     if not await self._is_group_enabled(group_uuid):
+                        # Phase 2B: Track skipped message (group disabled)
+                        self._track_message_skipped(chat_id, "not_enabled")
                         return
+
+                    # Phase 2B: Track handled message for metrics
+                    self._track_message_handled(chat_id)
 
                     logger.info("[NEW] %s: %s", group_title, (event.text or "[media]")[:80])
                     await self._enqueue_message(
@@ -2360,11 +2440,18 @@ class LiveCrawlerService:
                 try:
                     chat_id = self._normalize_chat_id(event.chat_id)
                     if chat_id not in self.group_id_map:
+                        # Phase 2B: Track skipped message (group not registered)
+                        self._track_message_skipped(chat_id, "not_in_map")
                         return
 
                     # Phase 2: Duplicate prevention — only handle if this client is assigned
                     if not await self._should_handle_group(chat_id, _c, user_id):
+                        # Phase 2B: Track skipped message (not assigned to this connection)
+                        self._track_message_skipped(chat_id, "not_assigned")
                         return
+
+                    # Phase 2B: Track handled message for metrics
+                    self._track_message_handled(chat_id)
 
                     group_uuid = self.group_id_map[chat_id]
                     logger.info("[EDIT] %s: msg %d", self._get_group_title(chat_id), event.message.id)
@@ -2380,11 +2467,19 @@ class LiveCrawlerService:
                 try:
                     chat_id = self._normalize_chat_id(event.chat_id)
                     if chat_id not in self.group_id_map:
+                        # Phase 2B: Track skipped message (group not registered)
+                        self._track_message_skipped(chat_id, "not_in_map")
                         return
 
                     # Phase 2: Duplicate prevention — only handle if this client is assigned
                     if not await self._should_handle_group(chat_id, _c, user_id):
+                        # Phase 2B: Track skipped message (not assigned to this connection)
+                        self._track_message_skipped(chat_id, "not_assigned")
                         return
+
+                    # Phase 2B: Track handled messages (counting each deleted ID)
+                    for _ in event.deleted_ids:
+                        self._track_message_handled(chat_id)
 
                     group_uuid = self.group_id_map[chat_id]
                     deleted_ids = list(event.deleted_ids)
@@ -2415,11 +2510,18 @@ class LiveCrawlerService:
                     old_id = self._normalize_chat_id(event.chat_id)
                     new_id = action.channel_id
                     if old_id not in self.group_id_map:
+                        # Phase 2B: Track skipped message (group not registered)
+                        self._track_message_skipped(old_id, "not_in_map")
                         return
 
                     # Phase 2: Duplicate prevention — only handle if this client is assigned
                     if not await self._should_handle_group(old_id, _c, user_id):
+                        # Phase 2B: Track skipped message (not assigned to this connection)
+                        self._track_message_skipped(old_id, "not_assigned")
                         return
+
+                    # Phase 2B: Track handled message (migration event)
+                    self._track_message_handled(old_id)
 
                     group_uuid = self.group_id_map[old_id]
                     logger.critical(
