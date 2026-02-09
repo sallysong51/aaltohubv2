@@ -31,8 +31,9 @@ async def get_all_groups(
                (
                    SELECT ug.connection_id::text
                    FROM user_groups ug
-                   WHERE ug.group_id = g.id AND ug.connection_id IS NOT NULL
-                   ORDER BY CASE WHEN ug.user_id = $3 THEN 0 ELSE 1 END
+                   WHERE ug.group_id = g.id
+                     AND ug.user_id = $3
+                     AND ug.connection_id IS NOT NULL
                    LIMIT 1
                ) AS connection_id,
                (
@@ -354,3 +355,51 @@ async def auto_join_unmapped_groups(
     except Exception as e:
         logger.error("auto_join_unmapped_groups error: %s", e)
         raise HTTPException(status_code=500, detail="Failed to auto-join groups")
+
+
+@router.post("/ensure-admin-membership")
+async def ensure_admin_membership(
+    current_user: UserResponse = Depends(get_current_admin_user),
+):
+    """Ensure admin has user_groups rows for all groups.
+
+    Creates missing user_groups entries (with connection_id=NULL initially)
+    so that connection filtering works correctly. This is necessary because:
+    - Admin needs visibility into ALL groups for management purposes
+    - The get_all_groups() subquery returns NULL connection_id unless admin has a user_groups row
+    - Without this endpoint, groups registered by other users won't show in connection tabs
+    """
+    try:
+        # Get all group IDs
+        all_groups = await db.fetch("SELECT id FROM groups")
+        all_group_ids = [row["id"] for row in all_groups]
+
+        # Get group IDs admin already has in user_groups
+        existing = await db.fetch(
+            "SELECT group_id FROM user_groups WHERE user_id = $1",
+            current_user.id
+        )
+        existing_ids = {row["group_id"] for row in existing}
+
+        # Find missing groups (groups admin doesn't have user_groups rows for)
+        missing_ids = [gid for gid in all_group_ids if gid not in existing_ids]
+
+        if not missing_ids:
+            return {"success": True, "added": 0}
+
+        # Insert missing user_groups rows (connection_id will be NULL)
+        # The backfill_connection_ids endpoint can later set connection_id if needed
+        for group_id in missing_ids:
+            await db.execute(
+                """INSERT INTO user_groups (user_id, group_id, connection_id)
+                   VALUES ($1, $2, NULL)
+                   ON CONFLICT (user_id, group_id) DO NOTHING""",
+                current_user.id, group_id
+            )
+
+        logger.info(f"ensure_admin_membership: Added {len(missing_ids)} groups for admin user {current_user.id}")
+        return {"success": True, "added": len(missing_ids)}
+
+    except Exception as e:
+        logger.error("ensure_admin_membership error: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to ensure admin membership")

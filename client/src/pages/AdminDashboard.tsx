@@ -94,12 +94,13 @@ function AdminDashboardContent() {
     try {
       const res = await telegramApi.getConnections();
       setConnections(res.data);
-      // Auto-backfill NULL connection_ids if admin has connections
+      // Auto-setup admin access to all groups
       if (res.data.length > 0) {
         try {
-          await adminApi.backfillConnectionIds();
+          await adminApi.ensureAdminMembership(); // Create missing user_groups rows
+          await adminApi.backfillConnectionIds();  // Set connection_id for NULL rows
         } catch {
-          // Non-critical: backfill is best-effort
+          // Non-critical: setup is best-effort
         }
       }
     } catch {
@@ -353,16 +354,22 @@ function AdminDashboardContent() {
   const groupedMessages = groupMessagesByDate(messages);
 
   // FIX #3: Filter groups by selected Telegram connection tab
-  const filteredGroups = groups.filter((g) => {
-    const matchesSearch = !groupSearch || g.title.toLowerCase().includes(groupSearch.toLowerCase());
-    let matchesTab = true;
-    if (activeConnectionTab === '__unlinked__') {
-      matchesTab = !g.connection_id;
-    } else if (activeConnectionTab) {
-      matchesTab = g.connection_id === activeConnectionTab;
-    }
-    return matchesSearch && matchesTab;
-  });
+  const filteredGroups = groups
+    .filter((g) => {
+      const matchesSearch = !groupSearch || g.title.toLowerCase().includes(groupSearch.toLowerCase());
+      let matchesTab = true;
+      if (activeConnectionTab === '__unlinked__') {
+        matchesTab = !g.connection_id;
+      } else if (activeConnectionTab) {
+        matchesTab = g.connection_id === activeConnectionTab;
+      }
+      return matchesSearch && matchesTab;
+    })
+    .sort((a, b) => {
+      const countA = a.message_count_total || 0;
+      const countB = b.message_count_total || 0;
+      return countB - countA; // 내림차순 (많은 순)
+    });
 
   // Count groups per connection for tab badges
   const groupCountByConnection = (connId: string) =>

@@ -621,6 +621,14 @@ export const adminApi = {
   deleteGroup: (groupId: string) =>
     apiClient.delete(`/admin/groups/${groupId}`),
 
+  ensureAdminMembership: () =>
+    apiClient.post<{
+      success: boolean;
+      added: number;
+    }>(
+      '/admin/ensure-admin-membership'
+    ),
+
   backfillConnectionIds: () =>
     apiClient.post<{
       success: boolean;
