@@ -173,6 +173,13 @@ class LiveCrawlerService:
         # Background task that waits for an admin session to appear
         self._admin_wait_task: asyncio.Task | None = None
 
+        # Phase 2: Duplicate Prevention — ensure each group is only listened by correct connection
+        # Populated at startup to map:
+        # - telegram_user_id (from client.get_me()) → connection_id (UUID)
+        # - group_id (telegram group ID) → connection_id (which connection should handle it, or None if unassigned)
+        self._telegram_user_id_to_connection_id: dict[int, str] = {}  # telegram_user_id (int) -> connection_id (UUID str)
+        self._group_to_connection_id: dict[int, str | None] = {}  # group_id (telegram group ID) -> connection_id (UUID str) or None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -393,6 +400,9 @@ class LiveCrawlerService:
 
             # Discover which groups each connection can access (for multi-connection backfill)
             await self.discover_group_accessibility()
+
+            # Load connection-group mappings (prevents duplicate listening for multi-connection admins)
+            await self._load_connection_group_mappings()
 
             # Load persisted entity cache (avoids get_entity API calls on restart)
             await self._load_entity_cache()
@@ -1070,6 +1080,8 @@ class LiveCrawlerService:
                 for nid in new_ids:
                     title = self._get_group_title(nid)
                     logger.info("Live crawler: new group detected — %s (id=%s)", title, nid)
+                # Phase 2: Load connection mapping for new groups
+                await self._reload_group_connection_mappings_for_groups(new_ids)
 
             logger.info("Live crawler: %d groups loaded", len(self.group_id_map))
         except Exception as e:
@@ -1193,6 +1205,179 @@ class LiveCrawlerService:
 
         except Exception as e:
             logger.error("discover_group_accessibility: unexpected error: %s", e)
+
+    async def _load_connection_group_mappings(self) -> None:
+        """Load connection-group mappings for duplicate prevention.
+
+        Phase 2: Ensures each group is only listened by its assigned connection.
+
+        Maps:
+        - telegram_user_id → connection_id (identifies which connection each client is)
+        - group_id → connection_id (identifies which connection should handle each group)
+
+        Called at startup, and can be refreshed via admin API.
+        """
+        try:
+            logger.info("_load_connection_group_mappings: building maps")
+
+            # Step 1: Map telegram_user_id -> connection_id
+            # For each client, fetch its telegram_user_id and load connections
+            for user_id, client in self.clients.items():
+                try:
+                    me = await client.get_me()
+                    if not me or not me.id:
+                        logger.warning("_load_connection_group_mappings: get_me() failed for user %s", user_id)
+                        continue
+
+                    telegram_user_id = int(me.id)
+                    # Load all this user's connections
+                    connections = await db.fetch(
+                        """SELECT id, telegram_user_id FROM telegram_connections
+                           WHERE user_id = $1""",
+                        user_id
+                    )
+
+                    for conn in connections:
+                        conn_id = str(conn["id"])
+                        conn_telegram_user_id = int(conn["telegram_user_id"])
+                        self._telegram_user_id_to_connection_id[conn_telegram_user_id] = conn_id
+                        logger.debug(
+                            "_load_connection_group_mappings: mapped telegram_user_id %s -> connection %s",
+                            conn_telegram_user_id, conn_id[:8] + "..."
+                        )
+
+                except Exception as e:
+                    logger.warning("_load_connection_group_mappings: failed to map user %s: %s", user_id, e)
+                    continue
+
+            # Step 2: Map group_id -> connection_id
+            # Load which connection is assigned to each group (from user_groups)
+            # For multi-connection admins, a group may have NULL or have a connection_id
+            try:
+                group_mappings = await db.fetch(
+                    """SELECT DISTINCT group_id, connection_id
+                       FROM user_groups
+                       WHERE connection_id IS NOT NULL
+                       ORDER BY group_id"""
+                )
+
+                for row in group_mappings:
+                    gid = int(row["group_id"])
+                    conn_id = str(row["connection_id"])
+                    # If group already mapped to different connection, use the first one
+                    if gid not in self._group_to_connection_id:
+                        self._group_to_connection_id[gid] = conn_id
+                        logger.debug(
+                            "_load_connection_group_mappings: mapped group %s -> connection %s",
+                            gid, conn_id[:8] + "..."
+                        )
+
+                logger.info(
+                    "_load_connection_group_mappings: completed. %d telegram_user_ids mapped, %d groups mapped",
+                    len(self._telegram_user_id_to_connection_id),
+                    len(self._group_to_connection_id)
+                )
+
+            except Exception as e:
+                logger.warning("_load_connection_group_mappings: failed to load group mappings: %s", e)
+
+        except Exception as e:
+            logger.error("_load_connection_group_mappings: unexpected error: %s", e)
+
+    async def _reload_group_connection_mappings_for_groups(self, group_ids: set[int]) -> None:
+        """Reload connection mapping for specific groups (after group refresh detects new groups).
+
+        Called when new groups are detected via refresh_groups().
+        Ensures newly enabled groups get their connection assignment loaded.
+        """
+        if not group_ids:
+            return
+
+        try:
+            # Load which connection is assigned to each of these groups
+            group_mappings = await db.fetch(
+                """SELECT DISTINCT group_id, connection_id
+                   FROM user_groups
+                   WHERE group_id = ANY($1::bigint[]) AND connection_id IS NOT NULL
+                   ORDER BY group_id""",
+                list(group_ids)
+            )
+
+            for row in group_mappings:
+                gid = int(row["group_id"])
+                conn_id = str(row["connection_id"])
+                if gid not in self._group_to_connection_id:
+                    self._group_to_connection_id[gid] = conn_id
+                    logger.debug(
+                        "_reload_group_connection_mappings_for_groups: loaded mapping group %s -> connection %s",
+                        gid, conn_id[:8] + "..."
+                    )
+
+            logger.info(
+                "_reload_group_connection_mappings_for_groups: loaded %d group mappings",
+                len(group_mappings)
+            )
+
+        except Exception as e:
+            logger.warning("_reload_group_connection_mappings_for_groups error: %s", e)
+
+    async def _should_handle_group(self, group_id: int, client: TelegramClient) -> bool:
+        """Check if this client should handle events from this group.
+
+        Phase 2: Duplicate prevention.
+
+        Rules:
+        1. If group has no assigned connection: all clients handle (backward compatible)
+        2. If group has assigned connection: only that connection handles
+        3. Requires get_me() call to identify client (cached in _telegram_user_id_to_connection_id)
+
+        Returns:
+        - True: this client should handle events
+        - False: another client is assigned, skip events
+        """
+        try:
+            # Check if this group has an assigned connection
+            assigned_conn_id = self._group_to_connection_id.get(group_id)
+
+            if assigned_conn_id is None:
+                # No assignment yet, all connections can handle (backward compatible)
+                return True
+
+            # Get this client's telegram_user_id and find its connection_id
+            try:
+                me = await client.get_me()
+                if not me or not me.id:
+                    logger.debug("_should_handle_group: get_me() failed for group %s", group_id)
+                    return False
+
+                my_telegram_user_id = int(me.id)
+                my_conn_id = self._telegram_user_id_to_connection_id.get(my_telegram_user_id)
+
+                if my_conn_id is None:
+                    logger.debug(
+                        "_should_handle_group: client telegram_user_id %s not in connection map for group %s",
+                        my_telegram_user_id, group_id
+                    )
+                    return False
+
+                # Check if this client's connection matches the assigned connection
+                should_handle = my_conn_id == assigned_conn_id
+
+                if not should_handle:
+                    logger.debug(
+                        "_should_handle_group: group %s assigned to connection %s, but this client is %s (skip)",
+                        group_id, assigned_conn_id[:8] + "...", my_conn_id[:8] + "..."
+                    )
+
+                return should_handle
+
+            except Exception as e:
+                logger.debug("_should_handle_group: get_me() error for group %s: %s", group_id, e)
+                return True  # Default: handle (fail open)
+
+        except Exception as e:
+            logger.error("_should_handle_group: unexpected error for group %s: %s", group_id, e)
+            return True  # Default: handle (fail open)
 
     def _get_group_title(self, gid: int) -> str:
         info = self.group_info_map.get(gid, {})
@@ -1871,6 +2056,10 @@ class LiveCrawlerService:
                     if chat_id not in self.group_id_map:
                         return
 
+                    # Phase 2: Duplicate prevention — only handle if this client is assigned
+                    if not await self._should_handle_group(chat_id, _c):
+                        return
+
                     group_uuid = self.group_id_map[chat_id]
                     group_title = self._get_group_title(chat_id)
 
@@ -1894,6 +2083,11 @@ class LiveCrawlerService:
                     chat_id = self._normalize_chat_id(event.chat_id)
                     if chat_id not in self.group_id_map:
                         return
+
+                    # Phase 2: Duplicate prevention — only handle if this client is assigned
+                    if not await self._should_handle_group(chat_id, _c):
+                        return
+
                     group_uuid = self.group_id_map[chat_id]
                     logger.info("[EDIT] %s: msg %d", self._get_group_title(chat_id), event.message.id)
                     await self._enqueue_message(
@@ -1904,11 +2098,16 @@ class LiveCrawlerService:
                     logger.error("Live crawler edit error: %s", e)
 
             @_client.on(events.MessageDeleted)
-            async def on_message_deleted(event):
+            async def on_message_deleted(event, _c=_client):
                 try:
                     chat_id = self._normalize_chat_id(event.chat_id)
                     if chat_id not in self.group_id_map:
                         return
+
+                    # Phase 2: Duplicate prevention — only handle if this client is assigned
+                    if not await self._should_handle_group(chat_id, _c):
+                        return
+
                     group_uuid = self.group_id_map[chat_id]
                     deleted_ids = list(event.deleted_ids)
                     logger.info("[DELETE] %s: %d msgs", self._get_group_title(chat_id), len(deleted_ids))
@@ -1927,7 +2126,7 @@ class LiveCrawlerService:
                     logger.error("Live crawler delete error: %s", e)
 
             @_client.on(events.ChatAction)
-            async def on_chat_action(event):
+            async def on_chat_action(event, _c=_client):
                 """Detect supergroup migration — log CRITICAL alert and disable crawling."""
                 try:
                     if not hasattr(event, 'action_message') or not event.action_message:
@@ -1939,6 +2138,11 @@ class LiveCrawlerService:
                     new_id = action.channel_id
                     if old_id not in self.group_id_map:
                         return
+
+                    # Phase 2: Duplicate prevention — only handle if this client is assigned
+                    if not await self._should_handle_group(old_id, _c):
+                        return
+
                     group_uuid = self.group_id_map[old_id]
                     logger.critical(
                         "SUPERGROUP MIGRATION DETECTED: group %s (uuid=%s) migrated from %d to %d. "
