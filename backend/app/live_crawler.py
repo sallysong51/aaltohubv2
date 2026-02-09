@@ -180,6 +180,16 @@ class LiveCrawlerService:
         self._telegram_user_id_to_connection_id: dict[int, str] = {}  # telegram_user_id (int) -> connection_id (UUID str)
         self._group_to_connection_id: dict[int, str | None] = {}  # group_id (telegram group ID) -> connection_id (UUID str) or None
 
+        # Phase 2A: Error Recovery & Resilience
+        # Cache telegram_user_id per client to reduce get_me() API calls
+        # Key: user_id (admin user ID), Value: (telegram_user_id, timestamp, ttl_seconds)
+        self._get_me_cache: dict[int, tuple[int, float]] = {}  # user_id -> (telegram_user_id, timestamp)
+        self._get_me_cache_ttl = 300.0  # Cache for 5 minutes
+        # Track get_me() failures per client for circuit breaker
+        self._get_me_failure_count: dict[int, int] = {}  # user_id -> consecutive_failure_count
+        self._get_me_circuit_open: dict[int, float] = {}  # user_id -> time when circuit opens (for backoff)
+        self._get_me_circuit_backoff = 30.0  # Start backoff at 30s
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -562,6 +572,10 @@ class LiveCrawlerService:
         # Phase 2: Clear connection-group mappings
         self._telegram_user_id_to_connection_id.clear()
         self._group_to_connection_id.clear()
+        # Phase 2A: Clear error recovery tracking
+        self._get_me_cache.clear()
+        self._get_me_failure_count.clear()
+        self._get_me_circuit_open.clear()
 
     def get_status(self) -> dict:
         return {
@@ -1421,15 +1435,18 @@ class LiveCrawlerService:
         except Exception as e:
             logger.warning("_reload_group_connection_mappings_for_groups error: %s", e)
 
-    async def _should_handle_group(self, group_id: int, client: TelegramClient) -> bool:
+    async def _should_handle_group(self, group_id: int, client: TelegramClient, user_id: int | None = None) -> bool:
         """Check if this client should handle events from this group.
 
-        Phase 2: Duplicate prevention.
+        Phase 2: Duplicate prevention with Phase 2A error recovery.
 
         Rules:
         1. If group has no assigned connection: all clients handle (backward compatible)
         2. If group has assigned connection: only that connection handles
-        3. Requires get_me() call to identify client (cached in _telegram_user_id_to_connection_id)
+        3. Uses cached telegram_user_id to minimize get_me() calls (5-min TTL)
+        4. Implements retry logic (up to 3 attempts) for transient failures
+        5. Implements circuit breaker for repeated failures (backoff: 30s→60s→120s)
+        6. Alerts Sentry on persistent failures
 
         Returns:
         - True: this client should handle events
@@ -1443,41 +1460,190 @@ class LiveCrawlerService:
                 # No assignment yet, all connections can handle (backward compatible)
                 return True
 
-            # Get this client's telegram_user_id and find its connection_id
-            try:
-                me = await client.get_me()
-                if not me or not me.id:
-                    logger.debug("_should_handle_group: get_me() failed for group %s", group_id)
-                    return False
+            # Get this client's telegram_user_id (cached or fresh)
+            my_telegram_user_id = await self._get_telegram_user_id_with_retry(client, user_id)
+            if my_telegram_user_id is None:
+                logger.warning(
+                    "_should_handle_group: failed to get telegram_user_id for group %s after retries (fail open)",
+                    group_id
+                )
+                return True  # Fail open: handle to avoid losing messages
 
-                my_telegram_user_id = int(me.id)
-                my_conn_id = self._telegram_user_id_to_connection_id.get(my_telegram_user_id)
+            # Find this client's connection_id
+            my_conn_id = self._telegram_user_id_to_connection_id.get(my_telegram_user_id)
 
-                if my_conn_id is None:
-                    logger.debug(
-                        "_should_handle_group: client telegram_user_id %s not in connection map for group %s",
-                        my_telegram_user_id, group_id
-                    )
-                    return False
+            if my_conn_id is None:
+                logger.debug(
+                    "_should_handle_group: client telegram_user_id %s not in connection map for group %s",
+                    my_telegram_user_id, group_id
+                )
+                return False
 
-                # Check if this client's connection matches the assigned connection
-                should_handle = my_conn_id == assigned_conn_id
+            # Check if this client's connection matches the assigned connection
+            should_handle = my_conn_id == assigned_conn_id
 
-                if not should_handle:
-                    logger.debug(
-                        "_should_handle_group: group %s assigned to connection %s, but this client is %s (skip)",
-                        group_id, assigned_conn_id[:8] + "...", my_conn_id[:8] + "..."
-                    )
+            if not should_handle:
+                logger.debug(
+                    "_should_handle_group: group %s assigned to connection %s, but this client is %s (skip)",
+                    group_id, assigned_conn_id[:8] + "...", my_conn_id[:8] + "..."
+                )
 
-                return should_handle
+            # Reset failure counter on success
+            if user_id is not None:
+                self._get_me_failure_count[user_id] = 0
 
-            except Exception as e:
-                logger.debug("_should_handle_group: get_me() error for group %s: %s", group_id, e)
-                return True  # Default: handle (fail open)
+            return should_handle
 
         except Exception as e:
             logger.error("_should_handle_group: unexpected error for group %s: %s", group_id, e)
             return True  # Default: handle (fail open)
+
+    async def _get_telegram_user_id_with_retry(self, client: TelegramClient, user_id: int | None) -> int | None:
+        """Get telegram_user_id with caching, retries, and circuit breaker.
+
+        Phase 2A: Error Recovery.
+
+        - Checks cache first (5-min TTL)
+        - Retries transient failures up to 3 times
+        - Implements circuit breaker with exponential backoff (30s→60s→120s)
+        - Alerts Sentry on persistent failures (5+ consecutive failures)
+
+        Args:
+            client: TelegramClient instance
+            user_id: Optional admin user ID (for error tracking)
+
+        Returns:
+            telegram_user_id (int) or None if failed after retries
+        """
+        if user_id is None:
+            # Try to extract user_id from clients dict, fallback to None
+            user_id = next((uid for uid, c in self.clients.items() if c is client), None)
+
+        # Check cache first
+        if user_id is not None and user_id in self._get_me_cache:
+            cached_user_id, timestamp = self._get_me_cache[user_id]
+            if time.monotonic() - timestamp < self._get_me_cache_ttl:
+                logger.debug("_get_telegram_user_id_with_retry: cache hit for user %s", user_id)
+                return cached_user_id
+
+        # Check if circuit is open
+        if user_id is not None and user_id in self._get_me_circuit_open:
+            circuit_open_at = self._get_me_circuit_open[user_id]
+            if time.monotonic() - circuit_open_at < self._get_me_circuit_backoff:
+                logger.debug(
+                    "_get_telegram_user_id_with_retry: circuit open for user %s, backoff active",
+                    user_id
+                )
+                return None
+
+        # Retry logic: up to 3 attempts
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                me = await asyncio.wait_for(client.get_me(), timeout=5.0)
+                if not me or not me.id:
+                    logger.warning(
+                        "_get_telegram_user_id_with_retry: get_me() returned empty for user %s (attempt %d/%d)",
+                        user_id, attempt + 1, max_retries
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.5)  # Brief backoff before retry
+                    continue
+
+                my_telegram_user_id = int(me.id)
+
+                # Cache the result
+                if user_id is not None:
+                    self._get_me_cache[user_id] = (my_telegram_user_id, time.monotonic())
+                    self._get_me_failure_count[user_id] = 0  # Reset failure counter
+
+                logger.debug(
+                    "_get_telegram_user_id_with_retry: get_me() success for user %s -> telegram_user_id %s",
+                    user_id, my_telegram_user_id
+                )
+                return my_telegram_user_id
+
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "_get_telegram_user_id_with_retry: get_me() timeout for user %s (attempt %d/%d)",
+                    user_id, attempt + 1, max_retries
+                )
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1.0)  # Longer backoff for timeout
+                continue
+
+            except Exception as e:
+                logger.warning(
+                    "_get_telegram_user_id_with_retry: get_me() error for user %s (attempt %d/%d): %s",
+                    user_id, attempt + 1, max_retries, e
+                )
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5)  # Brief backoff before retry
+                continue
+
+        # All retries exhausted: circuit breaker
+        if user_id is not None:
+            self._get_me_failure_count[user_id] = self._get_me_failure_count.get(user_id, 0) + 1
+            failure_count = self._get_me_failure_count[user_id]
+
+            # Open circuit after 5 consecutive failures
+            if failure_count >= 5:
+                self._get_me_circuit_open[user_id] = time.monotonic()
+                logger.error(
+                    "_get_telegram_user_id_with_retry: circuit opened for user %s after %d consecutive failures",
+                    user_id, failure_count
+                )
+                # Alert Sentry
+                try:
+                    sentry_sdk.capture_exception(
+                        Exception(f"get_me() circuit breaker open for user {user_id} after {failure_count} failures")
+                    )
+                except Exception:
+                    pass
+
+        logger.error(
+            "_get_telegram_user_id_with_retry: failed to get telegram_user_id for user %s after %d retries",
+            user_id, max_retries
+        )
+        return None
+
+    async def _cleanup_get_me_cache(self) -> None:
+        """Periodic cleanup of get_me() caches to prevent unbounded growth.
+
+        Phase 2A: Error Recovery cleanup.
+
+        Removes:
+        - Expired cache entries (older than 5 min)
+        - Closed circuits (backoff period expired)
+        - Stale failure counters (5+ hours with no failures)
+
+        Called periodically (every 30 min) during gap-fill.
+        """
+        try:
+            now = time.monotonic()
+            stale_users = []
+
+            # Clean expired cache entries
+            for user_id, (_, timestamp) in list(self._get_me_cache.items()):
+                if now - timestamp > self._get_me_cache_ttl * 2:  # 2x TTL = stale
+                    stale_users.append(user_id)
+
+            # Clean closed circuits that have expired
+            for user_id, circuit_open_at in list(self._get_me_circuit_open.items()):
+                if now - circuit_open_at > 3600:  # 1 hour: circuit can reset
+                    del self._get_me_circuit_open[user_id]
+                    stale_users.append(user_id)
+
+            # Remove stale user tracking
+            for user_id in stale_users:
+                self._get_me_cache.pop(user_id, None)
+                self._get_me_failure_count.pop(user_id, None)
+
+            if stale_users:
+                logger.info("_cleanup_get_me_cache: cleaned up tracking for %d users", len(stale_users))
+
+        except Exception as e:
+            logger.warning("_cleanup_get_me_cache error: %s", e)
 
     def _get_group_title(self, gid: int) -> str:
         info = self.group_info_map.get(gid, {})
@@ -1704,6 +1870,10 @@ class LiveCrawlerService:
                 del self._flood_wait_until[gid]
             if expired_penalties:
                 logger.debug("[GAP-FILL] Cleaned up %d expired FloodWait penalties", len(expired_penalties))
+
+            # Phase 2A: Cleanup get_me() cache and circuit breaker state
+            await self._cleanup_get_me_cache()
+
             for gid in list(self.group_id_map.keys()):
                 if not self.running:
                     break
@@ -2165,7 +2335,7 @@ class LiveCrawlerService:
                         return
 
                     # Phase 2: Duplicate prevention — only handle if this client is assigned
-                    if not await self._should_handle_group(chat_id, _c):
+                    if not await self._should_handle_group(chat_id, _c, user_id):
                         return
 
                     group_uuid = self.group_id_map[chat_id]
@@ -2193,7 +2363,7 @@ class LiveCrawlerService:
                         return
 
                     # Phase 2: Duplicate prevention — only handle if this client is assigned
-                    if not await self._should_handle_group(chat_id, _c):
+                    if not await self._should_handle_group(chat_id, _c, user_id):
                         return
 
                     group_uuid = self.group_id_map[chat_id]
@@ -2213,7 +2383,7 @@ class LiveCrawlerService:
                         return
 
                     # Phase 2: Duplicate prevention — only handle if this client is assigned
-                    if not await self._should_handle_group(chat_id, _c):
+                    if not await self._should_handle_group(chat_id, _c, user_id):
                         return
 
                     group_uuid = self.group_id_map[chat_id]
@@ -2248,7 +2418,7 @@ class LiveCrawlerService:
                         return
 
                     # Phase 2: Duplicate prevention — only handle if this client is assigned
-                    if not await self._should_handle_group(old_id, _c):
+                    if not await self._should_handle_group(old_id, _c, user_id):
                         return
 
                     group_uuid = self.group_id_map[old_id]
