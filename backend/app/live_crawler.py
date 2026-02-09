@@ -559,6 +559,9 @@ class LiveCrawlerService:
             except Exception:
                 pass
         self.clients.clear()
+        # Phase 2: Clear connection-group mappings
+        self._telegram_user_id_to_connection_id.clear()
+        self._group_to_connection_id.clear()
 
     def get_status(self) -> dict:
         return {
