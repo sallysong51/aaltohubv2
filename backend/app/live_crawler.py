@@ -43,6 +43,9 @@ from telethon.tl.types import (
 import asyncpg
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+from app.error_recovery import GetMeErrorRecovery
+from app.metrics import MessageMetrics
+
 # Transient exceptions that justify a retry (not programming bugs)
 _TRANSIENT_EXCEPTIONS = (
     ConnectionError, TimeoutError, OSError,
@@ -180,24 +183,11 @@ class LiveCrawlerService:
         self._telegram_user_id_to_connection_id: dict[int, str] = {}  # telegram_user_id (int) -> connection_id (UUID str)
         self._group_to_connection_id: dict[int, str | None] = {}  # group_id (telegram group ID) -> connection_id (UUID str) or None
 
-        # Phase 2A: Error Recovery & Resilience
-        # Cache telegram_user_id per client to reduce get_me() API calls
-        # Key: user_id (admin user ID), Value: (telegram_user_id, timestamp, ttl_seconds)
-        self._get_me_cache: dict[int, tuple[int, float]] = {}  # user_id -> (telegram_user_id, timestamp)
-        self._get_me_cache_ttl = 300.0  # Cache for 5 minutes
-        # Track get_me() failures per client for circuit breaker
-        self._get_me_failure_count: dict[int, int] = {}  # user_id -> consecutive_failure_count
-        self._get_me_circuit_open: dict[int, float] = {}  # user_id -> time when circuit opens (for backoff)
-        self._get_me_circuit_backoff = 30.0  # Start backoff at 30s
+        # Phase 2A: Error Recovery & Resilience — extract to separate module
+        self._error_recovery = GetMeErrorRecovery()
 
-        # Phase 2B: Logging Optimization — metrics tracking
-        # Per-group message counters for observability (group_id -> counts)
-        self._messages_handled: dict[int, int] = {}  # group_id -> count of handled messages
-        self._messages_skipped: dict[int, int] = {}  # group_id -> count of skipped messages
-        self._skip_reasons: dict[int, dict[str, int]] = {}  # group_id -> {reason: count}
-        # Sampling for verbose logging: log every Nth skipped message, don't spam logs
-        self._skipped_since_last_log: dict[int, int] = {}  # group_id -> count since last log
-        self._skip_log_interval = 100  # Log every 100 skipped messages per group
+        # Phase 2B: Logging Optimization — metrics tracking (extract to separate module)
+        self._metrics = MessageMetrics(self._get_group_title)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -581,26 +571,14 @@ class LiveCrawlerService:
         # Phase 2: Clear connection-group mappings
         self._telegram_user_id_to_connection_id.clear()
         self._group_to_connection_id.clear()
-        # Phase 2A: Clear error recovery tracking
-        self._get_me_cache.clear()
-        self._get_me_failure_count.clear()
-        self._get_me_circuit_open.clear()
-        # Phase 2B: Clear metrics tracking
-        self._messages_handled.clear()
-        self._messages_skipped.clear()
-        self._skip_reasons.clear()
-        self._skipped_since_last_log.clear()
+        # Phase 2A: Clear error recovery tracking (delegate to module)
+        self._error_recovery.clear()
+        # Phase 2B: Clear metrics tracking (delegate to module)
+        self._metrics.clear()
 
     def get_status(self) -> dict:
-        # Phase 2B: Aggregate metrics for observability
-        total_handled = sum(self._messages_handled.values())
-        total_skipped = sum(self._messages_skipped.values())
-
-        # Aggregate skip reasons across all groups
-        aggregated_skip_reasons: dict[str, int] = {}
-        for group_reasons in self._skip_reasons.values():
-            for reason, count in group_reasons.items():
-                aggregated_skip_reasons[reason] = aggregated_skip_reasons.get(reason, 0) + count
+        # Phase 2B: Get aggregated metrics from metrics module
+        metrics_summary = self._metrics.get_summary()
 
         return {
             "running": self.running,
@@ -608,10 +586,10 @@ class LiveCrawlerService:
             "start_error": self._start_error,
             "groups_count": len(self.group_id_map),
             "messages_received": self._message_count,
-            # Phase 2B: Message handling metrics
-            "messages_handled": total_handled,
-            "messages_skipped": total_skipped,
-            "skip_reasons": aggregated_skip_reasons,
+            # Phase 2B: Message handling metrics (delegated to metrics module)
+            "messages_handled": metrics_summary["messages_handled"],
+            "messages_skipped": metrics_summary["messages_skipped"],
+            "skip_reasons": metrics_summary["skip_reasons"],
             "historical_crawl_running": self._historical_crawl_running or self._batch_crawl_active,
             "currently_crawling_group_id": self._currently_crawling_group_id,
             "currently_crawling_group_title": (
@@ -1567,8 +1545,8 @@ class LiveCrawlerService:
                 # No assignment yet, all connections can handle (backward compatible)
                 return True
 
-            # Get this client's telegram_user_id (cached or fresh)
-            my_telegram_user_id = await self._get_telegram_user_id_with_retry(client, user_id)
+            # Get this client's telegram_user_id with error recovery (caching, retries, circuit breaker)
+            my_telegram_user_id = await self._error_recovery.get_telegram_user_id_with_retry(client, user_id)
             if my_telegram_user_id is None:
                 logger.warning(
                     "_should_handle_group: failed to get telegram_user_id for group %s after retries (fail open)",
@@ -1595,205 +1573,12 @@ class LiveCrawlerService:
                     group_id, assigned_conn_id[:8] + "...", my_conn_id[:8] + "..."
                 )
 
-            # Reset failure counter on success
-            if user_id is not None:
-                self._get_me_failure_count[user_id] = 0
-
             return should_handle
 
         except Exception as e:
             logger.error("_should_handle_group: unexpected error for group %s: %s", group_id, e)
             return True  # Default: handle (fail open)
 
-    async def _get_telegram_user_id_with_retry(self, client: TelegramClient, user_id: int | None) -> int | None:
-        """Get telegram_user_id with caching, retries, and circuit breaker.
-
-        Phase 2A: Error Recovery.
-
-        - Checks cache first (5-min TTL)
-        - Retries transient failures up to 3 times
-        - Implements circuit breaker with exponential backoff (30s→60s→120s)
-        - Alerts Sentry on persistent failures (5+ consecutive failures)
-
-        Args:
-            client: TelegramClient instance
-            user_id: Optional admin user ID (for error tracking)
-
-        Returns:
-            telegram_user_id (int) or None if failed after retries
-        """
-        if user_id is None:
-            # Try to extract user_id from clients dict, fallback to None
-            user_id = next((uid for uid, c in self.clients.items() if c is client), None)
-
-        # Check cache first
-        if user_id is not None and user_id in self._get_me_cache:
-            cached_user_id, timestamp = self._get_me_cache[user_id]
-            if time.monotonic() - timestamp < self._get_me_cache_ttl:
-                logger.debug("_get_telegram_user_id_with_retry: cache hit for user %s", user_id)
-                return cached_user_id
-
-        # Check if circuit is open
-        if user_id is not None and user_id in self._get_me_circuit_open:
-            circuit_open_at = self._get_me_circuit_open[user_id]
-            if time.monotonic() - circuit_open_at < self._get_me_circuit_backoff:
-                logger.debug(
-                    "_get_telegram_user_id_with_retry: circuit open for user %s, backoff active",
-                    user_id
-                )
-                return None
-
-        # Retry logic: up to 3 attempts
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                me = await asyncio.wait_for(client.get_me(), timeout=5.0)
-                if not me or not me.id:
-                    logger.warning(
-                        "_get_telegram_user_id_with_retry: get_me() returned empty for user %s (attempt %d/%d)",
-                        user_id, attempt + 1, max_retries
-                    )
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(0.5)  # Brief backoff before retry
-                    continue
-
-                my_telegram_user_id = int(me.id)
-
-                # Cache the result
-                if user_id is not None:
-                    self._get_me_cache[user_id] = (my_telegram_user_id, time.monotonic())
-                    self._get_me_failure_count[user_id] = 0  # Reset failure counter
-
-                logger.debug(
-                    "_get_telegram_user_id_with_retry: get_me() success for user %s -> telegram_user_id %s",
-                    user_id, my_telegram_user_id
-                )
-                return my_telegram_user_id
-
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "_get_telegram_user_id_with_retry: get_me() timeout for user %s (attempt %d/%d)",
-                    user_id, attempt + 1, max_retries
-                )
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1.0)  # Longer backoff for timeout
-                continue
-
-            except Exception as e:
-                logger.warning(
-                    "_get_telegram_user_id_with_retry: get_me() error for user %s (attempt %d/%d): %s",
-                    user_id, attempt + 1, max_retries, e
-                )
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(0.5)  # Brief backoff before retry
-                continue
-
-        # All retries exhausted: circuit breaker
-        if user_id is not None:
-            self._get_me_failure_count[user_id] = self._get_me_failure_count.get(user_id, 0) + 1
-            failure_count = self._get_me_failure_count[user_id]
-
-            # Open circuit after 5 consecutive failures
-            if failure_count >= 5:
-                self._get_me_circuit_open[user_id] = time.monotonic()
-                logger.error(
-                    "_get_telegram_user_id_with_retry: circuit opened for user %s after %d consecutive failures",
-                    user_id, failure_count
-                )
-                # Alert Sentry
-                try:
-                    sentry_sdk.capture_exception(
-                        Exception(f"get_me() circuit breaker open for user {user_id} after {failure_count} failures")
-                    )
-                except Exception:
-                    pass
-
-        logger.error(
-            "_get_telegram_user_id_with_retry: failed to get telegram_user_id for user %s after %d retries",
-            user_id, max_retries
-        )
-        return None
-
-    async def _cleanup_get_me_cache(self) -> None:
-        """Periodic cleanup of get_me() caches to prevent unbounded growth.
-
-        Phase 2A: Error Recovery cleanup.
-
-        Removes:
-        - Expired cache entries (older than 5 min)
-        - Closed circuits (backoff period expired)
-        - Stale failure counters (5+ hours with no failures)
-
-        Called periodically (every 30 min) during gap-fill.
-        """
-        try:
-            now = time.monotonic()
-            stale_users = []
-
-            # Clean expired cache entries
-            for user_id, (_, timestamp) in list(self._get_me_cache.items()):
-                if now - timestamp > self._get_me_cache_ttl * 2:  # 2x TTL = stale
-                    stale_users.append(user_id)
-
-            # Clean closed circuits that have expired
-            for user_id, circuit_open_at in list(self._get_me_circuit_open.items()):
-                if now - circuit_open_at > 3600:  # 1 hour: circuit can reset
-                    del self._get_me_circuit_open[user_id]
-                    stale_users.append(user_id)
-
-            # Remove stale user tracking
-            for user_id in stale_users:
-                self._get_me_cache.pop(user_id, None)
-                self._get_me_failure_count.pop(user_id, None)
-
-            if stale_users:
-                logger.info("_cleanup_get_me_cache: cleaned up tracking for %d users", len(stale_users))
-
-        except Exception as e:
-            logger.warning("_cleanup_get_me_cache error: %s", e)
-
-    def _track_message_handled(self, group_id: int) -> None:
-        """Track a handled message for per-group metrics.
-
-        Phase 2B: Logging optimization.
-        Used for observability: dashboard can show messages handled per group.
-        """
-        self._messages_handled[group_id] = self._messages_handled.get(group_id, 0) + 1
-        # Reset skipped counter when we get a handled message (shows activity)
-        self._skipped_since_last_log[group_id] = 0
-
-    def _track_message_skipped(self, group_id: int, reason: str) -> None:
-        """Track a skipped message with sampling to avoid log spam.
-
-        Phase 2B: Logging optimization.
-
-        Logs every Nth skipped message (configurable via _skip_log_interval).
-        Tracks reason for skipping for debugging.
-
-        Args:
-            group_id: Telegram group ID
-            reason: Why message was skipped (e.g., 'not_in_map', 'not_assigned', 'not_enabled')
-        """
-        self._messages_skipped[group_id] = self._messages_skipped.get(group_id, 0) + 1
-        self._skipped_since_last_log[group_id] = self._skipped_since_last_log.get(group_id, 0) + 1
-
-        # Track skip reason
-        if group_id not in self._skip_reasons:
-            self._skip_reasons[group_id] = {}
-        self._skip_reasons[group_id][reason] = self._skip_reasons[group_id].get(reason, 0) + 1
-
-        # Log with sampling to avoid spam: every Nth skipped message
-        if self._skipped_since_last_log[group_id] >= self._skip_log_interval:
-            group_title = self._get_group_title(group_id)
-            skipped_count = self._messages_skipped[group_id]
-            reasons_str = ", ".join(
-                f"{r}={c}" for r, c in sorted(self._skip_reasons[group_id].items())
-            )
-            logger.debug(
-                "[SKIP] %s: skipped %d messages (reasons: %s)",
-                group_title, skipped_count, reasons_str
-            )
-            self._skipped_since_last_log[group_id] = 0
 
     def _get_group_title(self, gid: int) -> str:
         info = self.group_info_map.get(gid, {})
@@ -2022,7 +1807,7 @@ class LiveCrawlerService:
                 logger.debug("[GAP-FILL] Cleaned up %d expired FloodWait penalties", len(expired_penalties))
 
             # Phase 2A: Cleanup get_me() cache and circuit breaker state
-            await self._cleanup_get_me_cache()
+            await self._error_recovery.cleanup()
 
             for gid in list(self.group_id_map.keys()):
                 if not self.running:
@@ -2483,13 +2268,13 @@ class LiveCrawlerService:
                     chat_id = self._normalize_chat_id(event.chat_id)
                     if chat_id not in self.group_id_map:
                         # Phase 2B: Track skipped message (group not registered)
-                        self._track_message_skipped(chat_id, "not_in_map")
+                        self._metrics.track_skipped(chat_id, "not_in_map")
                         return
 
                     # Phase 2: Duplicate prevention — only handle if this client is assigned
                     if not await self._should_handle_group(chat_id, _c, user_id):
                         # Phase 2B: Track skipped message (not assigned to this connection)
-                        self._track_message_skipped(chat_id, "not_assigned")
+                        self._metrics.track_skipped(chat_id, "not_assigned")
                         return
 
                     group_uuid = self.group_id_map[chat_id]
@@ -2497,11 +2282,11 @@ class LiveCrawlerService:
 
                     if not await self._is_group_enabled(group_uuid):
                         # Phase 2B: Track skipped message (group disabled)
-                        self._track_message_skipped(chat_id, "not_enabled")
+                        self._metrics.track_skipped(chat_id, "not_enabled")
                         return
 
                     # Phase 2B: Track handled message for metrics
-                    self._track_message_handled(chat_id)
+                    self._metrics.track_handled(chat_id)
 
                     logger.info("[NEW] %s: %s", group_title, (event.text or "[media]")[:80])
                     await self._enqueue_message(
@@ -2520,17 +2305,17 @@ class LiveCrawlerService:
                     chat_id = self._normalize_chat_id(event.chat_id)
                     if chat_id not in self.group_id_map:
                         # Phase 2B: Track skipped message (group not registered)
-                        self._track_message_skipped(chat_id, "not_in_map")
+                        self._metrics.track_skipped(chat_id, "not_in_map")
                         return
 
                     # Phase 2: Duplicate prevention — only handle if this client is assigned
                     if not await self._should_handle_group(chat_id, _c, user_id):
                         # Phase 2B: Track skipped message (not assigned to this connection)
-                        self._track_message_skipped(chat_id, "not_assigned")
+                        self._metrics.track_skipped(chat_id, "not_assigned")
                         return
 
                     # Phase 2B: Track handled message for metrics
-                    self._track_message_handled(chat_id)
+                    self._metrics.track_handled(chat_id)
 
                     group_uuid = self.group_id_map[chat_id]
                     logger.info("[EDIT] %s: msg %d", self._get_group_title(chat_id), event.message.id)
@@ -2547,18 +2332,18 @@ class LiveCrawlerService:
                     chat_id = self._normalize_chat_id(event.chat_id)
                     if chat_id not in self.group_id_map:
                         # Phase 2B: Track skipped message (group not registered)
-                        self._track_message_skipped(chat_id, "not_in_map")
+                        self._metrics.track_skipped(chat_id, "not_in_map")
                         return
 
                     # Phase 2: Duplicate prevention — only handle if this client is assigned
                     if not await self._should_handle_group(chat_id, _c, user_id):
                         # Phase 2B: Track skipped message (not assigned to this connection)
-                        self._track_message_skipped(chat_id, "not_assigned")
+                        self._metrics.track_skipped(chat_id, "not_assigned")
                         return
 
                     # Phase 2B: Track handled messages (counting each deleted ID)
                     for _ in event.deleted_ids:
-                        self._track_message_handled(chat_id)
+                        self._metrics.track_handled(chat_id)
 
                     group_uuid = self.group_id_map[chat_id]
                     deleted_ids = list(event.deleted_ids)
@@ -2590,17 +2375,17 @@ class LiveCrawlerService:
                     new_id = action.channel_id
                     if old_id not in self.group_id_map:
                         # Phase 2B: Track skipped message (group not registered)
-                        self._track_message_skipped(old_id, "not_in_map")
+                        self._metrics.track_skipped(old_id, "not_in_map")
                         return
 
                     # Phase 2: Duplicate prevention — only handle if this client is assigned
                     if not await self._should_handle_group(old_id, _c, user_id):
                         # Phase 2B: Track skipped message (not assigned to this connection)
-                        self._track_message_skipped(old_id, "not_assigned")
+                        self._metrics.track_skipped(old_id, "not_assigned")
                         return
 
                     # Phase 2B: Track handled message (migration event)
-                    self._track_message_handled(old_id)
+                    self._metrics.track_handled(old_id)
 
                     group_uuid = self.group_id_map[old_id]
                     logger.critical(

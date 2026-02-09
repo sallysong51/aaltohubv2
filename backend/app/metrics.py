@@ -1,138 +1,135 @@
+"""Message Handling Metrics — Per-group counters with sampling for observability.
+
+Phase 2B: Logging Optimization & Metrics Enhancement.
+
+Tracks:
+- Messages handled per group
+- Messages skipped per group (with sampling to reduce log spam)
+- Skip reasons (why events rejected)
+- Aggregated metrics for dashboard visibility
 """
-Prometheus-compatible metrics endpoint for AaltoHub v2.
+import logging
+from typing import Callable
 
-Provides counters and gauges in Prometheus text exposition format.
-No external dependencies required -- uses plain Python with thread-safe counters.
-
-Metrics exposed:
-  - aaltohub_messages_total          (counter)  Total messages processed
-  - aaltohub_crawler_groups_active   (gauge)    Number of active crawler groups
-  - aaltohub_queue_size              (gauge)    Current message queue size
-  - aaltohub_http_requests_total     (counter)  HTTP requests by method/path/status
-  - aaltohub_db_operations_total     (counter)  Database operations executed
-"""
-
-import threading
-import time
-from typing import Dict, Tuple
+logger = logging.getLogger(__name__)
 
 
-class _Counter:
-    """Thread-safe monotonically increasing counter."""
+class MessageMetrics:
+    """Track message handling and skipping with per-group visibility.
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._value: float = 0
+    Usage:
+        metrics = MessageMetrics(get_group_title_func)
+        metrics.track_handled(group_id)
+        metrics.track_skipped(group_id, "not_assigned")
 
-    def inc(self, amount: float = 1) -> None:
-        with self._lock:
-            self._value += amount
+        # Aggregate for dashboard
+        summary = metrics.get_summary()
+    """
 
-    @property
-    def value(self) -> float:
-        with self._lock:
-            return self._value
+    def __init__(self, get_group_title: Callable[[int], str]):
+        """Initialize message metrics.
 
+        Args:
+            get_group_title: Function to get group title from group_id
+        """
+        self._get_group_title = get_group_title
 
-class _LabeledCounter:
-    """Thread-safe counter with label dimensions."""
+        # Per-group message counters
+        self._messages_handled: dict[int, int] = {}  # group_id -> count
+        self._messages_skipped: dict[int, int] = {}  # group_id -> count
+        self._skip_reasons: dict[int, dict[str, int]] = {}  # group_id -> {reason: count}
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._values: Dict[Tuple[str, ...], float] = {}
+        # Sampling: log every Nth skipped message to avoid log spam
+        self._skipped_since_last_log: dict[int, int] = {}  # group_id -> count since last log
+        self._skip_log_interval = 100  # Log every 100 skipped messages per group
 
-    def inc(self, labels: Tuple[str, ...], amount: float = 1) -> None:
-        with self._lock:
-            self._values[labels] = self._values.get(labels, 0) + amount
+    def track_handled(self, group_id: int) -> None:
+        """Track a handled message for per-group metrics.
 
-    def items(self) -> list:
-        with self._lock:
-            return list(self._values.items())
+        Args:
+            group_id: Telegram group ID
+        """
+        self._messages_handled[group_id] = self._messages_handled.get(group_id, 0) + 1
+        # Reset skipped counter when we get a handled message (shows activity)
+        self._skipped_since_last_log[group_id] = 0
 
+    def track_skipped(self, group_id: int, reason: str) -> None:
+        """Track a skipped message with sampling to avoid log spam.
 
-class _Gauge:
-    """Thread-safe gauge that can go up or down."""
+        Logs every Nth skipped message (configurable via _skip_log_interval).
+        Tracks reason for skipping for debugging.
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._value: float = 0
+        Args:
+            group_id: Telegram group ID
+            reason: Why message was skipped (e.g., 'not_in_map', 'not_assigned', 'not_enabled')
+        """
+        self._messages_skipped[group_id] = self._messages_skipped.get(group_id, 0) + 1
+        self._skipped_since_last_log[group_id] = self._skipped_since_last_log.get(group_id, 0) + 1
 
-    def set(self, value: float) -> None:
-        with self._lock:
-            self._value = value
+        # Track skip reason
+        if group_id not in self._skip_reasons:
+            self._skip_reasons[group_id] = {}
+        self._skip_reasons[group_id][reason] = self._skip_reasons[group_id].get(reason, 0) + 1
 
-    def inc(self, amount: float = 1) -> None:
-        with self._lock:
-            self._value += amount
-
-    def dec(self, amount: float = 1) -> None:
-        with self._lock:
-            self._value -= amount
-
-    @property
-    def value(self) -> float:
-        with self._lock:
-            return self._value
-
-
-class MetricsRegistry:
-    """Central registry for all application metrics."""
-
-    def __init__(self) -> None:
-        # Counters
-        self.http_requests_total = _LabeledCounter()
-
-        # Gauges — these are set to absolute values from the crawler process,
-        # not monotonically incremented, so _Gauge (not _Counter) is correct.
-        self.messages_total = _Gauge()
-        self.crawler_groups_active = _Gauge()
-        self.queue_size = _Gauge()
-        self.sse_connections = _Gauge()
-
-        self._start_time = time.time()
-
-    def render(self) -> str:
-        """Render all metrics in Prometheus text exposition format."""
-        lines: list[str] = []
-
-        # -- aaltohub_messages_total --
-        lines.append("# HELP aaltohub_messages_total Total messages processed by the crawler.")
-        lines.append("# TYPE aaltohub_messages_total gauge")
-        lines.append(f"aaltohub_messages_total {self.messages_total.value}")
-
-        # -- aaltohub_crawler_groups_active --
-        lines.append("# HELP aaltohub_crawler_groups_active Number of active crawler groups.")
-        lines.append("# TYPE aaltohub_crawler_groups_active gauge")
-        lines.append(f"aaltohub_crawler_groups_active {self.crawler_groups_active.value}")
-
-        # -- aaltohub_queue_size --
-        lines.append("# HELP aaltohub_queue_size Current message queue size.")
-        lines.append("# TYPE aaltohub_queue_size gauge")
-        lines.append(f"aaltohub_queue_size {self.queue_size.value}")
-
-        # -- aaltohub_sse_connections --
-        lines.append("# HELP aaltohub_sse_connections Active SSE client connections.")
-        lines.append("# TYPE aaltohub_sse_connections gauge")
-        lines.append(f"aaltohub_sse_connections {self.sse_connections.value}")
-
-        # -- aaltohub_http_requests_total --
-        lines.append("# HELP aaltohub_http_requests_total Total HTTP requests by method, path, and status.")
-        lines.append("# TYPE aaltohub_http_requests_total counter")
-        for labels, value in self.http_requests_total.items():
-            method, path, status = labels
-            lines.append(
-                f'aaltohub_http_requests_total{{method="{method}",path="{path}",status="{status}"}} {value}'
+        # Log with sampling: every Nth skipped message per group
+        if self._skipped_since_last_log[group_id] >= self._skip_log_interval:
+            group_title = self._get_group_title(group_id)
+            skipped_count = self._messages_skipped[group_id]
+            reasons_str = ", ".join(
+                f"{r}={c}" for r, c in sorted(self._skip_reasons[group_id].items())
             )
+            logger.debug(
+                "[SKIP] %s: skipped %d messages (reasons: %s)",
+                group_title,
+                skipped_count,
+                reasons_str,
+            )
+            self._skipped_since_last_log[group_id] = 0
 
-        # -- aaltohub_uptime_seconds --
-        lines.append("# HELP aaltohub_uptime_seconds Seconds since the metrics registry was created.")
-        lines.append("# TYPE aaltohub_uptime_seconds gauge")
-        lines.append(f"aaltohub_uptime_seconds {time.time() - self._start_time:.1f}")
+    def get_summary(self) -> dict:
+        """Get aggregated metrics for status/dashboard.
 
-        # Prometheus text format requires a trailing newline
-        lines.append("")
-        return "\n".join(lines)
+        Returns:
+            Dict with keys:
+            - messages_handled: total handled count
+            - messages_skipped: total skipped count
+            - skip_reasons: aggregated skip reasons across all groups
+        """
+        total_handled = sum(self._messages_handled.values())
+        total_skipped = sum(self._messages_skipped.values())
 
+        # Aggregate skip reasons across all groups
+        aggregated_skip_reasons: dict[str, int] = {}
+        for group_reasons in self._skip_reasons.values():
+            for reason, count in group_reasons.items():
+                aggregated_skip_reasons[reason] = aggregated_skip_reasons.get(reason, 0) + count
 
-# Singleton instance -- import this from anywhere in the backend
-metrics = MetricsRegistry()
+        return {
+            "messages_handled": total_handled,
+            "messages_skipped": total_skipped,
+            "skip_reasons": aggregated_skip_reasons,
+        }
+
+    def get_per_group_metrics(self, group_id: int) -> dict:
+        """Get metrics for a specific group.
+
+        Args:
+            group_id: Telegram group ID
+
+        Returns:
+            Dict with handled, skipped, and reasons for this group
+        """
+        return {
+            "group_id": group_id,
+            "group_title": self._get_group_title(group_id),
+            "handled": self._messages_handled.get(group_id, 0),
+            "skipped": self._messages_skipped.get(group_id, 0),
+            "skip_reasons": self._skip_reasons.get(group_id, {}),
+        }
+
+    def clear(self) -> None:
+        """Clear all metrics on shutdown."""
+        self._messages_handled.clear()
+        self._messages_skipped.clear()
+        self._skip_reasons.clear()
+        self._skipped_since_last_log.clear()
