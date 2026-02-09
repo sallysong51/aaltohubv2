@@ -529,6 +529,27 @@ function AdminDashboardContent() {
               <LinkIcon className="h-3.5 w-3.5 mr-1.5" />
               미등록 그룹
             </Button>
+            {/* Phase 1: Auto-detect group-connection mappings for multi-connection admins */}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={async () => {
+                try {
+                  const res = await adminApi.detectGroupConnections();
+                  toast.success(
+                    `✓ ${res.data.updated}개 그룹 자동 매핑됨 ` +
+                    (res.data.unlinked_remaining > 0 ? `(${res.data.unlinked_remaining}개 미연결)` : '')
+                  );
+                  loadGroups();
+                } catch (error) {
+                  toast.error(getApiErrorMessage(error, '그룹 감지에 실패했습니다'));
+                }
+              }}
+              className="h-8 px-3 text-xs"
+            >
+              <Loader2 className="h-3.5 w-3.5 mr-1.5" />
+              연결 감지
+            </Button>
             <Button
               variant="ghost"
               size="sm"

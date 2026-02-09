@@ -641,6 +641,16 @@ export const adminApi = {
     }>(
       '/admin/backfill-connection-ids'
     ),
+
+  detectGroupConnections: () =>
+    apiClient.post<{
+      success: boolean;
+      updated: number;
+      unlinked_remaining: number;
+      message: string;
+    }>(
+      '/admin/detect-group-connections'
+    ),
 };
 
 // ============================================================

@@ -391,6 +391,9 @@ class LiveCrawlerService:
             # Load groups (shared across all clients)
             await self.refresh_groups()
 
+            # Discover which groups each connection can access (for multi-connection backfill)
+            await self.discover_group_accessibility()
+
             # Load persisted entity cache (avoids get_entity API calls on restart)
             await self._load_entity_cache()
 
@@ -1071,6 +1074,125 @@ class LiveCrawlerService:
             logger.info("Live crawler: %d groups loaded", len(self.group_id_map))
         except Exception as e:
             logger.error("Live crawler: failed to refresh groups: %s", e)
+
+    async def discover_group_accessibility(self) -> None:
+        """Discover which groups each Telegram connection can access.
+
+        Called during startup to populate connection_accessible_groups table.
+        This data is used by backfill_connection_ids() to auto-assign groups
+        to correct connections for multi-connection admins.
+
+        Algorithm:
+        1. For each admin client, call get_dialogs() to list accessible groups
+        2. Store (connection_id, group_id) mappings in DB
+        3. Clear old entries (stale discoveries are removed)
+        """
+        if not self.clients:
+            logger.debug("discover_group_accessibility: no clients connected")
+            return
+
+        try:
+            logger.info("discover_group_accessibility: starting for %d connections", len(self.clients))
+
+            # Get all admin's connections
+            admin_ids = list(self.clients.keys())
+            connections = await db.fetch(
+                "SELECT id, user_id FROM telegram_connections WHERE user_id = ANY($1::bigint[])",
+                admin_ids,
+            )
+
+            if not connections:
+                logger.debug("discover_group_accessibility: no telegram_connections found")
+                return
+
+            # Build map: user_id -> [connection_ids]
+            user_connections: dict[int, list[str]] = {}
+            for conn in connections:
+                user_id = conn["user_id"]
+                conn_id = str(conn["id"])
+                if user_id not in user_connections:
+                    user_connections[user_id] = []
+                user_connections[user_id].append(conn_id)
+
+            # For each admin (user_id -> client)
+            for user_id, client in self.clients.items():
+                try:
+                    # Get this admin's connections
+                    admin_conn_ids = user_connections.get(user_id, [])
+                    if not admin_conn_ids:
+                        logger.debug("discover_group_accessibility: user %s has no connections", user_id)
+                        continue
+
+                    # Get this client's accessible groups via get_dialogs()
+                    try:
+                        dialogs = await asyncio.wait_for(
+                            client.get_dialogs(limit=None),
+                            timeout=30.0
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("discover_group_accessibility: get_dialogs() timed out for user %s", user_id)
+                        continue
+
+                    if not dialogs:
+                        logger.debug("discover_group_accessibility: user %s has no dialogs", user_id)
+                        continue
+
+                    # Extract group IDs from dialogs
+                    discovered_group_ids: set[int] = set()
+                    for dialog in dialogs:
+                        try:
+                            entity = dialog.entity
+                            if not entity:
+                                continue
+                            # Get the entity's ID (works for Chat, Channel, User)
+                            if hasattr(entity, 'id'):
+                                gid = int(entity.id)
+                                discovered_group_ids.add(gid)
+                        except Exception as e:
+                            logger.debug("discover_group_accessibility: failed to extract group ID: %s", e)
+                            continue
+
+                    if not discovered_group_ids:
+                        logger.debug("discover_group_accessibility: no group IDs found for user %s", user_id)
+                        continue
+
+                    logger.info(
+                        "discover_group_accessibility: user %s can access %d groups",
+                        user_id, len(discovered_group_ids)
+                    )
+
+                    # Store mappings: connection_id -> group_id
+                    # For multi-connection admins, assign to first available connection
+                    # (refined backfill will choose more precisely)
+                    primary_conn_id = admin_conn_ids[0]
+
+                    for group_id in discovered_group_ids:
+                        try:
+                            await db.execute(
+                                """INSERT INTO connection_accessible_groups (connection_id, group_id)
+                                   VALUES ($1, $2)
+                                   ON CONFLICT (connection_id, group_id) DO UPDATE
+                                   SET discovered_at = NOW()""",
+                                primary_conn_id, group_id
+                            )
+                        except Exception as e:
+                            logger.debug("discover_group_accessibility: failed to store mapping %s/%s: %s",
+                                       primary_conn_id, group_id, e)
+                            continue
+
+                    logger.info(
+                        "discover_group_accessibility: stored %d accessible groups for user %s",
+                        len(discovered_group_ids), user_id
+                    )
+
+                except Exception as e:
+                    logger.warning("discover_group_accessibility failed for user %s: %s", user_id, e)
+                    continue
+
+            logger.info("discover_group_accessibility: completed")
+
+        except Exception as e:
+            logger.error("discover_group_accessibility: unexpected error: %s", e)
 
     def _get_group_title(self, gid: int) -> str:
         info = self.group_info_map.get(gid, {})

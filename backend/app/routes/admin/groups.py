@@ -150,15 +150,150 @@ async def backfill_connection_ids(
                 "connection_display_name": connection_display_name,
             }
 
+        # Multiple connections: try smart detection
+        logger.info(
+            "backfill_connection_ids: admin %s has %d connections, attempting smart detection",
+            current_user.id, len(connections)
+        )
+
+        # Try to auto-assign using discovered connection-group accessibility
+        updated = await _detect_and_assign_group_connections(current_user.id)
+        if updated > 0:
+            return {
+                "success": True,
+                "message": "Auto-detected and assigned groups to connections",
+                "updated": updated,
+                "connection_count": len(connections),
+            }
+
         return {
             "success": False,
-            "message": "Multiple connections found. Re-register groups per connection.",
+            "message": "Multiple connections found. Run detect-group-connections to auto-assign, or re-register groups per connection.",
             "updated": 0,
             "connection_count": len(connections),
         }
     except Exception as e:
         logger.error("backfill_connection_ids error: %s", e)
         raise HTTPException(status_code=500, detail="Failed to backfill connection IDs")
+
+
+async def _detect_and_assign_group_connections(user_id: int) -> int:
+    """Helper: Auto-assign groups to connections based on accessibility discovery.
+
+    Uses connection_accessible_groups table to determine which connection should
+    manage each group. For groups accessible by multiple connections, picks the first.
+
+    Returns: number of groups assigned
+    """
+    try:
+        # Get groups with NULL connection_id for this user
+        unlinked = await db.fetch(
+            """SELECT ug.group_id
+               FROM user_groups ug
+               WHERE ug.user_id = $1 AND ug.connection_id IS NULL""",
+            user_id,
+        )
+
+        if not unlinked:
+            logger.debug("_detect_and_assign_group_connections: no unlinked groups for user %s", user_id)
+            return 0
+
+        unlinked_group_ids = [row["group_id"] for row in unlinked]
+        logger.info(
+            "_detect_and_assign_group_connections: found %d unlinked groups for user %s",
+            len(unlinked_group_ids), user_id
+        )
+
+        updated_count = 0
+
+        # For each unlinked group, find an accessible connection
+        for group_id in unlinked_group_ids:
+            try:
+                # Find a connection that can access this group
+                accessible = await db.fetchval(
+                    """SELECT connection_id
+                       FROM connection_accessible_groups cag
+                       WHERE cag.group_id = $1
+                         AND cag.connection_id IN (
+                             SELECT id FROM telegram_connections
+                             WHERE user_id = $2
+                         )
+                       LIMIT 1""",
+                    group_id, user_id
+                )
+
+                if accessible:
+                    # Auto-assign this group to the accessible connection
+                    await db.execute(
+                        """UPDATE user_groups
+                           SET connection_id = $1
+                           WHERE user_id = $2 AND group_id = $3""",
+                        accessible, user_id, group_id
+                    )
+                    updated_count += 1
+                    logger.debug(
+                        "_detect_and_assign_group_connections: assigned group %s to connection %s",
+                        group_id, accessible
+                    )
+            except Exception as e:
+                logger.warning(
+                    "_detect_and_assign_group_connections: failed to assign group %s: %s",
+                    group_id, e
+                )
+                continue
+
+        logger.info(
+            "_detect_and_assign_group_connections: assigned %d groups for user %s",
+            updated_count, user_id
+        )
+        return updated_count
+
+    except Exception as e:
+        logger.error("_detect_and_assign_group_connections error: %s", e)
+        return 0
+
+
+@router.post("/detect-group-connections")
+async def detect_group_connections(
+    current_user: UserResponse = Depends(get_current_admin_user),
+):
+    """Manually trigger group-connection detection for multi-connection admins.
+
+    This endpoint uses the connection_accessible_groups table (populated by
+    live_crawler.discover_group_accessibility() at startup) to auto-assign
+    groups to their correct connections.
+
+    Call this endpoint after:
+    1. Adding new Telegram connections
+    2. Registering new groups (if multi-connection)
+    3. After getting "Multiple connections found" error from backfill endpoint
+
+    Returns:
+    - updated: number of groups auto-assigned
+    - unlinked_remaining: groups still without connection_id
+    - message: summary of results
+    """
+    try:
+        # Trigger detection
+        updated = await _detect_and_assign_group_connections(current_user.id)
+
+        # Check how many unlinked groups remain
+        remaining = await db.fetchval(
+            """SELECT COUNT(*)
+               FROM user_groups
+               WHERE user_id = $1 AND connection_id IS NULL""",
+            current_user.id,
+        )
+
+        return {
+            "success": True,
+            "updated": updated,
+            "unlinked_remaining": remaining or 0,
+            "message": f"Auto-assigned {updated} groups. {remaining or 0} groups still unlinked (register manually or check if connections have access).",
+        }
+    except Exception as e:
+        logger.error("detect_group_connections error: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to detect group connections")
 
 
 @router.get("/unmapped-groups")
