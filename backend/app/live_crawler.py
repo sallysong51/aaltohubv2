@@ -927,6 +927,38 @@ class LiveCrawlerService:
     _detect_media_type = staticmethod(detect_media_type)
     _select_photo_size = staticmethod(select_photo_size)
 
+    @staticmethod
+    def _extract_forum_topic_id(message) -> int | None:
+        """Extract forum topic ID from a Telethon message object.
+
+        Forum topics use the reply_to_top_id field. Returns None if:
+        - Message has no reply_to info
+        - Not a forum topic message (forum_topic flag is False)
+        - reply_to_top_id is missing (may be root message)
+
+        Args:
+            message: Telethon Message object
+
+        Returns:
+            Topic ID (int) or None
+        """
+        if not hasattr(message, "reply_to") or not message.reply_to:
+            return None
+
+        if not hasattr(message.reply_to, "forum_topic") or not message.reply_to.forum_topic:
+            return None
+
+        topic_id = getattr(message.reply_to, "reply_to_top_id", None)
+
+        # Log edge case for diagnostics
+        if topic_id is None:
+            logger.debug(
+                "Forum topic message with no reply_to_top_id: msg_id=%s, group=%s",
+                message.id, getattr(message, "peer_id", "unknown")
+            )
+
+        return topic_id
+
     async def _enqueue_message(
         self,
         message,
@@ -974,19 +1006,7 @@ class LiveCrawlerService:
                 if hasattr(message.sender, "last_name") and message.sender.last_name:
                     sender_name = f"{sender_name} {message.sender.last_name}"
 
-            topic_id = None
-            if hasattr(message, "reply_to") and message.reply_to:
-                if hasattr(message.reply_to, "forum_topic") and message.reply_to.forum_topic:
-                    # Only use reply_to_top_id (canonical field for forum topics)
-                    # Do NOT fallback to reply_to_msg_id (that's for regular replies)
-                    topic_id = getattr(message.reply_to, "reply_to_top_id", None)
-
-                    # If still None, log for diagnostics (may be root message or API change)
-                    if topic_id is None:
-                        logger.debug(
-                            "Forum topic message with no reply_to_top_id: msg_id=%s, group=%s",
-                            message.id, message.peer_id
-                        )
+            topic_id = self._extract_forum_topic_id(message)
 
             # Ensure sent_at is timezone-aware (Telethon may return naive datetime)
             sent_at = message.date
@@ -1102,94 +1122,153 @@ class LiveCrawlerService:
             except Exception as e:
                 logger.warning("Auto-register failed for admin %s: %s", admin_id, e)
 
+    # Forum topic constants
+    FORUM_TOPICS_TIMEOUT = 10.0  # Timeout for GetForumTopicsRequest
+    FORUM_TOPICS_LIMIT = 100  # Max topics per request (Telethon limit)
+
     async def _fetch_and_store_topics(self, group_id: int, client: TelegramClient) -> None:
         """
         Fetch forum topics from Telegram and store in group_topics table.
 
         Only called for groups where has_topics=True.
+
+        Flow:
+        1. Resolve entity
+        2. Verify it's a forum
+        3. Fetch topics from Telegram API
+        4. Convert to DB format
+        5. Batch upsert to DB
         """
         try:
-            from telethon.tl.functions.channels import GetForumTopicsRequest
-
-            # Get entity (from cache or API)
             entity = await self._get_entity_for_group_with_client(group_id, client)
             if not entity:
                 logger.warning("Cannot fetch topics for group %s: entity not found", group_id)
                 return
 
-            # Verify it's actually a forum
             if not getattr(entity, 'forum', False):
                 logger.debug("Group %s is not a forum, skipping topic fetch", group_id)
                 return
 
-            # Fetch topics (limit 100 per request, pagination not implemented in v1)
-            try:
-                result = await asyncio.wait_for(
-                    client(GetForumTopicsRequest(
-                        channel=entity,
-                        offset_date=0,
-                        offset_id=0,
-                        offset_topic=0,
-                        limit=100,
-                        q=''  # Empty query = fetch all topics
-                    )),
-                    timeout=10.0
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Timeout fetching topics for group %s", group_id)
+            topics_data = await self._fetch_topics_from_telegram(group_id, entity, client)
+            if not topics_data:
                 return
 
-            if not result or not result.topics:
-                logger.debug("No topics found for group %s", group_id)
-                return
-
-            # Batch insert/update topics
-            topics_data = []
-            for topic in result.topics:
-                topics_data.append({
-                    'group_id': group_id,
-                    'topic_id': topic.id,
-                    'topic_title': topic.title,
-                    'icon_color': topic.icon_color,
-                    'icon_emoji_id': getattr(topic, 'icon_emoji_id', None),
-                    'is_closed': getattr(topic, 'closed', False),
-                    'is_pinned': getattr(topic, 'pinned', False),
-                    'top_message_id': topic.top_message,
-                    'unread_count': topic.unread_count,
-                })
-
-            # Upsert topics to DB
-            for topic_data in topics_data:
-                await db.execute(
-                    """INSERT INTO group_topics
-                       (group_id, topic_id, topic_title, icon_color, icon_emoji_id,
-                        is_closed, is_pinned, top_message_id, unread_count)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                       ON CONFLICT (group_id, topic_id)
-                       DO UPDATE SET
-                           topic_title = EXCLUDED.topic_title,
-                           icon_color = EXCLUDED.icon_color,
-                           icon_emoji_id = EXCLUDED.icon_emoji_id,
-                           is_closed = EXCLUDED.is_closed,
-                           is_pinned = EXCLUDED.is_pinned,
-                           top_message_id = EXCLUDED.top_message_id,
-                           unread_count = EXCLUDED.unread_count,
-                           updated_at = NOW()""",
-                    topic_data['group_id'],
-                    topic_data['topic_id'],
-                    topic_data['topic_title'],
-                    topic_data['icon_color'],
-                    topic_data['icon_emoji_id'],
-                    topic_data['is_closed'],
-                    topic_data['is_pinned'],
-                    topic_data['top_message_id'],
-                    topic_data['unread_count'],
-                )
-
-            logger.info("Fetched %d topics for group %s", len(topics_data), group_id)
+            await self._batch_upsert_topics(group_id, topics_data)
 
         except Exception as e:
             logger.error("Failed to fetch topics for group %s: %s", group_id, e, exc_info=True)
+
+    async def _fetch_topics_from_telegram(self, group_id: int, entity, client: TelegramClient) -> list:
+        """Fetch forum topics from Telegram API.
+
+        Returns:
+            List of topic data dicts, or empty list if no topics found or error.
+        """
+        from telethon.tl.functions.channels import GetForumTopicsRequest
+
+        try:
+            result = await asyncio.wait_for(
+                client(GetForumTopicsRequest(
+                    channel=entity,
+                    offset_date=0,
+                    offset_id=0,
+                    offset_topic=0,
+                    limit=self.FORUM_TOPICS_LIMIT,
+                    q=''
+                )),
+                timeout=self.FORUM_TOPICS_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Timeout fetching topics for group %s (timeout=%fs)", group_id, self.FORUM_TOPICS_TIMEOUT)
+            return []
+
+        if not result or not result.topics:
+            logger.debug("No topics found for group %s", group_id)
+            return []
+
+        return self._convert_telethon_topics_to_db_format(group_id, result.topics)
+
+    @staticmethod
+    def _convert_telethon_topics_to_db_format(group_id: int, topics: list) -> list:
+        """Convert Telethon ForumTopic objects to database-ready dicts.
+
+        Args:
+            group_id: Telegram group ID
+            topics: List of Telethon ForumTopic objects
+
+        Returns:
+            List of dicts ready for database upsert
+        """
+        topics_data = []
+        for topic in topics:
+            topics_data.append({
+                'group_id': group_id,
+                'topic_id': topic.id,
+                'topic_title': topic.title,
+                'icon_color': topic.icon_color,
+                'icon_emoji_id': getattr(topic, 'icon_emoji_id', None),
+                'is_closed': getattr(topic, 'closed', False),
+                'is_pinned': getattr(topic, 'pinned', False),
+                'top_message_id': topic.top_message,
+                'unread_count': topic.unread_count,
+            })
+        return topics_data
+
+    async def _batch_upsert_topics(self, group_id: int, topics_data: list) -> None:
+        """Batch upsert topics to database.
+
+        Uses a single multi-row INSERT with ON CONFLICT for efficiency.
+
+        Args:
+            group_id: Telegram group ID (for logging)
+            topics_data: List of topic dicts to upsert
+        """
+        if not topics_data:
+            return
+
+        # Build VALUES clause for batch insert
+        placeholders = []
+        params = []
+        for i, topic in enumerate(topics_data):
+            base_idx = i * 9  # 9 columns per row
+            placeholders.append(
+                f"(${base_idx+1}, ${base_idx+2}, ${base_idx+3}, ${base_idx+4}, "
+                f"${base_idx+5}, ${base_idx+6}, ${base_idx+7}, ${base_idx+8}, ${base_idx+9})"
+            )
+            params.extend([
+                topic['group_id'],
+                topic['topic_id'],
+                topic['topic_title'],
+                topic['icon_color'],
+                topic['icon_emoji_id'],
+                topic['is_closed'],
+                topic['is_pinned'],
+                topic['top_message_id'],
+                topic['unread_count'],
+            ])
+
+        query = f"""
+            INSERT INTO group_topics
+            (group_id, topic_id, topic_title, icon_color, icon_emoji_id,
+             is_closed, is_pinned, top_message_id, unread_count)
+            VALUES {', '.join(placeholders)}
+            ON CONFLICT (group_id, topic_id)
+            DO UPDATE SET
+                topic_title = EXCLUDED.topic_title,
+                icon_color = EXCLUDED.icon_color,
+                icon_emoji_id = EXCLUDED.icon_emoji_id,
+                is_closed = EXCLUDED.is_closed,
+                is_pinned = EXCLUDED.is_pinned,
+                top_message_id = EXCLUDED.top_message_id,
+                unread_count = EXCLUDED.unread_count,
+                updated_at = NOW()
+        """
+
+        try:
+            await db.execute(query, *params)
+            logger.info("Upserted %d topics for group %s", len(topics_data), group_id)
+        except Exception as e:
+            logger.error("Failed to upsert %d topics for group %s: %s", len(topics_data), group_id, e)
 
     async def refresh_groups(self) -> None:
         """Load crawl-enabled groups from DB."""

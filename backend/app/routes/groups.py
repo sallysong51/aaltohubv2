@@ -370,18 +370,22 @@ async def get_group_topics(
     group_id: str,
     current_user: UserResponse = Depends(get_current_user),
 ):
-    """Get topics/threads for a group (Telegram forum groups)"""
-    try:
-        try:
-            gid = int(group_id)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid group ID: must be numeric")
+    """Get topics/threads for a group (Telegram forum groups)
 
+    Returns topics with real metadata (title, icons, status) and message counts.
+    Falls back to placeholder names for topics without metadata.
+    """
+    try:
+        gid = int(group_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid group ID: must be numeric")
+
+    try:
         group = await db.fetchrow("SELECT id, visibility, has_topics FROM groups WHERE id = $1", gid)
         if not group:
             raise HTTPException(status_code=404, detail="Group not found")
 
-        # IDOR fix: check private group membership
+        # Authorization check (IDOR prevention)
         if group["visibility"] == GroupVisibility.PRIVATE.value:
             access = await db.fetchrow(
                 "SELECT id FROM user_groups WHERE user_id = $1 AND group_id = $2",
@@ -390,65 +394,87 @@ async def get_group_topics(
             if not access:
                 raise HTTPException(status_code=403, detail="Access denied: Private group")
 
-        # NEW: Query real topic metadata from group_topics table
-        topic_metadata = {}
-        if group["has_topics"]:
-            topic_rows = await db.fetch(
-                """SELECT topic_id, topic_title, icon_color, icon_emoji_id, is_closed, is_pinned, unread_count
-                   FROM group_topics WHERE group_id = $1""",
-                gid,
-            )
-            for row in topic_rows:
-                topic_metadata[row["topic_id"]] = {
-                    "topic_id": row["topic_id"],
-                    "topic_title": row["topic_title"],
-                    "icon_color": row["icon_color"],
-                    "icon_emoji_id": row["icon_emoji_id"],
-                    "is_closed": row["is_closed"],
-                    "is_pinned": row["is_pinned"],
-                    "message_count": 0,  # Will be populated from messages table
-                }
+        # Fetch topic metadata and message counts
+        topics_result = await _fetch_and_aggregate_group_topics(gid, group["has_topics"])
 
-        # Query message counts per topic (limit to 5000 to avoid memory issues)
-        topics_rows = await db.fetch(
-            """SELECT topic_id FROM messages
-               WHERE group_id = $1 AND is_deleted = FALSE AND topic_id IS NOT NULL
-               ORDER BY sent_at DESC LIMIT 5000""",
-            gid,
-        )
+        return sorted(topics_result, key=lambda t: t["message_count"], reverse=True)
 
-        if not topics_rows and not topic_metadata:
-            return []
-
-        # Count messages per topic
-        topic_counts: Dict[int, int] = {}
-        for row in topics_rows:
-            tid = row["topic_id"]
-            topic_counts[tid] = topic_counts.get(tid, 0) + 1
-
-        # Merge metadata + counts
-        final_topics = {}
-
-        # First, add all topics from group_topics (with real names)
-        for tid, meta in topic_metadata.items():
-            meta["message_count"] = topic_counts.get(tid, 0)
-            final_topics[tid] = meta
-
-        # Then, add topics found in messages but not in group_topics (fallback to placeholder)
-        for tid, count in topic_counts.items():
-            if tid not in final_topics:
-                final_topics[tid] = {
-                    "topic_id": tid,
-                    "topic_title": f"Topic {tid}",  # Fallback placeholder
-                    "message_count": count,
-                }
-
-        return sorted(final_topics.values(), key=lambda t: t["message_count"], reverse=True)
     except HTTPException:
         raise
     except Exception as e:
         logger.error("Topics endpoint error for group_id=%s: %s", group_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+async def _fetch_and_aggregate_group_topics(group_id: int, has_topics: bool) -> list:
+    """Fetch and aggregate topic metadata and message counts.
+
+    Combines data from group_topics table (metadata) with message counts.
+    Falls back to placeholder names for topics without metadata.
+
+    Args:
+        group_id: Telegram group ID
+        has_topics: Whether group is a forum
+
+    Returns:
+        List of topic dicts with id, title, message_count, and optional metadata
+    """
+    # Get real topic metadata from group_topics table
+    topic_metadata = {}
+    if has_topics:
+        topic_rows = await db.fetch(
+            """SELECT topic_id, topic_title, icon_color, icon_emoji_id, is_closed, is_pinned, unread_count
+               FROM group_topics WHERE group_id = $1""",
+            group_id,
+        )
+
+        for row in topic_rows:
+            topic_metadata[row["topic_id"]] = {
+                "topic_id": row["topic_id"],
+                "topic_title": row["topic_title"],
+                "icon_color": row["icon_color"],
+                "icon_emoji_id": row["icon_emoji_id"],
+                "is_closed": row["is_closed"],
+                "is_pinned": row["is_pinned"],
+            }
+
+    # Count messages per topic (limit to 5000 rows to avoid memory issues)
+    message_rows = await db.fetch(
+        """SELECT topic_id FROM messages
+           WHERE group_id = $1 AND is_deleted = FALSE AND topic_id IS NOT NULL
+           ORDER BY sent_at DESC LIMIT 5000""",
+        group_id,
+    )
+
+    if not message_rows and not topic_metadata:
+        return []
+
+    # Aggregate message counts
+    topic_counts = {}
+    for row in message_rows:
+        tid = row["topic_id"]
+        topic_counts[tid] = topic_counts.get(tid, 0) + 1
+
+    # Build final topic list
+    final_topics = {}
+
+    # 1. Add all topics from group_topics with real names
+    for tid, meta in topic_metadata.items():
+        final_topics[tid] = {
+            **meta,
+            "message_count": topic_counts.get(tid, 0),
+        }
+
+    # 2. Add topics from messages without metadata (fallback to placeholder)
+    for tid, count in topic_counts.items():
+        if tid not in final_topics:
+            final_topics[tid] = {
+                "topic_id": tid,
+                "topic_title": f"Topic {tid}",
+                "message_count": count,
+            }
+
+    return list(final_topics.values())
 
 
 @router.get("/{group_id}/messages", response_model=MessagesListResponse)
