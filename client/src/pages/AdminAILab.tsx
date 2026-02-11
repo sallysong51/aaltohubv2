@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { adminAI } from '@/lib/api';
 
 /**
  * Admin AI Lab Dashboard
@@ -26,49 +27,64 @@ export default function AdminAILab() {
 
   const loadPrompts = async () => {
     try {
-      // TODO: Implement API call
-      // const data = await getPrompts(selectedType);
-      // setPrompts(data);
+      const response = await adminAI.getPrompts(selectedType);
+      setPrompts(response.data);
       setLoading(false);
     } catch (error) {
       console.error('Error loading prompts:', error);
+      setLoading(false);
     }
   };
 
   const handleSave = async () => {
     try {
-      // TODO: Implement API call
-      // await createPrompt({
-      //   name: `${selectedType}_v${prompts.length + 1}`,
-      //   type: selectedType,
-      //   content: editorContent
-      // });
+      if (!editorContent.trim()) {
+        alert('Prompt content cannot be empty');
+        return;
+      }
+
+      await adminAI.createPrompt({
+        name: `${selectedType}_v${prompts.length + 1}`,
+        type: selectedType as 'classification' | 'extraction' | 'hidden_cost',
+        content: editorContent,
+      });
+
+      alert('Prompt saved successfully');
+      setEditorContent('');
       await loadPrompts();
     } catch (error) {
       console.error('Error saving prompt:', error);
+      alert('Failed to save prompt');
     }
   };
 
   const handleActivate = async (promptId: string) => {
     try {
-      // TODO: Implement API call
-      // await activatePrompt(promptId);
+      await adminAI.activatePrompt(promptId);
+      alert('Prompt activated successfully');
       await loadPrompts();
     } catch (error) {
       console.error('Error activating prompt:', error);
+      alert('Failed to activate prompt');
     }
   };
 
   const handleTest = async () => {
     try {
-      // TODO: Implement API call
-      // const result = await testPrompt({
-      //   prompt_content: editorContent,
-      //   test_message: testMessage
-      // });
-      // setTestResult(result);
+      if (!editorContent.trim() || !testMessage.trim()) {
+        alert('Both prompt and test message are required');
+        return;
+      }
+
+      const result = await adminAI.testPrompt({
+        prompt_content: editorContent,
+        test_message: testMessage,
+      });
+
+      setTestResult(result.data);
     } catch (error) {
       console.error('Error testing prompt:', error);
+      alert('Failed to test prompt');
     }
   };
 
