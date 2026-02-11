@@ -1,17 +1,92 @@
-"""Message Handling Metrics — Per-group counters with sampling for observability.
+"""Metrics Module — Prometheus metrics + MessageMetrics class.
 
-Phase 2B: Logging Optimization & Metrics Enhancement.
-
-Tracks:
-- Messages handled per group
-- Messages skipped per group (with sampling to reduce log spam)
-- Skip reasons (why events rejected)
-- Aggregated metrics for dashboard visibility
+Combines:
+1. Prometheus metrics for /metrics endpoint (Phase 21)
+2. MessageMetrics class for per-group tracking (Phase 32D)
 """
 import logging
 from typing import Callable
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Prometheus Metrics (Phase 21)
+# ============================================================================
+
+class _Counter:
+    """Simple Prometheus Counter with labels."""
+    def __init__(self, name: str, description: str, labels: list[str]):
+        self.name = name
+        self.description = description
+        self.labels = labels
+        self._values: dict[tuple, int] = {}
+
+    def inc(self, label_values: tuple) -> None:
+        """Increment counter for given label values."""
+        self._values[label_values] = self._values.get(label_values, 0) + 1
+
+    def render(self) -> str:
+        """Render in Prometheus exposition format."""
+        lines = [
+            f"# HELP {self.name} {self.description}",
+            f"# TYPE {self.name} counter",
+        ]
+        for label_values, value in sorted(self._values.items()):
+            label_str = ",".join(
+                f'{label}="{val}"' for label, val in zip(self.labels, label_values)
+            )
+            lines.append(f"{self.name}{{{label_str}}} {value}")
+        return "\n".join(lines)
+
+
+class _Gauge:
+    """Simple Prometheus Gauge."""
+    def __init__(self, name: str, description: str):
+        self.name = name
+        self.description = description
+        self._value = 0
+
+    def set(self, value: int) -> None:
+        """Set gauge value."""
+        self._value = value
+
+    def render(self) -> str:
+        """Render in Prometheus exposition format."""
+        return f"# HELP {self.name} {self.description}\n# TYPE {self.name} gauge\n{self.name} {self._value}"
+
+
+class _Metrics:
+    """Prometheus metrics collector."""
+    def __init__(self):
+        self.http_requests_total = _Counter(
+            "http_requests_total",
+            "Total HTTP requests",
+            ["method", "path", "status_code"]
+        )
+        self.messages_total = _Gauge("messages_total", "Total messages received by crawler")
+        self.crawler_groups_active = _Gauge("crawler_groups_active", "Active groups in crawler")
+        self.queue_size = _Gauge("queue_size", "Crawler queue size")
+        self.sse_connections = _Gauge("sse_connections", "Active SSE connections")
+
+    def render(self) -> str:
+        """Render all metrics in Prometheus format."""
+        return "\n\n".join([
+            self.http_requests_total.render(),
+            self.messages_total.render(),
+            self.crawler_groups_active.render(),
+            self.queue_size.render(),
+            self.sse_connections.render(),
+        ])
+
+
+# Global metrics instance
+metrics = _Metrics()
+
+
+# ============================================================================
+# MessageMetrics Class (Phase 32D)
+# ============================================================================
 
 
 class MessageMetrics:

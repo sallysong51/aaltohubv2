@@ -47,11 +47,16 @@ class TelegramAutoJoin:
 
         # Worker task
         self._worker_task: Optional[asyncio.Task] = None
-        self._shutdown_event = asyncio.Event()
+        self._running = False
 
-        # Start worker
+    async def start(self) -> None:
+        """Start the background worker (must be called after event loop is running)."""
+        if self._running:
+            return
+
+        self._running = True
         self._worker_task = asyncio.create_task(self._process_queue())
-        logger.info("TelegramAutoJoin worker started")
+        logger.info("TelegramAutoJoin started")
 
     async def enqueue(self, join_queue_id: str, telegram_link: str) -> None:
         """
@@ -307,8 +312,8 @@ class TelegramAutoJoin:
 
     async def cleanup(self) -> None:
         """Cleanup worker task on shutdown."""
+        self._running = False
         logger.info("Shutting down auto-join worker...")
-        self._shutdown_event.set()
 
         if self._worker_task:
             self._worker_task.cancel()

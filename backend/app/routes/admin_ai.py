@@ -11,8 +11,8 @@ import logging
 import json
 
 from app.database import db
-from app.auth import require_admin
-from app.models import User
+from app.auth import get_current_admin_user
+from app.models import UserResponse
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 @router.get("/ai/metrics")
-async def get_ai_metrics(current_user: User = Depends(require_admin)) -> Dict:
+async def get_ai_metrics(current_user: UserResponse = Depends(get_current_admin_user)) -> Dict:
     """
     Get AI classification metrics.
 
@@ -85,7 +85,7 @@ async def get_ai_metrics(current_user: User = Depends(require_admin)) -> Dict:
 @router.get("/ai/prompts")
 async def list_prompts(
     prompt_type: Optional[str] = None,
-    current_user: User = Depends(require_admin)
+    current_user: UserResponse = Depends(get_current_admin_user)
 ) -> List[Dict]:
     """List all prompts, optionally filtered by type."""
     try:
@@ -116,7 +116,7 @@ async def list_prompts(
 @router.post("/ai/prompts")
 async def create_prompt(
     payload: Dict,
-    current_user: User = Depends(require_admin)
+    current_user: UserResponse = Depends(get_current_admin_user)
 ) -> Dict:
     """
     Create new prompt version.
@@ -171,7 +171,7 @@ async def create_prompt(
 @router.put("/ai/prompts/{prompt_id}/activate")
 async def activate_prompt(
     prompt_id: str,
-    current_user: User = Depends(require_admin)
+    current_user: UserResponse = Depends(get_current_admin_user)
 ) -> Dict:
     """Activate prompt version (deactivates others of same type)."""
     try:
@@ -212,7 +212,7 @@ async def activate_prompt(
 @router.post("/ai/test")
 async def test_prompt(
     payload: Dict,
-    current_user: User = Depends(require_admin)
+    current_user: UserResponse = Depends(get_current_admin_user)
 ) -> Dict:
     """
     Test prompt on sample message (mock implementation).
@@ -238,7 +238,7 @@ async def test_prompt(
 @router.get("/ai/stats")
 async def get_classification_stats(
     days: int = 30,
-    current_user: User = Depends(require_admin)
+    current_user: UserResponse = Depends(get_current_admin_user)
 ) -> List[Dict]:
     """Get classification statistics for last N days."""
     try:
@@ -263,7 +263,7 @@ async def get_classification_stats(
 # ============================================================================
 
 @router.get("/references/metrics")
-async def get_references_metrics(current_user: User = Depends(require_admin)) -> Dict:
+async def get_references_metrics(current_user: UserResponse = Depends(get_current_admin_user)) -> Dict:
     """Get external references crawling metrics."""
     try:
         async with db.pool.acquire() as conn:
@@ -308,7 +308,7 @@ async def get_references_metrics(current_user: User = Depends(require_admin)) ->
 # ============================================================================
 
 @router.get("/blacklist")
-async def list_blacklist(current_user: User = Depends(require_admin)) -> List[Dict]:
+async def list_blacklist(current_user: UserResponse = Depends(get_current_admin_user)) -> List[Dict]:
     """List all blacklist entries."""
     try:
         async with db.pool.acquire() as conn:
@@ -328,7 +328,7 @@ async def list_blacklist(current_user: User = Depends(require_admin)) -> List[Di
 @router.post("/blacklist")
 async def add_blacklist(
     payload: Dict,
-    current_user: User = Depends(require_admin)
+    current_user: UserResponse = Depends(get_current_admin_user)
 ) -> Dict:
     """Add URL pattern to blacklist."""
     try:
@@ -361,7 +361,7 @@ async def add_blacklist(
 @router.delete("/blacklist/{blacklist_id}")
 async def remove_blacklist(
     blacklist_id: str,
-    current_user: User = Depends(require_admin)
+    current_user: UserResponse = Depends(get_current_admin_user)
 ) -> Dict:
     """Remove entry from blacklist."""
     try:
@@ -390,7 +390,7 @@ async def remove_blacklist(
 @router.post("/bulk-retry")
 async def bulk_retry_classification(
     payload: Dict,
-    current_user: User = Depends(require_admin)
+    current_user: UserResponse = Depends(get_current_admin_user)
 ) -> Dict:
     """
     Bulk retry classification for low-confidence messages.
@@ -427,7 +427,7 @@ async def bulk_retry_classification(
 @router.post("/export")
 async def export_data(
     payload: Dict,
-    current_user: User = Depends(require_admin)
+    current_user: UserResponse = Depends(get_current_admin_user)
 ) -> Dict:
     """
     Export data (mock implementation).
@@ -442,7 +442,7 @@ async def export_data(
 @router.post("/cleanup")
 async def cleanup_data(
     payload: Dict,
-    current_user: User = Depends(require_admin)
+    current_user: UserResponse = Depends(get_current_admin_user)
 ) -> Dict:
     """
     Database cleanup operations.

@@ -34,11 +34,16 @@ class ContextAggregator:
         """Initialize context aggregator with periodic update."""
         self._update_interval = timedelta(hours=6)
         self._worker_task: Optional[asyncio.Task] = None
-        self._shutdown_event = asyncio.Event()
+        self._running = False
 
-        # Start worker
+    async def start(self) -> None:
+        """Start the background worker (must be called after event loop is running)."""
+        if self._running:
+            return
+
+        self._running = True
         self._worker_task = asyncio.create_task(self._periodic_update())
-        logger.info("ContextAggregator initialized and worker started")
+        logger.info("ContextAggregator started")
 
     async def _periodic_update(self) -> None:
         """Periodically update group contexts."""
@@ -269,8 +274,8 @@ class ContextAggregator:
 
     async def cleanup(self) -> None:
         """Cleanup worker task on shutdown."""
+        self._running = False
         logger.info("Shutting down context aggregator...")
-        self._shutdown_event.set()
 
         if self._worker_task:
             self._worker_task.cancel()

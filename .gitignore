@@ -124,3 +124,6 @@ dev-debug.log
 # Task files
 # tasks.json
 # tasks/ 
+.vercel
+.env*.local
+aaltohub-crawler.lock

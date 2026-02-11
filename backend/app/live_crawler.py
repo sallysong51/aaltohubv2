@@ -443,6 +443,12 @@ class LiveCrawlerService:
             # Start DB writer coroutine (consumes from queue)
             self._writer_task = asyncio.create_task(self._db_writer())
 
+            # Start background workers for new features (must be after event loop is running)
+            await self._ai_classifier.start()
+            await self._web_scraper.start()
+            await self._telegram_auto_join.start()
+            await self._context_aggregator.start()
+
             # Start listener tasks (one per admin client)
             for user_id, client in self.clients.items():
                 self._start_listener_task(user_id, client)

@@ -47,14 +47,20 @@ class WebScraper:
 
         # Worker task
         self._worker_task: Optional[asyncio.Task] = None
-        self._shutdown_event = asyncio.Event()
+        self._running = False
 
-        # Start worker if Playwright available
-        if self._playwright_available:
-            self._worker_task = asyncio.create_task(self._process_queue())
-            logger.info("WebScraper initialized with Playwright MCP")
-        else:
+    async def start(self) -> None:
+        """Start the background worker (must be called after event loop is running)."""
+        if self._running:
+            return
+
+        if not self._playwright_available:
             logger.warning("Playwright MCP not available - web scraping disabled")
+            return
+
+        self._running = True
+        self._worker_task = asyncio.create_task(self._process_queue())
+        logger.info("WebScraper started")
 
     def _check_playwright_mcp(self) -> None:
         """Check if Playwright MCP is available."""
@@ -260,8 +266,8 @@ class WebScraper:
 
     async def cleanup(self) -> None:
         """Cleanup worker task on shutdown."""
+        self._running = False
         logger.info("Shutting down web scraper...")
-        self._shutdown_event.set()
 
         if self._worker_task:
             self._worker_task.cancel()
