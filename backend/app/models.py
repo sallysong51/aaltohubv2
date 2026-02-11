@@ -207,6 +207,10 @@ class MessageBase(BaseModel):
     reply_to_message_id: Optional[int] = None
     topic_id: Optional[int] = None
     sent_at: datetime
+    # Phase 34: Message metadata fields (commented out - migration not applied yet)
+    # links: Optional[list[dict]] = None  # JSONB: [{"url": "https://...", "text": "optional"}]
+    # mentions: Optional[list[dict]] = None  # JSONB: [{"username": "@channel", "id": 123}]
+    # photo_count: Optional[int] = None  # INTEGER: 2+ for photo albums, NULL otherwise
 
 
 class MessageCreate(MessageBase):

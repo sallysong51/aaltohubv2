@@ -98,16 +98,25 @@ async def delete_group_admin(
         # Helper to delete with table existence check
         async def safe_delete(conn, table: str, column: str = "group_id"):
             """Delete from table if it exists, otherwise skip."""
+            # Check if table exists BEFORE attempting delete (prevents transaction abort)
+            table_exists = await conn.fetchval(
+                """SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_name = $1
+                )""",
+                table
+            )
+
+            if not table_exists:
+                logger.debug(f"delete_group_admin: table '{table}' does not exist, skipping")
+                return
+
             try:
                 query = f"DELETE FROM {table} WHERE {column} = $1"
                 await conn.execute(query, gid)
             except Exception as e:
-                # Table doesn't exist or other error - log and continue
-                error_msg = str(e).lower()
-                if "does not exist" in error_msg or "relation" in error_msg:
-                    logger.debug(f"delete_group_admin: table '{table}' does not exist, skipping")
-                else:
-                    logger.warning(f"delete_group_admin: error deleting from {table}: {e}")
+                # Log error but don't re-raise (allow other deletes to continue)
+                logger.warning(f"delete_group_admin: error deleting from {table}: {e}")
 
         # Use transaction for atomic delete
         async with db.pool.acquire() as conn:
