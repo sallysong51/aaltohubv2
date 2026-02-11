@@ -654,6 +654,120 @@ export const adminApi = {
 };
 
 // ============================================================
+// Admin AI Management
+// ============================================================
+
+export const adminAI = {
+  // AI Classification Metrics
+  getMetrics: () =>
+    apiClient.get<{
+      queue_size: number;
+      cache_hit_rate: number;
+      circuit_open: boolean;
+      cost_today: number;
+      messages_today: number;
+      avg_confidence: number;
+      category_breakdown: Record<string, number>;
+    }>('/admin/ai/metrics'),
+
+  // Prompt Management
+  listPrompts: (promptType?: string) =>
+    apiClient.get<
+      Array<{
+        id: string;
+        name: string;
+        type: string;
+        version: number;
+        is_active: boolean;
+        created_at: string;
+        content_length: number;
+      }>
+    >('/admin/ai/prompts', { params: { prompt_type: promptType } }),
+
+  createPrompt: (payload: {
+    name: string;
+    type: 'classification' | 'extraction' | 'hidden_cost';
+    content: string;
+  }) =>
+    apiClient.post<{
+      id: string;
+      name: string;
+      type: string;
+      version: number;
+      is_active: boolean;
+    }>('/admin/ai/prompts', payload),
+
+  activatePrompt: (promptId: string) =>
+    apiClient.put<{ success: boolean; activated_id: string }>(
+      `/admin/ai/prompts/${promptId}/activate`
+    ),
+
+  testPrompt: (payload: { prompt_content: string; test_message: string }) =>
+    apiClient.post<{
+      category: string;
+      confidence: number;
+      extracted_data?: Record<string, any>;
+    }>('/admin/ai/test', payload),
+
+  getStats: (days: number = 30) =>
+    apiClient.get<
+      Array<{
+        date: string;
+        messages_processed: number;
+        total_cost_usd: number;
+        avg_confidence: number;
+        category_breakdown: Record<string, number>;
+      }>
+    >('/admin/ai/stats', { params: { days } }),
+
+  // External References Metrics
+  getReferencesMetrics: () =>
+    apiClient.get<{
+      scraping_queue: number;
+      scraping_processing: number;
+      scraping_failed: number;
+      join_queue: number;
+      join_processing: number;
+      join_failed: number;
+    }>('/admin/references/metrics'),
+
+  // Blacklist Management
+  listBlacklist: () =>
+    apiClient.get<
+      Array<{
+        id: string;
+        pattern: string;
+        reason: string;
+        added_at: string;
+      }>
+    >('/admin/blacklist'),
+
+  addBlacklist: (payload: { pattern: string; reason?: string }) =>
+    apiClient.post<{ id: string; pattern: string }>('/admin/blacklist', payload),
+
+  removeBlacklist: (blacklistId: string) =>
+    apiClient.delete<{ success: boolean }>(`/admin/blacklist/${blacklistId}`),
+
+  // Bulk Operations
+  bulkRetryClassification: (payload: { confidence_threshold?: number }) =>
+    apiClient.post<{ requeued_count: number }>('/admin/bulk-retry', payload),
+
+  exportData: (payload: { format: 'csv' | 'json' }) =>
+    apiClient.post<{ message: string }>('/admin/export', payload),
+
+  cleanupData: (payload: {
+    action: 'delete_old_messages' | 'clear_failed_queues' | 'vacuum';
+  }) =>
+    apiClient.post<{
+      action: string;
+      deleted?: string;
+      deleted_scraping?: string;
+      deleted_join?: string;
+      message?: string;
+    }>('/admin/cleanup', payload),
+};
+
+// ============================================================
 // Helper functions
 // ============================================================
 

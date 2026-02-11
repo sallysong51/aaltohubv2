@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse
 import sentry_sdk
 from sentry_sdk.integrations.asyncio import AsyncioIntegration
 from app.config import settings
-from app.routes import auth, groups, admin, events, email_linking, telegram_connect
+from app.routes import auth, groups, admin, admin_ai, events, email_linking, telegram_connect
 from app.telegram_client import telegram_manager
 from app import crawler_client
 from app.database import db
@@ -398,6 +398,7 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(email_linking.router, prefix="/api")
 app.include_router(groups.router, prefix="/api")
 app.include_router(admin.router, prefix="/api")
+app.include_router(admin_ai.router, prefix="/api/admin")
 app.include_router(events.router, prefix="/api")
 app.include_router(telegram_connect.router, prefix="/api")
 

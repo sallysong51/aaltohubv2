@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { adminAI } from '@/lib/api';
 
 /**
  * Admin Data Management Dashboard
@@ -18,50 +19,71 @@ export default function AdminDataManagement() {
   const [exportFormat, setExportFormat] = useState<string>('csv');
   const [blacklistItems, setBlacklistItems] = useState<any[]>([]);
 
+  // Load blacklist on mount
+  useEffect(() => {
+    loadBlacklist();
+  }, []);
+
+  const loadBlacklist = async () => {
+    try {
+      const response = await adminAI.listBlacklist();
+      setBlacklistItems(response.data);
+    } catch (error) {
+      console.error('Error loading blacklist:', error);
+    }
+  };
+
   const handleBulkRetry = async () => {
     try {
-      // TODO: Implement API call
-      // const result = await bulkRetryClassification({ confidence_threshold: 0.7 });
-      // setRetryCount(result.requeued_count);
+      const result = await adminAI.bulkRetryClassification({ confidence_threshold: 0.7 });
+      setRetryCount(result.data.requeued_count);
     } catch (error) {
       console.error('Error retrying classification:', error);
+      alert('Failed to retry classification');
     }
   };
 
   const handleAddBlacklist = async () => {
     try {
-      // TODO: Implement API call
-      // await manageBlacklist({ action: 'add', pattern: blacklistUrl });
+      if (!blacklistUrl.trim()) return;
+      await adminAI.addBlacklist({ pattern: blacklistUrl });
       setBlacklistUrl('');
-      // Reload blacklist
+      await loadBlacklist();
     } catch (error) {
       console.error('Error adding to blacklist:', error);
+      alert('Failed to add to blacklist');
+    }
+  };
+
+  const handleRemoveBlacklist = async (blacklistId: string) => {
+    try {
+      await adminAI.removeBlacklist(blacklistId);
+      await loadBlacklist();
+    } catch (error) {
+      console.error('Error removing from blacklist:', error);
+      alert('Failed to remove from blacklist');
     }
   };
 
   const handleExport = async () => {
     try {
-      // TODO: Implement API call
-      // const data = await exportData({ format: exportFormat });
-      // Trigger download
-      // const blob = new Blob([data], { type: 'text/csv' });
-      // const url = window.URL.createObjectURL(blob);
-      // const a = document.createElement('a');
-      // a.href = url;
-      // a.download = `export.${exportFormat}`;
-      // a.click();
+      const result = await adminAI.exportData({ format: exportFormat as 'csv' | 'json' });
+      alert(result.data.message);
     } catch (error) {
       console.error('Error exporting data:', error);
+      alert('Failed to export data');
     }
   };
 
   const handleCleanup = async (action: string) => {
     try {
-      // TODO: Implement API call
-      // await cleanupData({ action });
-      alert(`Cleanup action "${action}" completed`);
+      const result = await adminAI.cleanupData({ action: action as any });
+      const message = result.data.message ||
+        `Cleanup completed: ${result.data.deleted || result.data.deleted_scraping || 0} items`;
+      alert(message);
     } catch (error) {
       console.error('Error cleaning up data:', error);
+      alert('Failed to cleanup data');
     }
   };
 
@@ -123,7 +145,11 @@ export default function AdminDataManagement() {
                     <td>{item.reason}</td>
                     <td>{new Date(item.added_at).toLocaleDateString()}</td>
                     <td>
-                      <Button size="sm" variant="destructive">
+                      <Button
+                        size="sm"
+                        variant="destructive"
+                        onClick={() => handleRemoveBlacklist(item.id)}
+                      >
                         Remove
                       </Button>
                     </td>

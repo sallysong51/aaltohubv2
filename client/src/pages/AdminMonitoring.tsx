@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { adminAI } from '@/lib/api';
 
 /**
  * Admin Monitoring Dashboard
@@ -18,22 +19,20 @@ export default function AdminMonitoring() {
   const [refMetrics, setRefMetrics] = useState<any>(null);
   const [loading, setLoading] = useState(true);
 
-  // TODO: Implement polling every 5s
+  // Poll metrics every 5s
   useEffect(() => {
     const poll = async () => {
       try {
-        // TODO: Implement API calls
-        // const [crawler, ai, ref] = await Promise.all([
-        //   getCrawlerHealth(),
-        //   getAIMetrics(),
-        //   getRefMetrics()
-        // ]);
-        // setCrawlerHealth(crawler);
-        // setAIMetrics(ai);
-        // setRefMetrics(ref);
+        const [ai, ref] = await Promise.all([
+          adminAI.getMetrics(),
+          adminAI.getReferencesMetrics(),
+        ]);
+        setAIMetrics(ai.data);
+        setRefMetrics(ref.data);
         setLoading(false);
       } catch (error) {
         console.error('Polling error:', error);
+        setLoading(false);
       }
     };
 
