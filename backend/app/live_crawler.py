@@ -45,6 +45,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from app.error_recovery import GetMeErrorRecovery
 from app.metrics import MessageMetrics
+from app.ai.classifier import AIClassifier
 
 # Transient exceptions that justify a retry (not programming bugs)
 _TRANSIENT_EXCEPTIONS = (
@@ -188,6 +189,9 @@ class LiveCrawlerService:
 
         # Phase 2B: Logging Optimization — metrics tracking (extract to separate module)
         self._metrics = MessageMetrics(self._get_group_title)
+
+        # Phase 3: AI Classification — async message classification with cost optimization
+        self._ai_classifier = AIClassifier()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -575,6 +579,8 @@ class LiveCrawlerService:
         self._error_recovery.clear()
         # Phase 2B: Clear metrics tracking (delegate to module)
         self._metrics.clear()
+        # Phase 3: Cleanup AI classifier (delegate to module)
+        await self._ai_classifier.cleanup()
 
     def get_status(self) -> dict:
         # Phase 2B: Get aggregated metrics from metrics module
@@ -613,6 +619,8 @@ class LiveCrawlerService:
                 and self._admin_wait_task is not None
                 and not self._admin_wait_task.done()
             ),
+            # Phase 3: AI classifier stats
+            "ai_classifier": self._ai_classifier.get_stats(),
         }
 
     # ------------------------------------------------------------------
@@ -883,6 +891,14 @@ class LiveCrawlerService:
             for item in persisted_items:
                 if item.get("broadcast", True):
                     await self._broadcast("insert", item["data"])
+
+                # Enqueue for AI classification
+                await self._ai_classifier.enqueue({
+                    "id": item["data"].get("id"),
+                    "text": item["data"].get("text"),
+                    "media_type": item["data"].get("media_type"),
+                    "group_id": item["data"].get("group_id"),
+                })
 
         # --- Handle upserts (edits — ON CONFLICT DO UPDATE) ---
         for item in upserts:
