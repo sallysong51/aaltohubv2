@@ -6,7 +6,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Security
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,32 @@ def _check_verify_rate_limit(key: str):
     _verify_code_attempts[key].append(now)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+
+def _set_refresh_cookie(response: Response, refresh_token: str) -> None:
+    """Set refresh token as httpOnly cookie (prevents XSS theft)."""
+    response.set_cookie(
+        key="refresh_token",
+        value=refresh_token,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite="lax",
+        domain=settings.COOKIE_DOMAIN or None,
+        max_age=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+        path="/api/auth",
+    )
+
+
+def _clear_refresh_cookie(response: Response) -> None:
+    """Remove refresh token cookie on logout."""
+    response.delete_cookie(
+        key="refresh_token",
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite="lax",
+        domain=settings.COOKIE_DOMAIN or None,
+        path="/api/auth",
+    )
 
 
 async def _upsert_user_and_create_tokens(user_info: dict, session_string: str) -> tuple:
@@ -162,7 +188,7 @@ async def send_code(request: SendCodeRequest, req: Request):
 
 
 @router.post("/verify-code", response_model=AuthResponse)
-async def verify_code(request: VerifyCodeRequest, req: Request):
+async def verify_code(request: VerifyCodeRequest, req: Request, response: Response):
     """Verify authentication code and sign in"""
     # Point 4: DB health guard (defense in depth — middleware also blocks)
     if not db.is_connected:
@@ -199,6 +225,7 @@ async def verify_code(request: VerifyCodeRequest, req: Request):
         except Exception as e:
             logger.error("Failed to save Telethon session for user %s: %s", user_id, e)
 
+        _set_refresh_cookie(response, refresh_token)
         return AuthResponse(
             access_token=access_token,
             refresh_token=refresh_token,
@@ -223,7 +250,7 @@ async def verify_code(request: VerifyCodeRequest, req: Request):
 
 
 @router.post("/verify-2fa", response_model=AuthResponse)
-async def verify_2fa(request: Verify2FARequest, req: Request):
+async def verify_2fa(request: Verify2FARequest, req: Request, response: Response):
     """Verify 2FA password and complete sign in"""
     if not db.is_connected:
         raise HTTPException(status_code=503, detail="서비스가 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해주세요.")
@@ -250,6 +277,7 @@ async def verify_2fa(request: Verify2FARequest, req: Request):
         except Exception as e:
             logger.error("Failed to save Telethon session for user %s: %s", user_id, e)
 
+        _set_refresh_cookie(response, refresh_token)
         return AuthResponse(
             access_token=access_token,
             refresh_token=refresh_token,
@@ -272,12 +300,22 @@ async def verify_2fa(request: Verify2FARequest, req: Request):
 
 
 @router.post("/refresh", response_model=AuthResponse)
-async def refresh_token_endpoint(request: RefreshTokenRequest):
-    """Refresh access token using refresh token"""
+async def refresh_token_endpoint(
+    req: Request,
+    response: Response,
+    request: RefreshTokenRequest = None,
+):
+    """Refresh access token using refresh token (from body or httpOnly cookie)."""
     if not db.is_connected:
         raise HTTPException(status_code=503, detail="서비스가 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해주세요.")
     try:
-        payload = await verify_refresh_token(request.refresh_token)
+        # Accept refresh token from cookie (preferred) or body (legacy)
+        token_value = req.cookies.get("refresh_token")
+        if not token_value and request and request.refresh_token:
+            token_value = request.refresh_token
+        if not token_value:
+            raise HTTPException(status_code=401, detail="Refresh token required")
+        payload = await verify_refresh_token(token_value)
         user_id = payload.get("sub")
 
         user_row = await db.fetchrow(
@@ -307,6 +345,7 @@ async def refresh_token_endpoint(request: RefreshTokenRequest):
         access_token = create_access_token({"sub": str(user_id)})
         new_refresh_token = create_refresh_token({"sub": str(user_id)})
 
+        _set_refresh_cookie(response, new_refresh_token)
         return AuthResponse(
             access_token=access_token,
             refresh_token=new_refresh_token,
@@ -327,6 +366,7 @@ async def get_me(current_user: UserResponse = Depends(get_current_user)):
 
 @router.post("/logout")
 async def logout(
+    response: Response,
     credentials: HTTPAuthorizationCredentials = Security(security),
 ):
     """Logout — revoke current token server-side (best-effort if DB down)"""
@@ -345,6 +385,7 @@ async def logout(
             invalidate_revocation_cache(jti)
     except Exception:
         pass  # Best effort revocation
+    _clear_refresh_cookie(response)
     return {"success": True, "message": "Logged out successfully"}
 
 

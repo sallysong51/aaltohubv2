@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, lazy, Suspense } from "react";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/NotFound";
@@ -7,20 +7,21 @@ import ErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider } from "./contexts/ThemeContext";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
 import { BackendConnectivityProvider, useBackendConnectivity } from "./contexts/BackendConnectivityContext";
-import Home from "./pages/Home";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
-import EmailLinking from "./pages/EmailLinking";
-import GroupSelection from "./pages/GroupSelection";
-import UserGroups from "./pages/UserGroups";
-import EventFeed from "./pages/EventFeed";
-import AdminDashboard from "./pages/AdminDashboard";
-import InviteAccept from "./pages/InviteAccept";
-import GroupSettings from "./pages/GroupSettings";
-import CrawlerManagement from "./pages/CrawlerManagement";
-import UserManagement from "./pages/UserManagement";
-import UnmappedGroups from "./pages/UnmappedGroups";
-import Privacy from "./pages/Privacy";
+
+// Lazy-loaded pages (code splitting for faster initial load)
+const EmailLinking = lazy(() => import("./pages/EmailLinking"));
+const GroupSelection = lazy(() => import("./pages/GroupSelection"));
+const UserGroups = lazy(() => import("./pages/UserGroups"));
+const EventFeed = lazy(() => import("./pages/EventFeed"));
+const AdminDashboard = lazy(() => import("./pages/AdminDashboard"));
+const InviteAccept = lazy(() => import("./pages/InviteAccept"));
+const GroupSettings = lazy(() => import("./pages/GroupSettings"));
+const CrawlerManagement = lazy(() => import("./pages/CrawlerManagement"));
+const UserManagement = lazy(() => import("./pages/UserManagement"));
+const UnmappedGroups = lazy(() => import("./pages/UnmappedGroups"));
+const Privacy = lazy(() => import("./pages/Privacy"));
 
 function HomeRedirect() {
   const { isAuthenticated, user, isLoading } = useAuth();
@@ -117,7 +118,9 @@ function App() {
               <OfflineBanner />
               <BackendBanner />
               <Toaster />
-              <Router />
+              <Suspense fallback={<div className="min-h-screen flex items-center justify-center"><div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" /></div>}>
+                <Router />
+              </Suspense>
             </TooltipProvider>
           </BackendConnectivityProvider>
         </AuthProvider>

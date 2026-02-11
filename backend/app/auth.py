@@ -1,6 +1,7 @@
 """
 Authentication and JWT utilities
 """
+import logging
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,8 @@ from fastapi import HTTPException, Security, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.config import settings
 from app.database import db as database
+
+logger = logging.getLogger(__name__)
 
 
 security = HTTPBearer()
@@ -114,8 +117,10 @@ async def get_current_user(
                 _mark_not_revoked(jti)
             except HTTPException:
                 raise
-            except Exception:
-                pass  # DB error should not block auth
+            except Exception as e:
+                # Fail-closed: DB error blocks auth to prevent revoked tokens from passing
+                logger.warning("Revocation check DB error (fail-closed): %s", e)
+                raise HTTPException(status_code=503, detail="인증 서비스를 일시적으로 사용할 수 없습니다")
 
     # Fetch user from database
     try:
@@ -187,7 +192,8 @@ async def verify_refresh_token(refresh_token: str) -> Dict:
                 raise HTTPException(status_code=401, detail="Token has been revoked")
         except HTTPException:
             raise
-        except Exception:
-            pass  # DB error should not block auth
+        except Exception as e:
+            logger.warning("Refresh revocation check DB error (fail-closed): %s", e)
+            raise HTTPException(status_code=503, detail="인증 서비스를 일시적으로 사용할 수 없습니다")
 
     return payload

@@ -42,6 +42,33 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 // - Production: set VITE_SSE_URL to the backend's direct HTTPS URL (e.g. https://api.aaltohub.com)
 export const SSE_BASE_URL = import.meta.env.VITE_SSE_URL || API_BASE_URL;
 
+/**
+ * Obtain a short-lived SSE ticket (60s, single-use) to avoid JWT exposure in URLs.
+ * The ticket is exchanged for an SSE connection without the JWT appearing in the URL.
+ */
+export async function createSSETicket(groupIds: string[]): Promise<string> {
+  const token = localStorage.getItem('access_token');
+  if (!token) throw new Error('No access token');
+
+  const response = await fetch(
+    `${SSE_BASE_URL}/api/events/ticket?groups=${encodeURIComponent(groupIds.join(','))}`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`SSE ticket request failed: ${response.status}`);
+  }
+
+  const data = await response.json();
+  return data.ticket;
+}
+
 // Create axios instance
 const apiClient: AxiosInstance = axios.create({
   baseURL: `${API_BASE_URL}/api`,
@@ -132,16 +159,19 @@ apiClient.interceptors.response.use(
         // refresh cycles that could invalidate single-use refresh tokens.
         if (!refreshPromise) {
           refreshPromise = (async () => {
+            // Send refresh token via both cookie (httpOnly, preferred) and body (legacy fallback)
             const refreshToken = localStorage.getItem('refresh_token');
-            if (!refreshToken) throw new Error('No refresh token');
 
-            const response = await axios.post(`${API_BASE_URL}/api/auth/refresh`, {
-              refresh_token: refreshToken,
-            });
+            const response = await axios.post(
+              `${API_BASE_URL}/api/auth/refresh`,
+              refreshToken ? { refresh_token: refreshToken } : {},
+              { withCredentials: true },
+            );
 
             const { access_token, refresh_token: newRefreshToken } = response.data;
             localStorage.setItem('access_token', access_token);
-            localStorage.setItem('refresh_token', newRefreshToken);
+            // Keep localStorage copy for legacy fallback; cookie is primary
+            if (newRefreshToken) localStorage.setItem('refresh_token', newRefreshToken);
             return access_token;
           })();
 
@@ -359,7 +389,6 @@ export interface Message {
   group_id: string;
   sender_id?: number;
   sender_name?: string;
-  sender_username?: string;
   content?: string;
   media_type?: string;  // photo, video, document, audio, sticker, voice (null = text)
   media_url?: string;

@@ -118,27 +118,3 @@ async def get_error_logs(
         raise HTTPException(status_code=500, detail="Failed to fetch error logs")
 
 
-@router.get("/user-activity", response_model=List[dict])
-async def get_user_activity(
-    current_user: UserResponse = Depends(get_current_admin_user),
-):
-    """Get user activity statistics (admin only)"""
-    try:
-        rows = await db.fetch("SELECT * FROM user_statistics")
-        return [dict(r) for r in rows]
-    except Exception as e:
-        logger.error("get_user_activity error: %s", e)
-        raise HTTPException(status_code=500, detail="Failed to fetch user activity")
-
-
-@router.get("/group-statistics", response_model=List[dict])
-async def get_group_statistics(
-    current_user: UserResponse = Depends(get_current_admin_user),
-):
-    """Get group statistics (admin only)"""
-    try:
-        rows = await db.fetch("SELECT * FROM group_statistics")
-        return [dict(r) for r in rows]
-    except Exception as e:
-        logger.error("get_group_statistics error: %s", e)
-        raise HTTPException(status_code=500, detail="Failed to fetch group statistics")

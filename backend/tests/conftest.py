@@ -1,8 +1,24 @@
 """
 Shared pytest fixtures for AaltoHub v2 backend tests.
 """
+import asyncio
+import sys
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, AsyncMock, patch
+
+# Pre-mock heavy external dependencies not available in test env
+for mod in ("telethon", "telethon.sessions", "telethon.errors",
+            "telethon.tl", "telethon.tl.functions", "telethon.tl.functions.channels",
+            "telethon.tl.types", "telethon.tl.functions.messages",
+            "sentry_sdk", "sentry_sdk.integrations", "sentry_sdk.integrations.asyncio",
+            "pythonjsonlogger", "pythonjsonlogger.json",
+            "asyncpg", "supabase", "tenacity",
+            "pydantic_settings", "pydantic", "pydantic.functional_validators",
+            "jwt", "resend",
+            "fastapi", "fastapi.security", "fastapi.responses",
+            "starlette", "starlette.requests", "starlette.responses",
+            "uvicorn", "httpx"):
+    sys.modules.setdefault(mod, MagicMock())
 
 
 class FakeSettings:
@@ -24,15 +40,17 @@ class FakeSettings:
     ADMIN_USERNAME = ""
     SENTRY_DSN = ""
     RESEND_API_KEY = ""
+    CRAWLER_API_PORT = 8001
+    COOKIE_DOMAIN = ""
+    COOKIE_SECURE = False
+    crawler_api_secret = "test-crawler-secret"
+    is_production = False
+    DATABASE_URL = "postgresql://test:test@localhost:5432/test"
 
 
 @pytest.fixture()
 def mock_settings():
-    """Patch app.config.settings with safe test defaults.
-
-    Also patches app.auth.settings so that auth functions pick up the
-    fake values without importing the real Settings() (which reads .env).
-    """
+    """Patch app.config.settings with safe test defaults."""
     fake = FakeSettings()
     with patch("app.config.settings", fake), \
          patch("app.auth.settings", fake):
@@ -41,11 +59,15 @@ def mock_settings():
 
 @pytest.fixture()
 def mock_db():
-    """Return a MagicMock that stands in for the Supabase Client.
+    """AsyncMock that mimics the asyncpg-based Database wrapper.
 
-    The mock supports chaining like:
-        db.table("x").select("*").eq("id", 1).execute()
+    Supports: fetch, fetchrow, fetchval, execute, is_connected
     """
-    db = MagicMock()
-    with patch("app.database.get_db", return_value=db):
+    db = AsyncMock()
+    db.is_connected = True
+    db.fetch = AsyncMock(return_value=[])
+    db.fetchrow = AsyncMock(return_value=None)
+    db.fetchval = AsyncMock(return_value=None)
+    db.execute = AsyncMock(return_value=None)
+    with patch("app.database.db", db):
         yield db

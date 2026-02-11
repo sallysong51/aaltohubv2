@@ -291,8 +291,50 @@ CREATE INDEX IF NOT EXISTS idx_failed_messages_resolved ON failed_messages(resol
 CREATE INDEX IF NOT EXISTS idx_failed_messages_group_id ON failed_messages(group_id);
 CREATE INDEX IF NOT EXISTS idx_failed_messages_telegram_msg_id ON failed_messages(telegram_message_id);
 
+-- User feed filtering: only show realtime messages to non-admin users
+CREATE INDEX IF NOT EXISTS idx_messages_user_feed ON messages(group_id, sent_at DESC) WHERE is_deleted = FALSE AND message_source = 'realtime';
+
 -- Standalone index on messages.group_id (for queries including deleted messages)
 CREATE INDEX IF NOT EXISTS idx_messages_group_id ON messages(group_id);
+
+-- ============================================================
+-- Group Topics Table (Forum Topic Metadata)
+-- Stores topic names, icons, and state from Telegram's GetForumTopicsRequest
+-- ============================================================
+CREATE TABLE IF NOT EXISTS group_topics (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    group_id BIGINT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    topic_id INTEGER NOT NULL,
+    topic_title TEXT NOT NULL DEFAULT 'General',
+    icon_color INTEGER,
+    icon_emoji_id BIGINT,
+    is_closed BOOLEAN DEFAULT FALSE,
+    is_pinned BOOLEAN DEFAULT FALSE,
+    top_message_id INTEGER,
+    unread_count INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(group_id, topic_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_group_topics_group_id ON group_topics(group_id);
+
+-- ============================================================
+-- Connection Accessible Groups (Multi-Admin Discovery)
+-- Tracks which Telegram connection can access which group
+-- Populated by live_crawler.discover_group_accessibility() at startup
+-- ============================================================
+CREATE TABLE IF NOT EXISTS connection_accessible_groups (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    connection_id UUID NOT NULL REFERENCES telegram_connections(id) ON DELETE CASCADE,
+    group_id BIGINT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    discovered_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(connection_id, group_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cag_connection_id ON connection_accessible_groups(connection_id);
+CREATE INDEX IF NOT EXISTS idx_cag_group_id ON connection_accessible_groups(group_id);
+CREATE INDEX IF NOT EXISTS idx_cag_discovered_at ON connection_accessible_groups(discovered_at);
 
 -- ============================================================
 -- Revoked JWT Tokens (for token blacklisting on logout/refresh)

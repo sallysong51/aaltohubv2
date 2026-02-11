@@ -42,53 +42,53 @@ async def _auto_join_admin_to_group(
         from app.live_crawler import live_crawler
 
         if not live_crawler.clients:
-            logger.debug(f"No admin clients available to join group {group_name}")
+            logger.debug("No admin clients available to join group %s", group_name)
             return False
 
         for admin_id, client in list(live_crawler.clients.items()):
             try:
                 if not client.is_connected():
-                    logger.debug(f"Admin client {admin_id} disconnected, trying next")
+                    logger.debug("Admin client %s disconnected, trying next", admin_id)
                     continue
 
                 # Try invite link first (works for both public and private)
                 if invite_link:
                     await client.join_chat(invite_link)
-                    logger.info(f"Admin {admin_id} auto-joined group {group_name} (id={group_id}) via invite link")
+                    logger.info("Admin %s auto-joined group %s (id=%s) via invite link", admin_id, group_name, group_id)
                     return True
 
                 # Fallback: try username
                 elif username:
                     await client.join_chat(f"@{username}")
-                    logger.info(f"Admin {admin_id} auto-joined group {group_name} (id={group_id}) via username")
+                    logger.info("Admin %s auto-joined group %s (id=%s) via username", admin_id, group_name, group_id)
                     return True
 
             except FloodWaitError as e:
-                logger.debug(f"FloodWait on join {group_name}: wait {e.seconds}s")
+                logger.debug("FloodWait on join %s: wait %ds", group_name, e.seconds)
                 await asyncio.sleep(min(e.seconds + 2, 10))
                 continue
 
             except (InviteHashInvalidError, InviteHashExpiredError):
-                logger.debug(f"Invalid/expired invite link for {group_name}")
+                logger.debug("Invalid/expired invite link for %s", group_name)
                 continue
 
             except ChannelPrivateError:
-                logger.debug(f"Cannot access private group {group_name} — admin not member")
+                logger.debug("Cannot access private group %s — admin not member", group_name)
                 continue
 
             except ChatAdminRequiredError:
-                logger.debug(f"Admin permission required for {group_name}")
+                logger.debug("Admin permission required for %s", group_name)
                 continue
 
             except Exception as e:
-                logger.debug(f"Failed to auto-join {group_name}: {type(e).__name__}: {e}")
+                logger.debug("Failed to auto-join %s: %s: %s", group_name, type(e).__name__, e)
                 continue
 
-        logger.warning(f"All admin clients failed to join {group_name}")
+        logger.warning("All admin clients failed to join %s", group_name)
         return False
 
     except Exception as e:
-        logger.warning(f"Unexpected error in auto_join: {e}")
+        logger.warning("Unexpected error in auto_join: %s", e)
         return False
 
 
@@ -324,11 +324,13 @@ async def search_messages(
         if not ids:
             return MessagesListResponse(messages=[], total=0, page=page, page_size=page_size, has_more=False)
 
+        # Escape ILIKE wildcards to prevent wildcard injection
+        escaped_q = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         return await fetch_messages_paginated(
             group_ids=[int(i) for i in ids],
             page=page,
             page_size=page_size,
-            search_pattern=f"%{q}%",
+            search_pattern=f"%{escaped_q}%",
         )
     except Exception as e:
         logger.error("search_messages error: %s", e)
@@ -438,22 +440,18 @@ async def _fetch_and_aggregate_group_topics(group_id: int, has_topics: bool) -> 
                 "is_pinned": row["is_pinned"],
             }
 
-    # Count messages per topic (limit to 5000 rows to avoid memory issues)
-    message_rows = await db.fetch(
-        """SELECT topic_id FROM messages
+    # Count messages per topic using SQL GROUP BY (server-side aggregation)
+    count_rows = await db.fetch(
+        """SELECT topic_id, COUNT(*) AS cnt FROM messages
            WHERE group_id = $1 AND is_deleted = FALSE AND topic_id IS NOT NULL
-           ORDER BY sent_at DESC LIMIT 5000""",
+           GROUP BY topic_id""",
         group_id,
     )
 
-    if not message_rows and not topic_metadata:
+    if not count_rows and not topic_metadata:
         return []
 
-    # Aggregate message counts
-    topic_counts = {}
-    for row in message_rows:
-        tid = row["topic_id"]
-        topic_counts[tid] = topic_counts.get(tid, 0) + 1
+    topic_counts = {row["topic_id"]: row["cnt"] for row in count_rows}
 
     # Build final topic list
     final_topics = {}

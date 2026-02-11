@@ -178,6 +178,7 @@ class RegisterGroupItem(BaseModel):
     member_count: Optional[int] = None
     group_type: Optional[GroupType] = GroupType.GROUP
     visibility: Optional[GroupVisibility] = GroupVisibility.PUBLIC
+    has_topics: Optional[bool] = None
 
 
 class RegisterGroupsRequest(BaseModel):
@@ -317,11 +318,3 @@ class AdminStatsResponse(BaseModel):
     messages_last_24h: int
 
 
-class UserActivityResponse(BaseModel):
-    user_id: int  # BIGINT
-    username: Optional[str]
-    first_name: Optional[str]
-    last_name: Optional[str]
-    role: UserRole
-    registered_groups_count: int
-    joined_at: datetime

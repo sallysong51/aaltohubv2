@@ -13,7 +13,7 @@
  *   garbage-collected when the EventSource is closed and dereferenced
  */
 import { useState, useEffect, useRef } from 'react';
-import { SSE_BASE_URL } from '@/lib/api';
+import { SSE_BASE_URL, createSSETicket } from '@/lib/api';
 import { useBackendConnectivity } from '@/contexts/BackendConnectivityContext';
 
 const INITIAL_DELAY = 2000;
@@ -75,7 +75,7 @@ export function useSSE({ groupIds, onInsert, onUpdate, onDelete, onOverflow }: U
       }
     }
 
-    function connect() {
+    async function connect() {
       cleanup();
 
       if (!mountedRef.current) return;
@@ -89,7 +89,18 @@ export function useSSE({ groupIds, onInsert, onUpdate, onDelete, onOverflow }: U
       const currentToken = localStorage.getItem('access_token');
       if (!currentToken) return;
 
-      const url = `${SSE_BASE_URL}/api/events/stream?token=${encodeURIComponent(currentToken)}&groups=${encodeURIComponent(groupIdsKey)}`;
+      // Obtain short-lived ticket to avoid JWT exposure in URL
+      let url: string;
+      try {
+        const groupIdsList = groupIdsKey.split(',');
+        const ticket = await createSSETicket(groupIdsList);
+        url = `${SSE_BASE_URL}/api/events/stream?ticket=${encodeURIComponent(ticket)}`;
+      } catch {
+        // Fallback to legacy token-in-URL if ticket endpoint unavailable
+        console.warn('[SSE] Ticket request failed, falling back to token-in-URL');
+        url = `${SSE_BASE_URL}/api/events/stream?token=${encodeURIComponent(currentToken)}&groups=${encodeURIComponent(groupIdsKey)}`;
+      }
+
       const es = new EventSource(url);
       esRef.current = es;
 

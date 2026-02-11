@@ -20,7 +20,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import sentry_sdk
@@ -143,9 +143,16 @@ app = FastAPI(
 
 
 @app.get("/health")
-async def health():
+async def health(request: Request):
     """Deep health check — reports degraded if the crawler is logically broken
-    even when the process is still alive (no clients, CB stuck open, queue saturated)."""
+    even when the process is still alive (no clients, CB stuck open, queue saturated).
+    In production, requires Bearer token to prevent internal state leakage."""
+    if settings.is_production:
+        import hmac as _hmac
+        auth = request.headers.get("authorization", "")
+        if not auth.startswith("Bearer ") or not _hmac.compare_digest(auth[7:], settings.crawler_api_secret):
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
     status = live_crawler.get_status()
     from fastapi.responses import JSONResponse
 

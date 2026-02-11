@@ -89,7 +89,11 @@ async def delete_group_admin(
     """Delete a group and all related data (admin only)."""
     try:
         gid = int(group_id)
-        # Delete cascade: messages, user_groups, crawler_status
+        # Delete cascade: all dependent tables before groups
+        await db.execute("DELETE FROM group_topics WHERE group_id = $1", gid)
+        await db.execute("DELETE FROM connection_accessible_groups WHERE group_id = $1", gid)
+        await db.execute("DELETE FROM failed_messages WHERE group_id = $1", gid)
+        await db.execute("DELETE FROM private_group_invites WHERE group_id = $1", gid)
         await db.execute("DELETE FROM crawler_status WHERE group_id = $1", gid)
         await db.execute("DELETE FROM user_groups WHERE group_id = $1", gid)
         await db.execute("DELETE FROM messages WHERE group_id = $1", gid)
@@ -402,13 +406,13 @@ async def auto_join_unmapped_groups(
                 for admin_id, client in list(live_crawler.clients.items()):
                     try:
                         if not client.is_connected():
-                            logger.warning(f"Admin client {admin_id} disconnected, skipping")
+                            logger.warning("Admin client %s disconnected, skipping", admin_id)
                             continue
 
                         # Try invite link first (works for both public and private)
                         if invite_link:
                             await client.join_chat(invite_link)
-                            logger.info(f"Auto-join success: {gname} (id={gid}) via invite link")
+                            logger.info("Auto-join success: %s (id=%s) via invite link", gname, gid)
                             results.append({
                                 "group_id": gid,
                                 "group_name": gname,
@@ -421,7 +425,7 @@ async def auto_join_unmapped_groups(
                         # Fallback: try username
                         elif username:
                             await client.join_chat(f"@{username}")
-                            logger.info(f"Auto-join success: {gname} (id={gid}) via username")
+                            logger.info("Auto-join success: %s (id=%s) via username", gname, gid)
                             results.append({
                                 "group_id": gid,
                                 "group_name": gname,
@@ -434,7 +438,7 @@ async def auto_join_unmapped_groups(
 
                     except FloodWaitError as e:
                         last_error = f"Rate limited: wait {e.seconds}s"
-                        logger.warning(f"FloodWait for group {gname}: {e.seconds}s")
+                        logger.warning("FloodWait for group %s: %ds", gname, e.seconds)
                         # Wait and retry with next client or move to next group
                         await asyncio.sleep(min(e.seconds + 5, 60))
                         continue
@@ -453,7 +457,7 @@ async def auto_join_unmapped_groups(
 
                     except Exception as e:
                         last_error = f"Error: {type(e).__name__}: {str(e)[:50]}"
-                        logger.warning(f"Failed to join {gname}: {e}")
+                        logger.warning("Failed to join %s: %s", gname, e)
                         continue
 
                 if not joined:
@@ -468,7 +472,7 @@ async def auto_join_unmapped_groups(
                 await asyncio.sleep(30)
 
             except Exception as e:
-                logger.error(f"Unexpected error joining group {gid}: {e}")
+                logger.error("Unexpected error joining group %s: %s", gid, e)
                 results.append({
                     "group_id": gid,
                     "group_name": gname,
@@ -476,7 +480,7 @@ async def auto_join_unmapped_groups(
                     "error": str(e)[:100],
                 })
 
-        logger.info(f"Auto-join completed: {joined_count}/{len(unmapped)} groups joined")
+        logger.info("Auto-join completed: %d/%d groups joined", joined_count, len(unmapped))
 
         return {
             "success": True,
@@ -532,7 +536,7 @@ async def ensure_admin_membership(
                 current_user.id, group_id
             )
 
-        logger.info(f"ensure_admin_membership: Added {len(missing_ids)} groups for admin user {current_user.id}")
+        logger.info("ensure_admin_membership: Added %d groups for admin user %s", len(missing_ids), current_user.id)
         return {"success": True, "added": len(missing_ids)}
 
     except Exception as e:

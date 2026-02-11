@@ -558,6 +558,24 @@ class TelegramClientManager:
 
             return self.admin_client
 
+    @staticmethod
+    def _parse_dialog_entity(entity) -> Optional[Dict]:
+        """Convert a Telethon dialog entity to a group info dict, or None if not a group."""
+        if not isinstance(entity, (Chat, Channel)):
+            return None
+        if isinstance(entity, Channel):
+            group_type = "supergroup" if entity.megagroup else "channel"
+        else:
+            group_type = "group"
+        return {
+            "telegram_id": entity.id,
+            "title": entity.title,
+            "username": getattr(entity, 'username', None),
+            "member_count": getattr(entity, 'participants_count', None),
+            "group_type": group_type,
+            "has_topics": getattr(entity, 'forum', False),
+        }
+
     async def get_user_groups(self, user_id: str) -> List[Dict]:
         """Get all groups/channels user is member of"""
         client = await self.get_user_client(user_id)
@@ -568,31 +586,9 @@ class TelegramClientManager:
             groups = []
 
             for dialog in dialogs:
-                entity = dialog.entity
-
-                # Chat = regular groups, Channel = supergroups & channels
-                if isinstance(entity, (Chat, Channel)):
-                    if isinstance(entity, Channel):
-                        group_type = "supergroup" if entity.megagroup else "channel"
-                    else:
-                        group_type = "group"
-
-                    group_info = {
-                        "telegram_id": entity.id,
-                        "title": entity.title,
-                        "username": getattr(entity, 'username', None),
-                        "member_count": getattr(entity, 'participants_count', None),
-                        "group_type": group_type,
-                        "has_topics": getattr(entity, 'forum', False),  # NEW: Extract forum flag
-                    }
-                    groups.append(group_info)
-                else:
-                    # Log skipped entities for diagnostics
-                    entity_type = type(entity).__name__
-                    logger.debug(
-                        "Skipped non-group entity in get_user_groups: type=%s, id=%s, title=%s",
-                        entity_type, getattr(entity, 'id', None), getattr(entity, 'title', 'N/A')
-                    )
+                info = self._parse_dialog_entity(dialog.entity)
+                if info:
+                    groups.append(info)
 
             return groups
         except asyncio.TimeoutError:
@@ -720,19 +716,9 @@ class TelegramClientManager:
             dialogs = await asyncio.wait_for(client.get_dialogs(), timeout=15.0)
             groups = []
             for dialog in dialogs:
-                entity = dialog.entity
-                if isinstance(entity, (Chat, Channel)):
-                    if isinstance(entity, Channel):
-                        group_type = "supergroup" if entity.megagroup else "channel"
-                    else:
-                        group_type = "group"
-                    groups.append({
-                        "telegram_id": entity.id,
-                        "title": entity.title,
-                        "username": getattr(entity, 'username', None),
-                        "member_count": getattr(entity, 'participants_count', None),
-                        "group_type": group_type,
-                    })
+                info = self._parse_dialog_entity(dialog.entity)
+                if info:
+                    groups.append(info)
             return groups
         except asyncio.TimeoutError:
             raise TelegramAuthError("텔레그램 그룹 목록 로딩 시간 초과.", status_code=504)
