@@ -12,7 +12,7 @@ import secrets
 import time
 from typing import Dict, Tuple
 
-from fastapi import APIRouter, HTTPException, Request, Security
+from fastapi import APIRouter, HTTPException, Query, Request, Security
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
@@ -48,7 +48,7 @@ def _cleanup_expired_tickets() -> None:
 @router.post("/events/ticket")
 async def create_sse_ticket(
     request: Request,
-    groups: str,
+    groups: str = Query(..., description="Comma-separated group IDs"),
     credentials: HTTPAuthorizationCredentials = Security(_security),
 ):
     """Exchange JWT for a single-use, short-lived SSE ticket.
@@ -101,6 +101,7 @@ async def event_stream(request: Request, ticket: str = "", token: str = "", grou
         if time.monotonic() > expires_at:
             raise HTTPException(status_code=401, detail="Ticket expired")
         user_id = user_id_str
+        # group_ids already extracted from ticket — no need to parse query param
     elif token:
         # Legacy fallback: JWT in URL (deprecated, kept for backward compatibility)
         try:
@@ -115,12 +116,12 @@ async def event_stream(request: Request, ticket: str = "", token: str = "", grou
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token payload")
 
+        # Parse group_ids from query parameter for legacy token auth
         group_ids = [g.strip() for g in groups.split(",") if g.strip()]
     else:
         raise HTTPException(status_code=401, detail="No authentication provided")
 
-    # Parse group IDs
-    group_ids = [g.strip() for g in groups.split(",") if g.strip()]
+    # Validate we have at least one group
     if not group_ids:
         raise HTTPException(status_code=400, detail="No groups specified")
 
