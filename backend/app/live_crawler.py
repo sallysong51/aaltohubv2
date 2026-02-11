@@ -45,6 +45,10 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from app.error_recovery import GetMeErrorRecovery
 from app.metrics import MessageMetrics
+from app.reference_discovery import ReferenceDiscovery
+from app.web_scraper import WebScraper
+from app.telegram_auto_join import TelegramAutoJoin
+from app.context_aggregator import ContextAggregator
 
 # Transient exceptions that justify a retry (not programming bugs)
 _TRANSIENT_EXCEPTIONS = (
@@ -188,6 +192,12 @@ class LiveCrawlerService:
 
         # Phase 2B: Logging Optimization — metrics tracking (extract to separate module)
         self._metrics = MessageMetrics(self._get_group_title)
+
+        # Phase 3: External Reference Discovery & Auto-Crawling
+        self._reference_discovery = ReferenceDiscovery()
+        self._web_scraper = WebScraper()
+        self._telegram_auto_join = TelegramAutoJoin(self)  # Pass self as client manager
+        self._context_aggregator = ContextAggregator()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1024,6 +1034,13 @@ class LiveCrawlerService:
                 _safe_create_task(
                     self._write_to_dead_letter(message_data, "queue_full"),
                     name=f"dead-letter-{message.id}",
+                )
+
+            # Phase 3: Discover and enqueue external references (URLs, t.me links)
+            if message_data.get("content"):
+                await self._reference_discovery.discover_and_enqueue(
+                    str(message_data["telegram_message_id"]),
+                    message_data["content"]
                 )
 
         except Exception as e:
