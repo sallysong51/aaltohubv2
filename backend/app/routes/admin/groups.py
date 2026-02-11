@@ -90,30 +90,45 @@ async def delete_group_admin(
 
     Deletes regardless of crawling status or any other state.
     All related data is cascaded or explicitly deleted.
+    Handles missing tables gracefully (logs and continues).
     """
     try:
         gid = int(group_id)
+
+        # Helper to delete with table existence check
+        async def safe_delete(conn, table: str, column: str = "group_id"):
+            """Delete from table if it exists, otherwise skip."""
+            try:
+                query = f"DELETE FROM {table} WHERE {column} = $1"
+                await conn.execute(query, gid)
+            except Exception as e:
+                # Table doesn't exist or other error - log and continue
+                error_msg = str(e).lower()
+                if "does not exist" in error_msg or "relation" in error_msg:
+                    logger.debug(f"delete_group_admin: table '{table}' does not exist, skipping")
+                else:
+                    logger.warning(f"delete_group_admin: error deleting from {table}: {e}")
 
         # Use transaction for atomic delete
         async with db.pool.acquire() as conn:
             async with conn.transaction():
                 # Delete tables WITHOUT CASCADE first (manual cleanup)
-                await conn.execute("DELETE FROM telegram_join_queue WHERE joined_group_id = $1", gid)
+                await safe_delete(conn, "telegram_join_queue", "joined_group_id")
 
-                # Delete tables with CASCADE (explicit delete for clarity, though CASCADE handles it)
+                # Delete tables with CASCADE (explicit delete for clarity)
                 # Order: child tables first, parent last
-                await conn.execute("DELETE FROM group_topics WHERE group_id = $1", gid)
-                await conn.execute("DELETE FROM context_keywords WHERE group_id = $1", gid)
-                await conn.execute("DELETE FROM group_contexts WHERE group_id = $1", gid)
-                await conn.execute("DELETE FROM connection_accessible_groups WHERE group_id = $1", gid)
-                await conn.execute("DELETE FROM failed_messages WHERE group_id = $1", gid)
-                await conn.execute("DELETE FROM private_group_invites WHERE group_id = $1", gid)
-                await conn.execute("DELETE FROM crawl_logs WHERE group_id = $1", gid)
-                await conn.execute("DELETE FROM crawler_events WHERE group_id = $1", gid)
-                await conn.execute("DELETE FROM crawler_metrics WHERE group_id = $1", gid)
-                await conn.execute("DELETE FROM crawler_status WHERE group_id = $1", gid)
-                await conn.execute("DELETE FROM user_groups WHERE group_id = $1", gid)
-                await conn.execute("DELETE FROM messages WHERE group_id = $1", gid)
+                await safe_delete(conn, "group_topics")
+                await safe_delete(conn, "context_keywords")
+                await safe_delete(conn, "group_contexts")
+                await safe_delete(conn, "connection_accessible_groups")
+                await safe_delete(conn, "failed_messages")
+                await safe_delete(conn, "private_group_invites")
+                await safe_delete(conn, "crawl_logs")
+                await safe_delete(conn, "crawler_events")
+                await safe_delete(conn, "crawler_metrics")
+                await safe_delete(conn, "crawler_status")
+                await safe_delete(conn, "user_groups")
+                await safe_delete(conn, "messages")
 
                 # Finally delete the parent
                 result = await conn.execute("DELETE FROM groups WHERE id = $1", gid)
