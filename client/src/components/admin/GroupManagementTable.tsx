@@ -4,8 +4,10 @@
  */
 import { Badge } from '@/components/ui/badge';
 import { toast } from 'sonner';
-import { Loader2, Circle, Power, PowerOff, Download, Trash2 } from 'lucide-react';
+import { Loader2, Circle, Power, PowerOff, Download, Trash2, FileText } from 'lucide-react';
 import { adminApi, RegisteredGroup, getApiErrorMessage } from '@/lib/api';
+import { formatDistanceToNow } from 'date-fns';
+import { ko } from 'date-fns/locale';
 
 interface GroupManagementTableProps {
   groups: RegisteredGroup[];
@@ -36,11 +38,13 @@ export default function GroupManagementTable({
             <thead className="bg-muted/50">
               <tr>
                 <th className="text-left px-3 py-2 font-medium">그룹명</th>
-                <th className="text-center px-3 py-2 font-medium w-20">멤버</th>
-                <th className="text-center px-3 py-2 font-medium w-24">공개여부</th>
-                <th className="text-center px-3 py-2 font-medium w-24">크롤링</th>
-                <th className="text-center px-3 py-2 font-medium w-20">상태</th>
-                <th className="text-center px-3 py-2 font-medium w-28">액션</th>
+                <th className="text-center px-3 py-2 font-medium w-16">멤버</th>
+                <th className="text-center px-3 py-2 font-medium w-20">공개</th>
+                <th className="text-center px-3 py-2 font-medium w-20">활성화</th>
+                <th className="text-center px-3 py-2 font-medium w-28">등록일</th>
+                <th className="text-center px-3 py-2 font-medium w-28">최근 업데이트</th>
+                <th className="text-center px-3 py-2 font-medium w-16">상태</th>
+                <th className="text-center px-3 py-2 font-medium w-36">액션</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
@@ -63,7 +67,7 @@ export default function GroupManagementTable({
                         variant={group.visibility === 'public' ? 'default' : 'secondary'}
                         className="text-[10px]"
                       >
-                        {group.visibility === 'public' ? '🌐 공개' : '🔒 개인'}
+                        {group.visibility === 'public' ? '공개' : '개인'}
                       </Badge>
                     </td>
                     <td className="text-center px-3 py-2">
@@ -90,6 +94,34 @@ export default function GroupManagementTable({
                       </button>
                     </td>
                     <td className="text-center px-3 py-2">
+                      <div className="text-[10px] text-muted-foreground">
+                        {group.registered_at ? (
+                          <span title={new Date(group.registered_at).toLocaleString('ko-KR')}>
+                            {formatDistanceToNow(new Date(group.registered_at), {
+                              addSuffix: true,
+                              locale: ko
+                            })}
+                          </span>
+                        ) : (
+                          '-'
+                        )}
+                      </div>
+                    </td>
+                    <td className="text-center px-3 py-2">
+                      <div className="text-[10px] text-muted-foreground">
+                        {group.last_updated_at ? (
+                          <span title={new Date(group.last_updated_at).toLocaleString('ko-KR')}>
+                            {formatDistanceToNow(new Date(group.last_updated_at), {
+                              addSuffix: true,
+                              locale: ko
+                            })}
+                          </span>
+                        ) : (
+                          <span className="text-amber-500">미수집</span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="text-center px-3 py-2">
                       <div className="flex items-center justify-center gap-1">
                         {crawlerStatus === 'initializing' ? (
                           <Loader2 className="h-3 w-3 animate-spin text-primary" />
@@ -109,6 +141,17 @@ export default function GroupManagementTable({
                     </td>
                     <td className="text-center px-3 py-2">
                       <div className="flex items-center justify-center gap-1">
+                        <button
+                          onClick={() => {
+                            toast.info('이벤트 로그 기능은 다음 단계에서 구현됩니다', {
+                              description: `${group.title}의 모든 이벤트와 추출된 정보를 표시할 예정입니다.`
+                            });
+                          }}
+                          className="p-1 rounded hover:bg-accent text-blue-500"
+                          title="이벤트 로그 (개발 예정)"
+                        >
+                          <FileText className="h-3.5 w-3.5" />
+                        </button>
                         <button
                           onClick={() => onTriggerCrawl(group.id)}
                           className="p-1 rounded hover:bg-accent text-primary"

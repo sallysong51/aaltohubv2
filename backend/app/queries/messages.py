@@ -10,25 +10,33 @@ logger = logging.getLogger(__name__)
 
 # The canonical SELECT column list for messages.
 # DB column is "text" but API field is "content", so we alias here.
+# Phase 34: Added links, mentions, photo_count for message metadata
 MESSAGE_SELECT_COLUMNS = """id, telegram_message_id, group_id, sender_id, sender_name,
        "text" AS content, media_type, media_url,
+       links, mentions, photo_count,
        reply_to_message_id, topic_id, sent_at, is_deleted, created_at"""
 
 
 def message_upsert_sql(ignore_duplicates: bool = True) -> str:
-    """Return the INSERT...ON CONFLICT SQL for messages."""
+    """Return the INSERT...ON CONFLICT SQL for messages.
+
+    Phase 34: Extended to 15 params (added links, mentions, photo_count).
+    """
     conflict = (
         "ON CONFLICT (telegram_message_id, group_id) DO NOTHING"
         if ignore_duplicates
         else 'ON CONFLICT (telegram_message_id, group_id) DO UPDATE SET '
              '"text" = EXCLUDED."text", media_type = EXCLUDED.media_type, '
              'media_url = EXCLUDED.media_url, is_edited = TRUE, '
-             'is_deleted = EXCLUDED.is_deleted'
+             'is_deleted = EXCLUDED.is_deleted, '
+             'links = EXCLUDED.links, mentions = EXCLUDED.mentions, '
+             'photo_count = EXCLUDED.photo_count'
     )
     return f"""INSERT INTO messages
         (telegram_message_id, group_id, sender_id, sender_name, "text",
-         media_type, media_url, reply_to_message_id, topic_id, is_deleted, sent_at, message_source)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         media_type, media_url, reply_to_message_id, topic_id, is_deleted, sent_at, message_source,
+         links, mentions, photo_count)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         {conflict}"""
 
 

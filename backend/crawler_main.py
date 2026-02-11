@@ -29,6 +29,7 @@ from sentry_sdk.integrations.asyncio import AsyncioIntegration
 from app.config import settings
 from app.database import db
 from app.live_crawler import live_crawler, CB_RECOVERY_TIMEOUT
+from app.event_logger import event_logger
 
 # Track crawler process startup time (for restart detection)
 STARTUP_TIMESTAMP = time.time()
@@ -110,12 +111,27 @@ async def lifespan(app: FastAPI):
 
     # Connect with retry (matches main.py behavior) — keeps process alive if DB is temporarily down
     db_ok = await db.connect_with_retry()
+
+    # Start event logger (async background worker for event recording)
+    await event_logger.start()
+    logger.info("EventLogger started")
+
     if db_ok:
         asyncio.create_task(live_crawler.start())
+        await event_logger.log_info(
+            category="system",
+            title="Crawler started",
+            message="Live crawler process initialized successfully",
+        )
     else:
         logger.critical(
             "[CRAWLER] Database unreachable after retries — crawler will not start. "
             "Auto-reconnect will retry every %ds.", _AUTO_RECONNECT_INTERVAL
+        )
+        await event_logger.log_error(
+            category="database",
+            title="Database unreachable at startup",
+            message=f"Crawler will not start. Auto-reconnect will retry every {_AUTO_RECONNECT_INTERVAL}s.",
         )
 
     # Always start auto-reconnect (handles DB-down-at-startup and mid-run crashes)
@@ -130,6 +146,11 @@ async def lifespan(app: FastAPI):
         pass
     if live_crawler.running:
         await live_crawler.stop()
+
+    # Stop event logger and flush pending events
+    await event_logger.stop()
+    logger.info("EventLogger stopped")
+
     await db.close()
     executor.shutdown(wait=True, cancel_futures=True)
 

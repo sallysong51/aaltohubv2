@@ -1,0 +1,30 @@
+{
+  "event-management-system": {
+    "phase": "plan",
+    "status": "in_progress",
+    "startedAt": "2026-02-11T00:00:00Z",
+    "lastUpdated": "2026-02-11T00:00:00Z",
+    "documents": {
+      "plan": "docs/01-plan/features/event-management-system.plan.md",
+      "design": null,
+      "analysis": null,
+      "report": null
+    },
+    "tasks": {
+      "plan": 1
+    },
+    "metadata": {
+      "level": "Dynamic",
+      "modules": [
+        "AI Classification Engine",
+        "Prompt Management",
+        "Process Visualization",
+        "Event Detail Page",
+        "Collection Dashboard"
+      ],
+      "estimatedWeeks": 6,
+      "aiModel": "claude-3-5-sonnet-20241022",
+      "priority": "high"
+    }
+  }
+}

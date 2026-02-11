@@ -15,6 +15,7 @@ import { toast } from 'sonner';
 import {
   Loader2, Users, Settings, MessageSquare, RefreshCw, Zap, LayoutDashboard,
   Search, X, Sun, Moon,
+  Link, Send, Image, Video, File, Sticker,  // Phase 34: metadata icons
 } from 'lucide-react';
 import { groupsApi, RegisteredGroup, Message, getApiErrorMessage } from '@/lib/api';
 import ProtectedRoute from '@/components/ProtectedRoute';
@@ -658,24 +659,63 @@ function EventFeedContent() {
                             </div>
                           )}
 
-                          {/* Media */}
-                          {message.media_type && (
-                            <div className="flex items-center gap-1">
-                              {message.media_type === 'photo' && message.media_url && /^https?:\/\//i.test(message.media_url) ? (
-                                <img
-                                  src={message.media_url}
-                                  alt={`${message.sender_name || '사용자'}의 미디어`}
-                                  className="max-h-24 rounded border border-border cursor-pointer hover:opacity-80 transition-opacity"
-                                  loading="lazy"
-                                  onClick={() => handlePhotoClick(message.telegram_message_id)}
-                                />
-                              ) : (
-                                <Badge variant="secondary" className="text-xs py-0">
-                                  {message.media_type}
-                                </Badge>
-                              )}
-                            </div>
-                          )}
+                          {/* Phase 34: Metadata badges (links, mentions, media) */}
+                          <div className="flex gap-2 mt-2 flex-wrap">
+                            {/* Links badge */}
+                            {message.links && message.links.length > 0 && (
+                              <span className="inline-flex items-center gap-1 px-2 py-1 bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300 rounded-full text-xs">
+                                <Link size={14} />
+                                <span>{message.links.length}</span>
+                              </span>
+                            )}
+
+                            {/* Mentions badge (텔레그램 그룹 언급) */}
+                            {message.mentions && message.mentions.length > 0 && (
+                              <span className="inline-flex items-center gap-1 px-2 py-1 bg-purple-100 dark:bg-purple-900 text-purple-700 dark:text-purple-300 rounded-full text-xs">
+                                <Send size={14} />
+                                <span>{message.mentions.length}</span>
+                              </span>
+                            )}
+
+                            {/* Photo count (if album) */}
+                            {message.photo_count && message.photo_count > 1 && (
+                              <span className="inline-flex items-center gap-1 px-2 py-1 bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 rounded-full text-xs">
+                                <Image size={14} />
+                                <span>{message.photo_count}</span>
+                              </span>
+                            )}
+
+                            {/* Single photo (no count) */}
+                            {message.media_type === 'photo' && !message.photo_count && (
+                              <span className="inline-flex items-center gap-1 px-2 py-1 bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 rounded-full text-xs">
+                                <Image size={14} />
+                              </span>
+                            )}
+
+                            {/* Video */}
+                            {message.media_type === 'video' && (
+                              <span className="inline-flex items-center gap-1 px-2 py-1 bg-orange-100 dark:bg-orange-900 text-orange-700 dark:text-orange-300 rounded-full text-xs">
+                                <Video size={14} />
+                                <span>영상</span>
+                              </span>
+                            )}
+
+                            {/* Document */}
+                            {message.media_type === 'document' && (
+                              <span className="inline-flex items-center gap-1 px-2 py-1 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-full text-xs">
+                                <File size={14} />
+                                <span>문서</span>
+                              </span>
+                            )}
+
+                            {/* Sticker */}
+                            {message.media_type === 'sticker' && (
+                              <span className="inline-flex items-center gap-1 px-2 py-1 bg-pink-100 dark:bg-pink-900 text-pink-700 dark:text-pink-300 rounded-full text-xs">
+                                <Sticker size={14} />
+                                <span>스티커</span>
+                              </span>
+                            )}
+                          </div>
                         </div>
                       </MessageContextMenu>
                     </div>

@@ -40,7 +40,9 @@ async def get_all_groups(
                    SELECT COUNT(*)
                    FROM messages m
                    WHERE m.group_id = g.id AND m.is_deleted = FALSE
-               ) AS message_count_total
+               ) AS message_count_total,
+               g.created_at::text AS registered_at,
+               g.last_crawled_at::text AS last_updated_at
                FROM groups g
                ORDER BY g.created_at DESC
                LIMIT $1 OFFSET $2""",
@@ -51,6 +53,8 @@ async def get_all_groups(
             api_dict = db_group_to_api(dict(g))
             api_dict["connection_id"] = g.get("connection_id")
             api_dict["message_count_total"] = g.get("message_count_total", 0)
+            api_dict["registered_at"] = g.get("registered_at")
+            api_dict["last_updated_at"] = g.get("last_updated_at")
             result.append(TelegramGroupResponse(**api_dict))
         return result
     except Exception as e:

@@ -165,3 +165,185 @@ async def trigger_batch_crawl_admin(
         "message": f"Batch crawl started for {len(group_ids)} groups",
         "group_count": len(group_ids)
     }
+
+
+@router.get("/crawler-events")
+async def get_crawler_events(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
+    event_type: str = Query(None, description="Filter by event type: error, warning, info, success, recovery"),
+    event_category: str = Query(None, description="Filter by category: connection, crawl, database, media, gap_fill, circuit_breaker, system, auth, rate_limit"),
+    group_id: int = Query(None, description="Filter by group ID"),
+    resolved: bool = Query(None, description="Filter by resolved status"),
+    current_user: UserResponse = Depends(get_current_admin_user),
+):
+    """
+    Get crawler events with optional filters (admin only).
+    Returns comprehensive event log with resolution tracking.
+    """
+    offset = (page - 1) * page_size
+
+    # Build dynamic WHERE clause
+    where_clauses = []
+    params = []
+    param_count = 1
+
+    if event_type:
+        where_clauses.append(f"event_type = ${param_count}")
+        params.append(event_type)
+        param_count += 1
+
+    if event_category:
+        where_clauses.append(f"event_category = ${param_count}")
+        params.append(event_category)
+        param_count += 1
+
+    if group_id is not None:
+        where_clauses.append(f"group_id = ${param_count}")
+        params.append(group_id)
+        param_count += 1
+
+    if resolved is not None:
+        where_clauses.append(f"resolved = ${param_count}")
+        params.append(resolved)
+        param_count += 1
+
+    where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+    # Add pagination params
+    params.extend([page_size, offset])
+
+    try:
+        # Check if table exists first
+        table_exists = await db.fetchval(
+            "SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'crawler_events')"
+        )
+
+        if not table_exists:
+            logger.warning("crawler_events table does not exist - returning empty result")
+            return {
+                "events": [],
+                "unresolved_count": 0,
+                "page": page,
+                "page_size": page_size,
+            }
+
+        rows = await db.fetch(
+            f"""
+            SELECT
+                ce.*,
+                g.name AS group_title
+            FROM crawler_events ce
+            LEFT JOIN groups g ON g.id = ce.group_id
+            {where_sql}
+            ORDER BY ce.created_at DESC
+            LIMIT ${param_count} OFFSET ${param_count + 1}
+            """,
+            *params,
+        )
+
+        # Also get count of unresolved errors for summary
+        unresolved_count = await db.fetchval(
+            "SELECT COUNT(*) FROM crawler_events WHERE resolved = false AND event_type IN ('error', 'warning')"
+        ) or 0
+
+        return {
+            "events": [dict(r) for r in rows],
+            "unresolved_count": unresolved_count,
+            "page": page,
+            "page_size": page_size,
+        }
+    except Exception as e:
+        logger.error("get_crawler_events error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch crawler events: {str(e)}")
+
+
+@router.get("/crawler-summary")
+async def get_crawler_summary(
+    current_user: UserResponse = Depends(get_current_admin_user),
+):
+    """
+    Get summary statistics of crawler events for dashboard.
+    전체 상황 파악용 요약 통계
+    """
+    try:
+        # Check if table exists first
+        table_exists = await db.fetchval(
+            "SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'crawler_events')"
+        )
+
+        if not table_exists:
+            logger.warning("crawler_events table does not exist - returning empty summary")
+            return {
+                "event_counts": [],
+                "unresolved_errors": [],
+                "recent_successes": [],
+                "recovery_events": [],
+            }
+
+        # Get event counts by type (last 24 hours)
+        event_counts = await db.fetch(
+            """
+            SELECT
+                event_type,
+                event_category,
+                COUNT(*) as count
+            FROM crawler_events
+            WHERE created_at > NOW() - INTERVAL '24 hours'
+            GROUP BY event_type, event_category
+            ORDER BY count DESC
+            """
+        )
+
+        # Get unresolved errors
+        unresolved_errors = await db.fetch(
+            """
+            SELECT
+                ce.*,
+                g.name AS group_title
+            FROM crawler_events ce
+            LEFT JOIN groups g ON g.id = ce.group_id
+            WHERE ce.resolved = false
+              AND ce.event_type IN ('error', 'warning')
+            ORDER BY ce.created_at DESC
+            LIMIT 10
+            """
+        )
+
+        # Get recent successes (last 10)
+        recent_successes = await db.fetch(
+            """
+            SELECT
+                ce.*,
+                g.name AS group_title
+            FROM crawler_events ce
+            LEFT JOIN groups g ON g.id = ce.group_id
+            WHERE ce.event_type = 'success'
+            ORDER BY ce.created_at DESC
+            LIMIT 10
+            """
+        )
+
+        # Get recovery events (auto-resolved issues)
+        recovery_events = await db.fetch(
+            """
+            SELECT
+                ce.*,
+                g.name AS group_title
+            FROM crawler_events ce
+            LEFT JOIN groups g ON g.id = ce.group_id
+            WHERE ce.event_type = 'recovery'
+            ORDER BY ce.created_at DESC
+            LIMIT 10
+            """
+        )
+
+        return {
+            "event_counts": [dict(r) for r in event_counts],
+            "unresolved_errors": [dict(r) for r in unresolved_errors],
+            "recent_successes": [dict(r) for r in recent_successes],
+            "recovery_events": [dict(r) for r in recovery_events],
+        }
+    except Exception as e:
+        logger.error("get_crawler_summary error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch crawler summary: {str(e)}")

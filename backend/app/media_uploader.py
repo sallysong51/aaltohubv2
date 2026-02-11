@@ -38,9 +38,19 @@ class MediaUploader:
     ) -> tuple[str | None, str | None]:
         """Download media from Telegram and upload to Supabase Storage.
 
+        Phase 34: Only downloads photos. Videos/documents/stickers are detected
+        (media_type set) but NOT downloaded (media_url=NULL), saving 80-90% bandwidth.
+
         Returns (media_url, None). For photos, downloads an optimized size (800px)
         instead of full resolution. Uses x-upsert for idempotent re-crawl.
         """
+        if not message.media:
+            return None, None
+
+        # Phase 34: Early return for non-photos (bandwidth optimization)
+        if media_type != "photo":
+            return None, None
+
         try:
             buffer = io.BytesIO()
             if media_type == "photo":

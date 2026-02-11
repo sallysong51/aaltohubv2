@@ -43,6 +43,7 @@ from telethon.tl.types import (
 import asyncpg
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+from app.entity_parser import MessageEntityParser
 from app.error_recovery import GetMeErrorRecovery
 from app.media_uploader import MediaUploader
 from app.metrics import GapFillMetrics, MessageMetrics
@@ -615,6 +616,7 @@ class LiveCrawlerService:
             "connected": self.connected,
             "start_error": self._start_error,
             "groups_count": len(self.group_id_map),
+            "groups_monitored": len(self.group_id_map),
             "messages_received": self._message_count,
             # Phase 2B: Message handling metrics (delegated to metrics module)
             "messages_handled": metrics_summary["messages_handled"],
@@ -647,7 +649,54 @@ class LiveCrawlerService:
             "ai_classifier": self._ai_classifier.get_stats(),
             # Phase 33: Gap-fill SLA monitoring
             "gap_fill_at_risk": self._gap_fill_metrics.get_groups_exceeding_sla(sla_hours=2.5),
+            # Phase 34: System diagnostics
+            "circuit_breaker": {
+                "state": "open" if self._circuit_breaker.is_open else "closed",
+                "failure_count": self._circuit_breaker.failure_count,
+                "consecutive_opens": getattr(self._circuit_breaker, '_consecutive_opens', 0),
+            },
+            "dead_letter_queue_size": self._get_dead_letter_queue_size(),
+            "floodwait_penalties": self._floodwait_penalties,
+            "get_me_cache_size": len(self._error_recovery._get_me_cache) if hasattr(self._error_recovery, '_get_me_cache') else 0,
+            "get_me_circuit_open_count": sum(1 for exp in (self._error_recovery._get_me_circuit_open.values() if hasattr(self._error_recovery, '_get_me_circuit_open') else []) if exp > time.time()),
+            "manual_crawl_tasks_count": len(self._manual_crawl_tasks),
+            "batch_crawl_active": self._batch_crawl_active,
+            "batch_crawl_queue_size": getattr(self, '_batch_crawl_queue_size', 0),
+            "active_listeners": {
+                str(user_id): {
+                    "username": client_info.get("username"),
+                    "connection_id": client_info.get("connection_id"),
+                }
+                for user_id, client_info in self.user_id_client_map.items()
+            },
+            "status": self._get_overall_status(),
+            "last_activity": self._started_at.isoformat() if self._started_at else None,
         }
+
+    def _get_overall_status(self) -> str:
+        """Calculate overall crawler status for diagnostics."""
+        if not self.running:
+            return "stopped"
+        if self._circuit_breaker.is_open:
+            return "degraded"
+        if self._batch_crawl_active or self._historical_crawl_running:
+            return "crawling"
+        if self.connected and len(self.user_id_client_map) > 0:
+            return "active"
+        return "initializing"
+
+    def _get_dead_letter_queue_size(self) -> int:
+        """Get size of dead letter queue (from file)."""
+        try:
+            dlq_path = Path("data/dead_letter_queue.jsonl")
+            if not dlq_path.exists():
+                return 0
+            # Count lines in file
+            with open(dlq_path, "r") as f:
+                return sum(1 for _ in f)
+        except Exception as e:
+            logger.error("Failed to get dead letter queue size: %s", e)
+            return 0
 
     # ------------------------------------------------------------------
     # DB writer coroutine with adaptive batching
@@ -731,7 +780,10 @@ class LiveCrawlerService:
         reraise=True,
     )
     async def _db_upsert_batch(self, rows: list[dict], ignore_duplicates: bool = True) -> None:
-        """Batch upsert messages via asyncpg executemany."""
+        """Batch upsert messages via asyncpg executemany.
+
+        Phase 34: Extended to 15 params (added links, mentions, photo_count).
+        """
         from app.queries.messages import message_upsert_sql
         query = message_upsert_sql(ignore_duplicates)
         args_list = [
@@ -740,6 +792,7 @@ class LiveCrawlerService:
                 r.get("sender_name"), r.get("content"), r.get("media_type"),
                 r.get("media_url"), r.get("reply_to_message_id"), r.get("topic_id"),
                 r.get("is_deleted", False), r.get("sent_at"), r.get("message_source", "realtime"),
+                r.get("links"), r.get("mentions"), r.get("photo_count"),  # Phase 34
             )
             for r in rows
         ]
@@ -752,7 +805,10 @@ class LiveCrawlerService:
         reraise=True,
     )
     async def _db_upsert_single(self, row: dict, ignore_duplicates: bool = True) -> None:
-        """Single message upsert via asyncpg."""
+        """Single message upsert via asyncpg.
+
+        Phase 34: Extended to 15 params (added links, mentions, photo_count).
+        """
         from app.queries.messages import message_upsert_sql
         query = message_upsert_sql(ignore_duplicates)
         await db.execute(
@@ -761,6 +817,7 @@ class LiveCrawlerService:
             row.get("sender_name"), row.get("content"), row.get("media_type"),
             row.get("media_url"), row.get("reply_to_message_id"), row.get("topic_id"),
             row.get("is_deleted", False), row.get("sent_at"), row.get("message_source", "realtime"),
+            row.get("links"), row.get("mentions"), row.get("photo_count"),  # Phase 34
         )
 
     async def _check_cb_recovery(self) -> None:
@@ -1016,7 +1073,13 @@ class LiveCrawlerService:
             media_type = self._detect_media_type(message)
             media_url = None
 
-            if download_media and media_type is not None and client:
+            # Phase 34: Extract entity metadata (links, mentions, photo albums)
+            links = MessageEntityParser.extract_links(message)
+            mentions = MessageEntityParser.extract_mentions(message)
+            photo_count = MessageEntityParser.get_photo_count(message)
+
+            # Phase 34: Only download photos (not videos/documents/stickers)
+            if download_media and media_type == "photo" and client:
                 media_url, _ = await self._upload_media(message, group_uuid, media_type, client)
 
             sender_id = message.sender_id
@@ -1047,6 +1110,9 @@ class LiveCrawlerService:
                 "sent_at": sent_at,
                 "message_source": message_source,
                 "created_at": datetime.now(timezone.utc),
+                "links": links,  # Phase 34: JSONB array of link objects
+                "mentions": mentions,  # Phase 34: JSONB array of mention objects
+                "photo_count": photo_count,  # Phase 34: INTEGER count for photo albums
             }
 
             if is_edit:

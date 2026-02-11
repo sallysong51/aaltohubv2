@@ -342,6 +342,8 @@ export interface RegisteredGroup {
   crawl_enabled?: boolean;
   message_count_total?: number;
   created_at: string;
+  registered_at?: string;  // ISO timestamp when first registered
+  last_updated_at?: string;  // ISO timestamp of last crawl
 }
 
 export interface RegisterGroupsRequest {
@@ -397,6 +399,10 @@ export interface Message {
   is_deleted: boolean;
   sent_at: string;
   created_at: string;
+  // Phase 34: Message metadata
+  links?: Array<{ url: string; text?: string }> | null;
+  mentions?: Array<{ username?: string; id?: number }> | null;
+  photo_count?: number | null;
 }
 
 export interface MessagesListResponse {
@@ -579,6 +585,78 @@ export interface BackendHealth {
   sse_listener: string;
 }
 
+export interface CrawlerEvent {
+  id: string;
+  event_type: 'error' | 'info' | 'warning' | 'success' | 'recovery';
+  event_category: 'connection' | 'crawl' | 'database' | 'media' | 'gap_fill' | 'circuit_breaker' | 'system' | 'auth' | 'rate_limit';
+  title: string;
+  message: string;
+  group_id?: number;
+  group_title?: string;
+  connection_id?: string;
+  details?: Record<string, unknown>;
+  resolved: boolean;
+  resolved_at?: string;
+  resolution_message?: string;
+  created_at: string;
+}
+
+export interface CrawlerEventsResponse {
+  events: CrawlerEvent[];
+  unresolved_count: number;
+  page: number;
+  page_size: number;
+}
+
+export interface CrawlerSummary {
+  event_counts: Array<{
+    event_type: string;
+    event_category: string;
+    count: number;
+  }>;
+  unresolved_errors: CrawlerEvent[];
+  recent_successes: CrawlerEvent[];
+  recovery_events: CrawlerEvent[];
+}
+
+export interface SystemComponent {
+  name: string;
+  category: 'core' | 'connection' | 'database' | 'realtime' | 'resilience' | 'rate_limit' | 'monitoring' | 'crawl';
+  health: 'healthy' | 'warning' | 'degraded' | 'critical';
+  status: string;
+  metrics: Record<string, any>;
+  issues: string[];
+  last_activity: string | null;
+}
+
+export interface SystemDiagnostics {
+  overall_health: 'healthy' | 'warning' | 'degraded' | 'critical';
+  components: SystemComponent[];
+  timestamp: string;
+  crawler_reachable: boolean;
+}
+
+export interface SystemLog {
+  id: string;
+  event_type: string;
+  event_category: string;
+  message: string;
+  group_id?: number;
+  group_title?: string;
+  resolved: boolean;
+  resolution_note?: string;
+  created_at: string;
+  resolved_at?: string;
+  metadata?: Record<string, any>;
+}
+
+export interface SystemLogsResponse {
+  logs: SystemLog[];
+  page: number;
+  page_size: number;
+  total: number;
+}
+
 export const adminApi = {
   getAllGroups: () => apiClient.get<RegisteredGroup[]>('/admin/groups'),
 
@@ -680,6 +758,30 @@ export const adminApi = {
     }>(
       '/admin/detect-group-connections'
     ),
+
+  getCrawlerEvents: (params?: {
+    page?: number;
+    page_size?: number;
+    event_type?: 'error' | 'info' | 'warning' | 'success' | 'recovery';
+    event_category?: 'connection' | 'crawl' | 'database' | 'media' | 'gap_fill' | 'circuit_breaker' | 'system' | 'auth' | 'rate_limit';
+    group_id?: number;
+    resolved?: boolean;
+  }) =>
+    apiClient.get<CrawlerEventsResponse>('/admin/crawler-events', { params }),
+
+  getCrawlerSummary: () =>
+    apiClient.get<CrawlerSummary>('/admin/crawler-summary'),
+
+  getSystemDiagnostics: () =>
+    apiClient.get<SystemDiagnostics>('/admin/system-diagnostics'),
+
+  getSystemLogs: (params?: {
+    page?: number;
+    page_size?: number;
+    component?: string;
+    health?: 'healthy' | 'warning' | 'degraded' | 'critical';
+  }) =>
+    apiClient.get<SystemLogsResponse>('/admin/system-logs', { params }),
 };
 
 // ============================================================
