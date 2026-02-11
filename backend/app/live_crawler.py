@@ -49,6 +49,7 @@ from app.reference_discovery import ReferenceDiscovery
 from app.web_scraper import WebScraper
 from app.telegram_auto_join import TelegramAutoJoin
 from app.context_aggregator import ContextAggregator
+from app.ai.classifier import AIClassifier
 
 # Transient exceptions that justify a retry (not programming bugs)
 _TRANSIENT_EXCEPTIONS = (
@@ -198,6 +199,9 @@ class LiveCrawlerService:
         self._web_scraper = WebScraper()
         self._telegram_auto_join = TelegramAutoJoin(self)  # Pass self as client manager
         self._context_aggregator = ContextAggregator()
+
+        # Phase 3: AI Classification — async message classification with cost optimization
+        self._ai_classifier = AIClassifier()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -585,6 +589,8 @@ class LiveCrawlerService:
         self._error_recovery.clear()
         # Phase 2B: Clear metrics tracking (delegate to module)
         self._metrics.clear()
+        # Phase 3: Cleanup AI classifier (delegate to module)
+        await self._ai_classifier.cleanup()
 
     def get_status(self) -> dict:
         # Phase 2B: Get aggregated metrics from metrics module
@@ -623,6 +629,8 @@ class LiveCrawlerService:
                 and self._admin_wait_task is not None
                 and not self._admin_wait_task.done()
             ),
+            # Phase 3: AI classifier stats
+            "ai_classifier": self._ai_classifier.get_stats(),
         }
 
     # ------------------------------------------------------------------
@@ -893,6 +901,14 @@ class LiveCrawlerService:
             for item in persisted_items:
                 if item.get("broadcast", True):
                     await self._broadcast("insert", item["data"])
+
+                # Enqueue for AI classification
+                await self._ai_classifier.enqueue({
+                    "id": item["data"].get("id"),
+                    "text": item["data"].get("text"),
+                    "media_type": item["data"].get("media_type"),
+                    "group_id": item["data"].get("group_id"),
+                })
 
         # --- Handle upserts (edits — ON CONFLICT DO UPDATE) ---
         for item in upserts:
