@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     # Resend
     RESEND_API_KEY: str = ""
 
+    # Anthropic (AI Classification)
+    ANTHROPIC_API_KEY: str = ""
+
     # Cookie settings (for httpOnly refresh token)
     COOKIE_DOMAIN: str = ""  # Set to your domain in production (e.g. "aaltohub.com")
     COOKIE_SECURE: bool = True  # Set to False for local development without HTTPS
