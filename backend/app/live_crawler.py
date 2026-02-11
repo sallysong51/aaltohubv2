@@ -45,7 +45,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from app.error_recovery import GetMeErrorRecovery
 from app.media_uploader import MediaUploader
-from app.metrics import MessageMetrics
+from app.metrics import GapFillMetrics, MessageMetrics
 from app.reference_discovery import ReferenceDiscovery
 from app.web_scraper import WebScraper
 from app.telegram_auto_join import TelegramAutoJoin
@@ -75,9 +75,9 @@ MAX_RECONNECT_ATTEMPTS = 10
 MSG_QUEUE_MAXSIZE = 10000
 BATCH_SIZE = 50  # max messages per batch insert
 BATCH_TIMEOUT = 2.0  # seconds to wait for more messages before flushing
-GAP_FILL_INTERVAL = 1800  # 30 minutes
-GAP_FILL_LOOKBACK_HOURS = 1  # re-check last 1 hour of messages
-GAP_FILL_MAX_MESSAGES = 500  # max messages per group during gap-fill
+GAP_FILL_INTERVAL = 900  # 15 minutes (2x frequency for 3-hour SLA)
+GAP_FILL_LOOKBACK_HOURS = 3  # re-check last 3 hours of messages (3-hour SLA guarantee)
+GAP_FILL_MAX_MESSAGES = 2000  # max messages per group during gap-fill (covers high-volume groups)
 DIALOGS_COOLDOWN = 600  # 10 minutes — minimum interval between get_dialogs() calls
 QUEUE_DRAIN_TIMEOUT = 60  # seconds — max wait for queue to drain after historical crawl
 MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB — skip media larger than this
@@ -194,6 +194,7 @@ class LiveCrawlerService:
 
         # Phase 2B: Logging Optimization — metrics tracking (extract to separate module)
         self._metrics = MessageMetrics(self._get_group_title)
+        self._gap_fill_metrics = GapFillMetrics()  # Phase 33: 3-hour SLA monitoring
 
         # Phase 3: External Reference Discovery & Auto-Crawling
         self._reference_discovery = ReferenceDiscovery()
@@ -473,6 +474,7 @@ class LiveCrawlerService:
             self._refresh_task = asyncio.create_task(self._periodic_group_refresh())
             self._historical_task = asyncio.create_task(self._crawl_all_groups_historical())
             self._gap_fill_task = asyncio.create_task(self._periodic_gap_fill())
+            self._sla_monitor_task = asyncio.create_task(self._monitor_sla())  # Phase 33: SLA monitoring
             self._watchdog_task = asyncio.create_task(self._listener_watchdog())
             self._auto_join_task = asyncio.create_task(self._periodic_auto_join_groups())
 
@@ -599,6 +601,8 @@ class LiveCrawlerService:
         self._error_recovery.clear()
         # Phase 2B: Clear metrics tracking (delegate to module)
         self._metrics.clear()
+        # Phase 33: Clear gap-fill SLA metrics
+        self._gap_fill_metrics.clear()
         # Phase 3: Cleanup AI classifier (delegate to module)
         await self._ai_classifier.cleanup()
 
@@ -641,6 +645,8 @@ class LiveCrawlerService:
             ),
             # Phase 3: AI classifier stats
             "ai_classifier": self._ai_classifier.get_stats(),
+            # Phase 33: Gap-fill SLA monitoring
+            "gap_fill_at_risk": self._gap_fill_metrics.get_groups_exceeding_sla(sla_hours=2.5),
         }
 
     # ------------------------------------------------------------------
@@ -1901,9 +1907,14 @@ class LiveCrawlerService:
                             await asyncio.sleep(1.5)
                     filled += count
 
+                    # Track successful gap-fill for SLA monitoring
+                    self._gap_fill_metrics.record_gap_fill_success(gid, count)
+
                 except FloodWaitError as e:
                     logger.warning("[GAP-FILL] FloodWait %ds for group %s — skipping, will retry after penalty", e.seconds, gid)
                     self._flood_wait_until[gid] = time.monotonic() + e.seconds
+                    # Track gap-fill failure for SLA monitoring
+                    self._gap_fill_metrics.record_gap_fill_failure(gid, f"FloodWait_{e.seconds}s")
                 except Exception as e:
                     logger.debug("[GAP-FILL] Error for group %s: %s", gid, e)
 
@@ -1946,7 +1957,7 @@ class LiveCrawlerService:
                 await self._crawl_historical_for_group(gid)
 
             # --- Pass 2: retry FloodWait-skipped groups ---
-            retry_deadline = time.monotonic() + 1800  # 30 minutes max
+            retry_deadline = time.monotonic() + 7200  # 2 hours max (covers extended FloodWait penalties)
             while self.running:
                 pending_gids = [
                     gid for gid in all_gids
@@ -2592,6 +2603,9 @@ class LiveCrawlerService:
                     return
             self._start_listener_task(user_id, client)
             logger.info("Restarted listener for user_id=%s", user_id)
+
+            # Trigger emergency gap-fill to catch any messages missed during downtime
+            await self._trigger_emergency_gap_fill(f"listener_restart_user_{user_id}")
         except Exception as e:
             logger.error("Failed to restart listener for user_id=%s: %s", user_id, e)
 
@@ -2627,6 +2641,127 @@ class LiveCrawlerService:
                 for user_id in dead_user_ids:
                     await self._restart_single_listener(user_id)
 
+    async def _trigger_emergency_gap_fill(self, reason: str) -> None:
+        """Trigger immediate gap-fill without waiting for periodic cycle.
+
+        Called when:
+        - Listener reconnects after disconnect
+        - Circuit breaker recovers from open state
+        - Watchdog detects and restarts dead listener
+
+        Uses extended lookback based on time since last gap-fill.
+        """
+        if not self.running:
+            return
+
+        logger.warning("[EMERGENCY-GAP-FILL] Triggered: %s", reason)
+
+        # Calculate lookback based on time since last gap-fill
+        now_mono = time.monotonic()
+        if self._last_gap_fill_at > 0:
+            hours_since_last = (now_mono - self._last_gap_fill_at) / 3600
+            lookback_hours = min(max(hours_since_last + 0.5, 3.0), 24)
+        else:
+            lookback_hours = 3.0
+
+        lookback = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+        logger.info("[EMERGENCY-GAP-FILL] Starting (lookback=%.1fh)...", lookback_hours)
+
+        # Reuse gap-fill logic from _periodic_gap_fill
+        filled = 0
+        for group_uuid in self._groups_map.keys():
+            try:
+                group_data = self._groups_map.get(group_uuid)
+                if not group_data or not group_data.get("is_enabled"):
+                    continue
+
+                gid = int(group_uuid)
+
+                # Skip if FloodWait penalty active
+                if gid in self._flood_wait_until:
+                    penalty_ends = self._flood_wait_until[gid]
+                    if time.monotonic() < penalty_ends:
+                        continue
+
+                # Get working client and entity
+                working_client, entity = await self._get_entity_for_group_with_client(group_uuid, group_data)
+                if not working_client or not entity:
+                    continue
+
+                # Fetch messages since lookback
+                count = 0
+                async for message in working_client.iter_messages(entity, offset_date=lookback, reverse=True):
+                    if count >= GAP_FILL_MAX_MESSAGES:
+                        break
+
+                    if message.text or message.media:
+                        await self._enqueue_message(
+                            message, group_uuid,
+                            broadcast=False,
+                            message_source="gap_fill"
+                        )
+                        count += 1
+                        filled += 1
+
+                    # Throttle
+                    if count % 200 == 0:
+                        await asyncio.sleep(1.5)
+
+                await asyncio.sleep(2.0)  # Inter-group delay
+
+            except FloodWaitError as e:
+                self._flood_wait_until[gid] = time.monotonic() + e.seconds
+                logger.warning("[EMERGENCY-GAP-FILL] FloodWait %ds for group %s", e.seconds, gid)
+            except Exception as e:
+                logger.error("[EMERGENCY-GAP-FILL] Error for group %s: %s", group_uuid, e)
+
+        self._last_gap_fill_at = time.monotonic()
+        logger.info("[EMERGENCY-GAP-FILL] Complete — %d messages re-enqueued", filled)
+
+    async def _monitor_sla(self) -> None:
+        """Monitor gap-fill SLA and send Sentry alerts when at risk.
+
+        Checks every 15 minutes for groups exceeding 2.5-hour threshold
+        (provides 30-minute early warning before 3-hour SLA breach).
+        """
+        while self.running:
+            await asyncio.sleep(900)  # 15 minutes
+            if not self.running:
+                break
+
+            try:
+                at_risk = self._gap_fill_metrics.get_groups_exceeding_sla(sla_hours=2.5)
+                if not at_risk:
+                    continue
+
+                # Determine severity
+                critical_groups = [g for g in at_risk if g["hours_since_last_fill"] >= 3.0]
+                severity = "critical" if critical_groups else "warning"
+
+                # Send Sentry alert
+                try:
+                    import sentry_sdk
+                    if sentry_sdk.is_initialized():
+                        sentry_sdk.capture_message(
+                            f"Gap-fill SLA at risk: {len(at_risk)} group(s) not filled in 2.5+ hours",
+                            level=severity,
+                            extras={
+                                "at_risk_groups": at_risk[:10],  # Top 10 worst offenders
+                                "total_at_risk": len(at_risk),
+                                "critical_count": len(critical_groups),
+                            },
+                        )
+                except Exception:
+                    pass  # Sentry unavailable, continue
+
+                logger.warning(
+                    "[SLA-MONITOR] %d group(s) exceeding 2.5h gap-fill threshold (severity=%s)",
+                    len(at_risk), severity
+                )
+
+            except Exception as e:
+                logger.error("[SLA-MONITOR] Monitoring failed: %s", e)
+
     # ------------------------------------------------------------------
     # Listener with auto-reconnect
     # ------------------------------------------------------------------
@@ -2645,6 +2780,10 @@ class LiveCrawlerService:
                 break
             except Exception as e:
                 logger.error("Live crawler [user_id=%s] disconnected: %s", user_id, e)
+
+                # Trigger emergency gap-fill to catch messages missed during disconnect
+                if self.running:
+                    await self._trigger_emergency_gap_fill(f"disconnect_user_{user_id}")
 
             attempts += 1
 

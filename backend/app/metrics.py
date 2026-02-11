@@ -208,3 +208,62 @@ class MessageMetrics:
         self._messages_skipped.clear()
         self._skip_reasons.clear()
         self._skipped_since_last_log.clear()
+
+
+class GapFillMetrics:
+    """Track gap-fill effectiveness and SLA compliance per group.
+
+    Provides real-time visibility into which groups are at risk of
+    violating the 3-hour message recovery SLA.
+    """
+
+    def __init__(self):
+        self._last_gap_fill: dict[int, float] = {}  # group_id -> timestamp
+        self._messages_recovered: dict[int, int] = {}  # group_id -> count
+        self._failures: dict[int, int] = {}  # group_id -> consecutive failures
+
+    def record_gap_fill_success(self, group_id: int, messages_found: int) -> None:
+        """Record successful gap-fill for a group."""
+        import time
+        self._last_gap_fill[group_id] = time.time()
+        self._messages_recovered[group_id] = self._messages_recovered.get(group_id, 0) + messages_found
+        self._failures[group_id] = 0  # Reset failure count on success
+
+    def record_gap_fill_failure(self, group_id: int, reason: str) -> None:
+        """Record failed gap-fill (FloodWait, timeout, etc)."""
+        import logging
+        self._failures[group_id] = self._failures.get(group_id, 0) + 1
+        logger = logging.getLogger(__name__)
+        logger.warning("[GAP-FILL-METRICS] Group %d failure: %s (consecutive=%d)",
+                       group_id, reason, self._failures[group_id])
+
+    def get_groups_exceeding_sla(self, sla_hours: float = 2.5) -> list[dict]:
+        """Return groups that haven't had successful gap-fill in SLA window.
+
+        Args:
+            sla_hours: Alert threshold (default 2.5h = 30min before 3h breach)
+
+        Returns:
+            List of dicts with group_id, hours_since_last_fill, consecutive_failures
+        """
+        import time
+        now = time.time()
+        threshold = now - (sla_hours * 3600)
+
+        at_risk = []
+        for group_id, last_fill in self._last_gap_fill.items():
+            if last_fill < threshold:
+                hours_since = (now - last_fill) / 3600
+                at_risk.append({
+                    "group_id": group_id,
+                    "hours_since_last_fill": round(hours_since, 2),
+                    "consecutive_failures": self._failures.get(group_id, 0),
+                })
+
+        return sorted(at_risk, key=lambda x: x["hours_since_last_fill"], reverse=True)
+
+    def clear(self) -> None:
+        """Clear all metrics on shutdown."""
+        self._last_gap_fill.clear()
+        self._messages_recovered.clear()
+        self._failures.clear()
