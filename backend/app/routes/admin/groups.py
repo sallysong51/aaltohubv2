@@ -86,26 +86,54 @@ async def delete_group_admin(
     group_id: str,
     current_user: UserResponse = Depends(get_current_admin_user),
 ):
-    """Delete a group and all related data (admin only)."""
+    """Delete a group and all related data (admin only).
+
+    Deletes regardless of crawling status or any other state.
+    All related data is cascaded or explicitly deleted.
+    """
     try:
         gid = int(group_id)
-        # Delete cascade: all dependent tables before groups
-        await db.execute("DELETE FROM group_topics WHERE group_id = $1", gid)
-        await db.execute("DELETE FROM connection_accessible_groups WHERE group_id = $1", gid)
-        await db.execute("DELETE FROM failed_messages WHERE group_id = $1", gid)
-        await db.execute("DELETE FROM private_group_invites WHERE group_id = $1", gid)
-        await db.execute("DELETE FROM crawler_status WHERE group_id = $1", gid)
-        await db.execute("DELETE FROM user_groups WHERE group_id = $1", gid)
-        await db.execute("DELETE FROM messages WHERE group_id = $1", gid)
-        result = await db.execute("DELETE FROM groups WHERE id = $1", gid)
-        if "DELETE 0" in result:
-            raise HTTPException(status_code=404, detail="Group not found")
-        return {"success": True, "group_id": gid}
+
+        # Use transaction for atomic delete
+        async with db.pool.acquire() as conn:
+            async with conn.transaction():
+                # Delete tables WITHOUT CASCADE first (manual cleanup)
+                await conn.execute("DELETE FROM telegram_join_queue WHERE joined_group_id = $1", gid)
+
+                # Delete tables with CASCADE (explicit delete for clarity, though CASCADE handles it)
+                # Order: child tables first, parent last
+                await conn.execute("DELETE FROM group_topics WHERE group_id = $1", gid)
+                await conn.execute("DELETE FROM context_keywords WHERE group_id = $1", gid)
+                await conn.execute("DELETE FROM group_contexts WHERE group_id = $1", gid)
+                await conn.execute("DELETE FROM connection_accessible_groups WHERE group_id = $1", gid)
+                await conn.execute("DELETE FROM failed_messages WHERE group_id = $1", gid)
+                await conn.execute("DELETE FROM private_group_invites WHERE group_id = $1", gid)
+                await conn.execute("DELETE FROM crawl_logs WHERE group_id = $1", gid)
+                await conn.execute("DELETE FROM crawler_events WHERE group_id = $1", gid)
+                await conn.execute("DELETE FROM crawler_metrics WHERE group_id = $1", gid)
+                await conn.execute("DELETE FROM crawler_status WHERE group_id = $1", gid)
+                await conn.execute("DELETE FROM user_groups WHERE group_id = $1", gid)
+                await conn.execute("DELETE FROM messages WHERE group_id = $1", gid)
+
+                # Finally delete the parent
+                result = await conn.execute("DELETE FROM groups WHERE id = $1", gid)
+
+                if "DELETE 0" in result:
+                    raise HTTPException(status_code=404, detail="Group not found")
+
+        logger.info("delete_group_admin: successfully deleted group %s and all related data", gid)
+        return {"success": True, "group_id": gid, "message": f"Group {gid} and all related data deleted"}
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("delete_group_admin error: %s", e)
-        raise HTTPException(status_code=500, detail="Failed to delete group")
+        # Detailed error logging for debugging
+        import traceback
+        logger.error("delete_group_admin error for group %s: %s\n%s", group_id, e, traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete group: {str(e)}"
+        )
 
 
 @router.post("/backfill-connection-ids")

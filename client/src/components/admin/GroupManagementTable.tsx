@@ -37,7 +37,7 @@ export default function GroupManagementTable({
               <tr>
                 <th className="text-left px-3 py-2 font-medium">그룹명</th>
                 <th className="text-center px-3 py-2 font-medium w-20">멤버</th>
-                <th className="text-center px-3 py-2 font-medium w-20">타입</th>
+                <th className="text-center px-3 py-2 font-medium w-24">공개여부</th>
                 <th className="text-center px-3 py-2 font-medium w-24">크롤링</th>
                 <th className="text-center px-3 py-2 font-medium w-20">상태</th>
                 <th className="text-center px-3 py-2 font-medium w-28">액션</th>
@@ -59,8 +59,11 @@ export default function GroupManagementTable({
                       {group.member_count?.toLocaleString() || '-'}
                     </td>
                     <td className="text-center px-3 py-2">
-                      <Badge variant="outline" className="text-[10px]">
-                        {group.group_type === 'channel' ? '채널' : '그룹'}
+                      <Badge
+                        variant={group.visibility === 'public' ? 'default' : 'secondary'}
+                        className="text-[10px]"
+                      >
+                        {group.visibility === 'public' ? '🌐 공개' : '🔒 개인'}
                       </Badge>
                     </td>
                     <td className="text-center px-3 py-2">
@@ -115,18 +118,21 @@ export default function GroupManagementTable({
                         </button>
                         <button
                           onClick={async () => {
-                            if (!confirm(`"${group.title}" 그룹을 삭제하시겠습니까?\n모든 메시지와 데이터가 영구 삭제됩니다.`)) return;
+                            if (!confirm(`"${group.title}" 그룹을 삭제하시겠습니까?\n\n⚠️ 다음 데이터가 영구 삭제됩니다:\n- 모든 메시지\n- 크롤링 상태\n- 그룹 설정\n- 초대 링크\n\n이 작업은 되돌릴 수 없습니다.`)) return;
                             try {
-                              await adminApi.deleteGroup(group.id);
+                              const response = await adminApi.deleteGroup(group.id);
+                              console.log('Delete response:', response);
                               setGroups(prev => prev.filter(g => g.id !== group.id));
                               if (selectedGroup?.id === group.id) setSelectedGroup(null);
-                              toast.success(`"${group.title}" 삭제됨`);
-                            } catch (err) {
-                              toast.error(getApiErrorMessage(err, '삭제 실패'));
+                              toast.success(`✓ "${group.title}" 그룹이 삭제되었습니다`);
+                            } catch (err: any) {
+                              console.error('Delete error:', err);
+                              const errorMsg = getApiErrorMessage(err, '그룹 삭제에 실패했습니다');
+                              toast.error(`❌ ${errorMsg}`, { duration: 5000 });
                             }
                           }}
                           className="p-1 rounded hover:bg-red-100 text-red-500 dark:hover:bg-red-900/30"
-                          title="그룹 삭제"
+                          title="그룹 삭제 (영구 삭제)"
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
