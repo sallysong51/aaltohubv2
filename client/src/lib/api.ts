@@ -442,6 +442,37 @@ export interface CrawlProgressItem {
   is_currently_crawling?: boolean;
 }
 
+// ============================================================
+// Auto-Join Feature (Phase 3)
+// ============================================================
+
+export interface AutoJoinRequest {
+  identifier: string;  // Telegram link, @username, or numeric group ID
+}
+
+export interface AutoJoinResponse {
+  success: boolean;
+  group_id?: number;
+  group_title?: string;
+  connection_id?: string;
+  message: string;
+  estimated_wait_seconds?: number;  // Set when all connections unhealthy (queued)
+}
+
+export interface JoinAttempt {
+  id: string;
+  connection_id: string;
+  telegram_user_id: number;
+  group_link?: string | null;
+  group_username?: string | null;
+  group_id?: number | null;
+  success: boolean;
+  error_type?: string | null;  // 'flood_wait', 'invite_expired', 'privacy', 'unknown'
+  flood_wait_seconds?: number | null;
+  attempted_at: string;
+  connection_name: string;  // From JOIN with telegram_connections
+}
+
 export const telegramApi = {
   getConnections: () =>
     apiClient.get<TelegramConnection[]>('/telegram/connections'),
@@ -782,6 +813,13 @@ export const adminApi = {
     health?: 'healthy' | 'warning' | 'degraded' | 'critical';
   }) =>
     apiClient.get<SystemLogsResponse>('/admin/system-logs', { params }),
+
+  // Auto-join feature (Phase 3)
+  autoJoinGroup: (data: AutoJoinRequest) =>
+    apiClient.post<AutoJoinResponse>('/admin/auto-join', data),
+
+  getRecentJoinAttempts: (limit: number = 20) =>
+    apiClient.get<JoinAttempt[]>('/admin/auto-join/recent', { params: { limit } }),
 };
 
 // ============================================================
