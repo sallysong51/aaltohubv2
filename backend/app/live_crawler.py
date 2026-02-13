@@ -13,6 +13,7 @@ Features:
 """
 import asyncio
 import fcntl
+import gc
 import io
 import json
 import logging
@@ -41,6 +42,8 @@ from telethon.tl.types import (
     Chat,
 )
 import asyncpg
+import psutil
+import sentry_sdk
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.entity_parser import MessageEntityParser
@@ -52,6 +55,7 @@ from app.web_scraper import WebScraper
 from app.telegram_auto_join import TelegramAutoJoin
 from app.context_aggregator import ContextAggregator
 from app.ai.classifier import AIClassifier
+from app.crawler.dead_letter_queue import DeadLetterQueue
 
 # Transient exceptions that justify a retry (not programming bugs)
 _TRANSIENT_EXCEPTIONS = (
@@ -87,19 +91,62 @@ ENABLED_CACHE_MAX_SIZE = 1000  # max entries before eviction
 MEDIA_CONCURRENCY = 5  # max concurrent media downloads during batch operations
 MEDIA_DOWNLOAD_BATCH = 50  # process media in chunks for progress tracking
 
+# Global set to track background tasks (prevents GC of fire-and-forget tasks)
+_background_tasks: set[asyncio.Task] = set()
+
 
 def _safe_create_task(coro, *, name: str | None = None) -> asyncio.Task:
-    """Create an asyncio task with automatic exception logging (prevents silent failures)."""
-    task = asyncio.create_task(coro, name=name)
+    """Create an asyncio task with automatic exception logging and Sentry reporting.
 
-    def _log_exception(t: asyncio.Task) -> None:
+    Prevents silent failures by:
+    1. Logging exceptions to application logger
+    2. Sending exceptions to Sentry for alerting
+    3. Tracking task references to prevent garbage collection
+
+    Args:
+        coro: The coroutine to run as a background task
+        name: Optional name for debugging (shown in logs/Sentry)
+
+    Returns:
+        The created asyncio.Task
+    """
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+
+    def _done_callback(t: asyncio.Task) -> None:
+        # Remove from tracking set
+        _background_tasks.discard(t)
+
+        # Handle cancellation (normal shutdown)
         if t.cancelled():
             return
+
+        # Handle exceptions
         exc = t.exception()
         if exc:
-            logger.error("Background task %s failed: %s", name or t.get_name(), exc)
+            task_name = name or t.get_name()
+            logger.error(
+                "[BACKGROUND-TASK] Task '%s' failed with exception: %s",
+                task_name,
+                exc,
+                exc_info=exc,
+            )
 
-    task.add_done_callback(_log_exception)
+            # Send to Sentry for alerting (with task context)
+            try:
+                sentry_sdk.capture_exception(
+                    exc,
+                    extras={
+                        "task_name": task_name,
+                        "task_id": id(t),
+                        "coro_name": coro.__name__ if hasattr(coro, "__name__") else str(coro),
+                    },
+                )
+            except Exception as sentry_err:
+                # Don't let Sentry errors crash the callback
+                logger.warning("[BACKGROUND-TASK] Failed to send to Sentry: %s", sentry_err)
+
+    task.add_done_callback(_done_callback)
     return task
 
 
@@ -165,6 +212,7 @@ class LiveCrawlerService:
         self._batch_crawl_active = False
         self._last_event_received_at: float = 0
         self._watchdog_task: asyncio.Task | None = None
+        self._connection_health_task: asyncio.Task | None = None  # Phase 34: Connection health monitoring
         # Per-group crawl lock: prevents concurrent crawl of same group by startup + batch
         self._crawling_groups_lock: set[int] = set()
         # Track last gap-fill completion for dynamic lookback after outages
@@ -208,6 +256,9 @@ class LiveCrawlerService:
 
         # Phase 33: Media uploader — extracted to separate module
         self._media_uploader = MediaUploader()
+
+        # Phase 33: Dead Letter Queue — file-based backup for failed DB writes
+        self._dead_letter = DeadLetterQueue()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -284,7 +335,7 @@ class LiveCrawlerService:
                 logger.warning("Live crawler: %s", self._start_error)
                 logger.warning("Live crawler: Will retry every 60s until an admin session is available...")
                 self._release_lock()
-                self._admin_wait_task = asyncio.create_task(self._wait_for_admin_session())
+                self._admin_wait_task = _safe_create_task(self._wait_for_admin_session(), name="admin-wait")
                 return
 
             admin_ids = [r["id"] for r in admin_rows]
@@ -321,12 +372,16 @@ class LiveCrawlerService:
                         settings.TELEGRAM_API_ID,
                         settings.TELEGRAM_API_HASH,
                         use_ipv6=False,
-                        request_retries=3,
-                        connection_retries=5,
-                        retry_delay=3,
+                        request_retries=5,
+                        connection_retries=10,
+                        retry_delay=2,
                         timeout=120,
-                        flood_sleep_threshold=300,
+                        flood_sleep_threshold=60,
                         auto_reconnect=True,
+                        catch_up=True,  # ★ 재연결 시 놓친 이벤트 수신
+                        device_model="AaltoHub Server",
+                        system_version="Ubuntu 24.04",
+                        app_version="2.0.0",
                     )
                     logger.info("Live crawler: Connecting for %s (@%s) [conn=%s]...", admin_name, admin_username, conn_id[:8])
                     await client.connect()
@@ -385,12 +440,16 @@ class LiveCrawlerService:
                         settings.TELEGRAM_API_ID,
                         settings.TELEGRAM_API_HASH,
                         use_ipv6=False,
-                        request_retries=3,
-                        connection_retries=5,
-                        retry_delay=3,
+                        request_retries=5,
+                        connection_retries=10,
+                        retry_delay=2,
                         timeout=120,
-                        flood_sleep_threshold=300,
+                        flood_sleep_threshold=60,
                         auto_reconnect=True,
+                        catch_up=True,  # ★ 재연결 시 놓친 이벤트 수신
+                        device_model="AaltoHub Server",
+                        system_version="Ubuntu 24.04",
+                        app_version="2.0.0",
                     )
                     logger.info("Live crawler: Connecting for %s (@%s) [id=%s]...", admin_name, admin_username, admin_id)
                     await client.connect()
@@ -413,7 +472,7 @@ class LiveCrawlerService:
                 logger.warning("Live crawler: %s", self._start_error)
                 logger.warning("Live crawler: Will retry every 60s until a session is available...")
                 self._release_lock()
-                self._admin_wait_task = asyncio.create_task(self._wait_for_admin_session())
+                self._admin_wait_task = _safe_create_task(self._wait_for_admin_session(), name="admin-wait")
                 return
 
             self.running = True
@@ -443,7 +502,7 @@ class LiveCrawlerService:
             self._register_event_handlers()
 
             # Start DB writer coroutine (consumes from queue)
-            self._writer_task = asyncio.create_task(self._db_writer())
+            self._writer_task = _safe_create_task(self._db_writer(), name="db-writer")
 
             # Start background workers for new features (must be after event loop is running)
             await self._ai_classifier.start()
@@ -472,12 +531,29 @@ class LiveCrawlerService:
 
             self.connected = True
 
-            self._refresh_task = asyncio.create_task(self._periodic_group_refresh())
-            self._historical_task = asyncio.create_task(self._crawl_all_groups_historical())
-            self._gap_fill_task = asyncio.create_task(self._periodic_gap_fill())
-            self._sla_monitor_task = asyncio.create_task(self._monitor_sla())  # Phase 33: SLA monitoring
-            self._watchdog_task = asyncio.create_task(self._listener_watchdog())
-            self._auto_join_task = asyncio.create_task(self._periodic_auto_join_groups())
+            # Replay dead letter queue on startup (auto-recovery)
+            try:
+                async def _replay_wrapper(batch: list[dict]) -> None:
+                    """Wrapper to convert DLQ format to _flush_batch format."""
+                    converted = [
+                        {"data": msg["row"], "broadcast": False}
+                        for msg in batch
+                    ]
+                    await self._flush_batch(converted)
+
+                replayed = await self._dead_letter.replay(_replay_wrapper)
+                if replayed > 0:
+                    logger.info("[STARTUP] Replayed %d messages from dead letter queue", replayed)
+            except Exception as e:
+                logger.error("[STARTUP] Dead letter replay failed: %s", e)
+
+            self._refresh_task = _safe_create_task(self._periodic_group_refresh(), name="group-refresh")
+            self._historical_task = _safe_create_task(self._crawl_all_groups_historical(), name="historical-crawl")
+            self._gap_fill_task = _safe_create_task(self._periodic_gap_fill(), name="gap-fill")
+            self._sla_monitor_task = _safe_create_task(self._monitor_sla(), name="sla-monitor")  # Phase 33: SLA monitoring
+            self._watchdog_task = _safe_create_task(self._listener_watchdog(), name="listener-watchdog")
+            self._connection_health_task = _safe_create_task(self._connection_health_check(), name="connection-health")  # Phase 34: Connection health monitoring
+            self._auto_join_task = _safe_create_task(self._periodic_auto_join_groups(), name="auto-join")
 
             logger.info("Live crawler started!")
             logger.info("  - %d admin account(s) connected", len(self.clients))
@@ -500,14 +576,15 @@ class LiveCrawlerService:
         1. Set running=False so listeners/refresh stop accepting new work
         2. Cancel refresh & historical tasks (no new messages enqueued)
         3. Wait briefly for listener tasks to finish in-flight enqueues, then cancel
-        4. Wait for DB writer to drain the queue (up to 15s)
-        5. Disconnect Telethon clients
+        4. Wait for DB writer to drain the queue (up to 50s)
+        5. If timeout, flush remaining queue items to dead letter
+        6. Disconnect Telethon clients
         """
         logger.info("Stopping live crawler...")
         self.running = False
 
         # Cancel background housekeeping tasks first
-        for task in [self._refresh_task, self._historical_task, self._gap_fill_task, self._watchdog_task, self._auto_join_task]:
+        for task in [self._refresh_task, self._historical_task, self._gap_fill_task, self._watchdog_task, self._connection_health_task, self._auto_join_task]:
             if task and not task.done():
                 task.cancel()
 
@@ -519,12 +596,22 @@ class LiveCrawlerService:
                 task.cancel()
 
         # Now drain the queue — writer loop exits when running=False AND queue empty
+        # Allow 50s for graceful drain (systemd gives us 60s total)
         if self._writer_task and not self._writer_task.done():
             try:
-                await asyncio.wait_for(self._writer_task, timeout=15.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                logger.warning("DB writer did not drain in time, cancelling")
+                await asyncio.wait_for(self._writer_task, timeout=50.0)
+                logger.info("DB writer drained successfully")
+            except asyncio.TimeoutError:
+                remaining = self._msg_queue.qsize()
+                logger.warning(
+                    "DB writer did not drain in 50s — %d messages remaining. "
+                    "Flushing to dead letter queue...", remaining
+                )
+                # Flush remaining messages to dead letter before cancelling
+                await self._flush_queue_to_dead_letter()
                 self._writer_task.cancel()
+            except asyncio.CancelledError:
+                logger.warning("DB writer was cancelled")
 
         await self._cleanup()
         self._release_lock()
@@ -606,6 +693,16 @@ class LiveCrawlerService:
         self._gap_fill_metrics.clear()
         # Phase 3: Cleanup AI classifier (delegate to module)
         await self._ai_classifier.cleanup()
+
+    @property
+    def _floodwait_penalties(self) -> int:
+        """Count active FloodWait penalties.
+
+        Returns:
+            Number of groups currently under FloodWait penalty
+        """
+        now = time.monotonic()
+        return sum(1 for expiry in self._flood_wait_until.values() if now < expiry)
 
     def get_status(self) -> dict:
         # Phase 2B: Get aggregated metrics from metrics module
@@ -722,16 +819,7 @@ class LiveCrawlerService:
 
     def _get_dead_letter_queue_size(self) -> int:
         """Get size of dead letter queue (from file)."""
-        try:
-            dlq_path = Path("data/dead_letter_queue.jsonl")
-            if not dlq_path.exists():
-                return 0
-            # Count lines in file
-            with open(dlq_path, "r") as f:
-                return sum(1 for _ in f)
-        except Exception as e:
-            logger.error("Failed to get dead letter queue size: %s", e)
-            return 0
+        return self._dead_letter.get_size()
 
     # ------------------------------------------------------------------
     # DB writer coroutine with adaptive batching
@@ -901,11 +989,9 @@ class LiveCrawlerService:
             event, payload.get("group_id"), payload.get("telegram_message_id"), last_err,
         )
 
-    _DEAD_LETTER_FILE_MAX_BYTES = 50 * 1024 * 1024  # 50 MB cap
-
     async def _write_to_dead_letter(self, row: dict, error: str) -> None:
         """Write a failed message to the dead letter table for later retry.
-        Falls back to local file if DB is also unreachable."""
+        Falls back to DeadLetterQueue file-based backup if DB is also unreachable."""
         try:
             await db.execute(
                 """INSERT INTO failed_messages (telegram_message_id, group_id, payload, error_message, retry_count)
@@ -914,7 +1000,7 @@ class LiveCrawlerService:
                 json.dumps(row), str(error)[:500],
             )
         except Exception as e:
-            logger.error("Dead letter DB write failed: %s — writing to local file", e)
+            logger.error("Dead letter DB write failed: %s — writing to file fallback", e)
             try:
                 import sentry_sdk
                 if sentry_sdk.is_initialized():
@@ -924,25 +1010,56 @@ class LiveCrawlerService:
                     )
             except Exception:
                 pass
+            # Use DeadLetterQueue for file-based backup
+            await self._dead_letter.write_batch([{"row": row, "error": str(error)[:500]}])
+
+    async def _flush_queue_to_dead_letter(self) -> None:
+        """Flush all remaining items in the queue to dead letter.
+
+        Called during shutdown when the queue cannot be drained in time.
+        Prevents message loss by persisting unprocessed items to dead letter
+        for later retry by admins.
+        """
+        flushed_count = 0
+        failed_count = 0
+
+        while not self._msg_queue.empty():
             try:
-                # Use persistent path (not /tmp which may be private-namespaced by systemd)
-                dl_path = Path(__file__).resolve().parent.parent / "dead-letters.jsonl"
-                if dl_path.exists() and dl_path.stat().st_size > self._DEAD_LETTER_FILE_MAX_BYTES:
-                    logger.error("Dead letter file exceeds %d MB — DROPPING message", self._DEAD_LETTER_FILE_MAX_BYTES // (1024 * 1024))
-                    try:
-                        import sentry_sdk
-                        if sentry_sdk.is_initialized():
-                            sentry_sdk.capture_message(
-                                "Dead letter file full — messages being DROPPED",
-                                level="error",
-                            )
-                    except Exception:
-                        pass
-                    return
-                with open(dl_path, "a") as f:
-                    f.write(json.dumps({"row": row, "error": str(error)[:500], "ts": time.time()}) + "\n")
-            except Exception as e2:
-                logger.error("Local dead letter file write also failed: %s", e2)
+                item = self._msg_queue.get_nowait()
+                # Extract the actual message data from the queue item
+                message_data = item.get("data", item)
+                await self._write_to_dead_letter(
+                    message_data,
+                    "shutdown_timeout_queue_flush"
+                )
+                flushed_count += 1
+            except asyncio.QueueEmpty:
+                break
+            except Exception as e:
+                failed_count += 1
+                logger.error(
+                    "Failed to flush queue item to dead letter: %s", e
+                )
+
+        if flushed_count > 0:
+            logger.warning(
+                "[SHUTDOWN] Flushed %d messages to dead letter queue "
+                "(%d failed)", flushed_count, failed_count
+            )
+            # Alert via Sentry for visibility
+            try:
+                import sentry_sdk
+                if sentry_sdk.is_initialized():
+                    sentry_sdk.capture_message(
+                        f"Shutdown timeout: {flushed_count} messages flushed to dead letter",
+                        level="warning",
+                        extras={
+                            "flushed_count": flushed_count,
+                            "failed_count": failed_count,
+                        },
+                    )
+            except Exception:
+                pass
 
     async def _flush_batch(self, batch: list[dict]) -> None:
         """Write a batch of messages to the database.
@@ -1959,6 +2076,29 @@ class LiveCrawlerService:
             # Phase 2A: Cleanup get_me() cache and circuit breaker state
             await self._error_recovery.cleanup()
 
+            # Phase 34: Memory monitoring and maintenance
+            process = psutil.Process()
+            mem_mb = process.memory_info().rss / 1024 / 1024
+            logger.info(
+                "[MAINTENANCE] Memory: %.1fMB, Tasks: %d, Queue: %d, "
+                "EntityCache: %d, FloodWait: %d",
+                mem_mb,
+                len(_background_tasks),
+                self._msg_queue.qsize(),
+                len(self._entity_cache),
+                self._floodwait_penalties,
+            )
+
+            # Memory warning at 500MB threshold
+            if mem_mb > 500:
+                sentry_sdk.capture_message(
+                    f"High memory usage: {mem_mb:.0f}MB",
+                    level="warning",
+                )
+                # Force garbage collection to free unreferenced objects
+                gc.collect()
+                logger.warning("[MAINTENANCE] Triggered GC due to high memory usage (%.1fMB)", mem_mb)
+
             for gid in list(self.group_id_map.keys()):
                 if not self.running:
                     break
@@ -2644,7 +2784,7 @@ class LiveCrawlerService:
                         if joined:
                             joined_count += 1
                             # Trigger historical crawl for the newly joined group
-                            asyncio.create_task(self._crawl_historical_for_group(gid))
+                            _safe_create_task(self._crawl_historical_for_group(gid), name=f"auto-join-crawl-{gid}")
 
                         # Delay between groups to avoid rate limiting
                         await asyncio.sleep(30)
@@ -2671,8 +2811,9 @@ class LiveCrawlerService:
 
     def _start_listener_task(self, user_id: int, client: TelegramClient) -> None:
         """Start a listener task with a done callback for immediate restart."""
-        task = asyncio.create_task(
-            self._run_listener_with_reconnect(user_id, client)
+        task = _safe_create_task(
+            self._run_listener_with_reconnect(user_id, client),
+            name=f"listener-{user_id}"
         )
         task.add_done_callback(lambda t, uid=user_id: self._on_listener_done(uid, t))
         self._listener_tasks[user_id] = task
@@ -2685,7 +2826,7 @@ class LiveCrawlerService:
             return
         logger.warning("Listener for user_id=%s exited — scheduling immediate restart", user_id)
         asyncio.get_event_loop().call_soon(
-            lambda: asyncio.create_task(self._restart_single_listener(user_id))
+            lambda: _safe_create_task(self._restart_single_listener(user_id), name=f"listener-restart-{user_id}")
         )
 
     async def _restart_single_listener(self, user_id: int) -> None:
@@ -2741,6 +2882,82 @@ class LiveCrawlerService:
                 )
                 for user_id in dead_user_ids:
                     await self._restart_single_listener(user_id)
+
+    async def _connection_health_check(self) -> None:
+        """Phase 34: Verify Telegram client TCP connectivity every 30s.
+
+        This is deeper than _listener_watchdog (task-level check) — it verifies
+        the actual Telethon client's TCP connection state and auth validity.
+
+        Improvements:
+        - Detects silent disconnections (NAT timeouts, TCP FIN lost)
+        - Auto-reconnects before Telethon's internal keepalive fails
+        - Alerts on auth loss (session revoked)
+        - Validates with get_me() API call (not just is_connected())
+        """
+        while self.running:
+            await asyncio.sleep(30)
+            if not self.running:
+                break
+
+            for user_id, client in list(self.clients.items()):
+                try:
+                    # Check 1: TCP connection alive?
+                    if not client.is_connected():
+                        logger.warning("[HEALTH] Client user_id=%s disconnected, reconnecting...", user_id)
+                        try:
+                            await asyncio.wait_for(client.connect(), timeout=10.0)
+                        except asyncio.TimeoutError:
+                            logger.error("[HEALTH] Client user_id=%s reconnect timeout", user_id)
+                            # Trigger listener restart (will recreate client)
+                            await self._restart_single_listener(user_id)
+                            continue
+                        except Exception as e:
+                            logger.error("[HEALTH] Client user_id=%s reconnect failed: %s", user_id, e)
+                            await self._restart_single_listener(user_id)
+                            continue
+
+                    # Check 2: Auth still valid?
+                    try:
+                        me = await asyncio.wait_for(client.get_me(), timeout=10.0)
+                        if not me:
+                            logger.error("[HEALTH] Client user_id=%s auth lost (get_me returned None)", user_id)
+                            import sentry_sdk
+                            sentry_sdk.capture_message(
+                                f"Telegram auth lost for user_id={user_id}",
+                                level="error",
+                                extras={"user_id": user_id}
+                            )
+                            # Don't auto-reconnect — requires user re-authentication
+                            continue
+                    except asyncio.TimeoutError:
+                        logger.error("[HEALTH] Client user_id=%s get_me() timeout", user_id)
+                        # Timeout doesn't mean auth lost, just network issue
+                        # Delay 2s and retry connection on next cycle
+                        await asyncio.sleep(2.0)
+                        try:
+                            await client.connect()
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        err_str = str(e).lower()
+                        # Detect auth failures (session revoked, unauthorized)
+                        if any(kw in err_str for kw in ("auth", "unauthorized", "session", "deactivated")):
+                            logger.error("[HEALTH] Client user_id=%s auth error: %s", user_id, e)
+                            import sentry_sdk
+                            sentry_sdk.capture_exception(
+                                e,
+                                extras={"user_id": user_id, "error": str(e)}
+                            )
+                            # Auth error — requires user re-login, don't retry
+                            continue
+                        else:
+                            logger.warning("[HEALTH] Client user_id=%s get_me() failed: %s", user_id, e)
+
+                except Exception as e:
+                    logger.error("[HEALTH] Health check failed for user_id=%s: %s", user_id, e)
+                    import sentry_sdk
+                    sentry_sdk.capture_exception(e)
 
     async def _trigger_emergency_gap_fill(self, reason: str) -> None:
         """Trigger immediate gap-fill without waiting for periodic cycle.
