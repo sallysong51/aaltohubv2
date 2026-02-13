@@ -30,9 +30,27 @@ from app.config import settings
 from app.database import db
 from app.live_crawler import live_crawler, CB_RECOVERY_TIMEOUT
 from app.event_logger import event_logger
+from app.utils.connection_health_tracker import ConnectionHealthTracker
 
 # Track crawler process startup time (for restart detection)
 STARTUP_TIMESTAMP = time.time()
+
+# Global ConnectionHealthTracker instance for auto-join feature
+_health_tracker: ConnectionHealthTracker | None = None
+
+
+def get_health_tracker() -> ConnectionHealthTracker:
+    """Get the global ConnectionHealthTracker instance.
+
+    Returns:
+        ConnectionHealthTracker instance
+
+    Raises:
+        RuntimeError: If tracker not initialized
+    """
+    if _health_tracker is None:
+        raise RuntimeError("ConnectionHealthTracker not initialized")
+    return _health_tracker
 
 # Logging setup (matches main.py pattern)
 if settings.ENVIRONMENT != "development":
@@ -102,8 +120,41 @@ async def _auto_reconnect_and_start_crawler() -> None:
             logger.error("[AUTO-RECONNECT] Crawler start failed: %s", e)
 
 
+async def _sync_flood_wait_to_tracker():
+    """Background task: sync FloodWait status from crawler to health tracker every 60s."""
+    global _health_tracker
+    while True:
+        await asyncio.sleep(60)  # Sync every 1 minute
+        try:
+            if _health_tracker and live_crawler.running:
+                flood_status = live_crawler.get_flood_wait_status_for_auto_join()
+                _health_tracker.sync_flood_wait_penalties(flood_status)
+                logger.debug(f"Synced FloodWait status: {len(flood_status)} entries")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Failed to sync FloodWait status: {e}")
+
+
+async def _cleanup_tracker_history():
+    """Background task: cleanup old tracker history every 1 hour."""
+    global _health_tracker
+    while True:
+        await asyncio.sleep(3600)  # Cleanup every 1 hour
+        try:
+            if _health_tracker:
+                _health_tracker.cleanup_old_history()
+                logger.debug("Cleaned up tracker history")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Failed to cleanup tracker history: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _health_tracker
+
     # Thread pool for Storage uploads + Telethon sync calls
     loop = asyncio.get_running_loop()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="crawler-io")
@@ -111,6 +162,10 @@ async def lifespan(app: FastAPI):
 
     # Connect with retry (matches main.py behavior) — keeps process alive if DB is temporarily down
     db_ok = await db.connect_with_retry()
+
+    # Initialize ConnectionHealthTracker for auto-join feature
+    _health_tracker = ConnectionHealthTracker()
+    logger.info("ConnectionHealthTracker initialized")
 
     # Start event logger (async background worker for event recording)
     await event_logger.start()
@@ -137,11 +192,19 @@ async def lifespan(app: FastAPI):
     # Always start auto-reconnect (handles DB-down-at-startup and mid-run crashes)
     reconnect_task = asyncio.create_task(_auto_reconnect_and_start_crawler())
 
+    # Start background tasks for ConnectionHealthTracker
+    flood_sync_task = asyncio.create_task(_sync_flood_wait_to_tracker())
+    cleanup_task = asyncio.create_task(_cleanup_tracker_history())
+
     yield
 
+    # Cancel all background tasks
     reconnect_task.cancel()
+    flood_sync_task.cancel()
+    cleanup_task.cancel()
+
     try:
-        await reconnect_task
+        await asyncio.gather(reconnect_task, flood_sync_task, cleanup_task, return_exceptions=True)
     except asyncio.CancelledError:
         pass
     if live_crawler.running:
