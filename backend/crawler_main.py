@@ -19,6 +19,7 @@ import concurrent.futures
 import logging
 import time
 from contextlib import asynccontextmanager
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -38,6 +39,10 @@ STARTUP_TIMESTAMP = time.time()
 # Global ConnectionHealthTracker instance for auto-join feature
 _health_tracker: ConnectionHealthTracker | None = None
 
+# Global queue for delayed join requests (when all connections are unhealthy)
+# Format: (identifier, user_id, delay_seconds, retry_count)
+_join_queue: asyncio.Queue = None  # Initialized in lifespan
+
 
 def get_health_tracker() -> ConnectionHealthTracker:
     """Get the global ConnectionHealthTracker instance.
@@ -51,6 +56,27 @@ def get_health_tracker() -> ConnectionHealthTracker:
     if _health_tracker is None:
         raise RuntimeError("ConnectionHealthTracker not initialized")
     return _health_tracker
+
+
+async def queue_join_request(identifier: str, user_id: int, delay_seconds: int):
+    """Add a join request to the queue for later processing.
+
+    Args:
+        identifier: Telegram link/username/ID
+        user_id: Admin user ID
+        delay_seconds: How long to wait before retrying
+    """
+    global _join_queue
+    if _join_queue is None:
+        logger.warning("Join queue not initialized, cannot queue request")
+        return
+
+    retry_count = 0
+    await _join_queue.put((identifier, user_id, delay_seconds, retry_count))
+    logger.info(
+        f"Queued join request for {identifier} (user {user_id}) "
+        f"with {delay_seconds}s delay"
+    )
 
 # Logging setup (matches main.py pattern)
 if settings.ENVIRONMENT != "development":
@@ -120,6 +146,104 @@ async def _auto_reconnect_and_start_crawler() -> None:
             logger.error("[AUTO-RECONNECT] Crawler start failed: %s", e)
 
 
+async def _process_join_queue():
+    """Background task: process queued join requests when connections become healthy."""
+    global _join_queue, _health_tracker
+
+    while True:
+        try:
+            # Get next request from queue (blocking)
+            identifier, user_id, delay_seconds, retry_count = await _join_queue.get()
+
+            # Wait the specified delay
+            await asyncio.sleep(delay_seconds)
+
+            logger.info(
+                f"Processing queued join request: {identifier} "
+                f"(retry #{retry_count + 1})"
+            )
+
+            # Import here to avoid circular dependency
+            from app.routes.admin.auto_join import (
+                parse_telegram_identifier,
+                fetch_active_connections,
+                select_best_connection_for_join,
+                attempt_join_with_fallback,
+            )
+
+            # Re-check if connections are healthy
+            try:
+                connections = await fetch_active_connections(user_id)
+
+                # Register connections with tracker
+                for conn in connections:
+                    _health_tracker.register_connection(
+                        telegram_user_id=conn["telegram_user_id"],
+                        connection_id=UUID(conn["id"]),
+                    )
+
+                # Select best connection
+                best_conn, wait_time = await select_best_connection_for_join(
+                    _health_tracker, connections
+                )
+
+                if best_conn is None:
+                    # Still all unhealthy - re-queue with exponential backoff
+                    new_delay = min(wait_time * 1.5, 1800)  # Max 30 minutes
+                    new_retry = retry_count + 1
+
+                    if new_retry < 10:  # Max 10 retries
+                        await _join_queue.put((identifier, user_id, new_delay, new_retry))
+                        logger.info(
+                            f"Re-queued {identifier} with {new_delay}s delay "
+                            f"(retry #{new_retry})"
+                        )
+                    else:
+                        logger.warning(
+                            f"Dropped {identifier} after {new_retry} retries"
+                        )
+                        sentry_sdk.capture_message(
+                            f"Join request dropped after 10 queue retries",
+                            level="warning",
+                            extras={
+                                "identifier": identifier,
+                                "user_id": user_id,
+                            },
+                        )
+                else:
+                    # Connection available - attempt join
+                    group_info = parse_telegram_identifier(identifier)
+                    result = await attempt_join_with_fallback(
+                        tracker=_health_tracker,
+                        connections=connections,
+                        group_info=group_info,
+                        user_id=user_id,
+                        max_attempts=3,
+                    )
+
+                    if result.success:
+                        logger.info(
+                            f"Queued join succeeded: {identifier} → "
+                            f"group {result.group_id}"
+                        )
+                    else:
+                        logger.warning(
+                            f"Queued join failed: {identifier} - {result.message}"
+                        )
+
+            except Exception as e:
+                logger.error(
+                    f"Error processing queued join for {identifier}: {e}",
+                    exc_info=True,
+                )
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Join queue processor error: {e}", exc_info=True)
+            await asyncio.sleep(5)  # Brief pause before continuing
+
+
 async def _sync_flood_wait_to_tracker():
     """Background task: sync FloodWait status from crawler to health tracker every 60s."""
     global _health_tracker
@@ -153,7 +277,7 @@ async def _cleanup_tracker_history():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _health_tracker
+    global _health_tracker, _join_queue
 
     # Thread pool for Storage uploads + Telethon sync calls
     loop = asyncio.get_running_loop()
@@ -166,6 +290,10 @@ async def lifespan(app: FastAPI):
     # Initialize ConnectionHealthTracker for auto-join feature
     _health_tracker = ConnectionHealthTracker()
     logger.info("ConnectionHealthTracker initialized")
+
+    # Initialize join queue
+    _join_queue = asyncio.Queue()
+    logger.info("Auto-join queue initialized")
 
     # Start event logger (async background worker for event recording)
     await event_logger.start()
@@ -196,15 +324,25 @@ async def lifespan(app: FastAPI):
     flood_sync_task = asyncio.create_task(_sync_flood_wait_to_tracker())
     cleanup_task = asyncio.create_task(_cleanup_tracker_history())
 
+    # Start queue processor for auto-join
+    queue_processor_task = asyncio.create_task(_process_join_queue())
+
     yield
 
     # Cancel all background tasks
     reconnect_task.cancel()
     flood_sync_task.cancel()
     cleanup_task.cancel()
+    queue_processor_task.cancel()
 
     try:
-        await asyncio.gather(reconnect_task, flood_sync_task, cleanup_task, return_exceptions=True)
+        await asyncio.gather(
+            reconnect_task,
+            flood_sync_task,
+            cleanup_task,
+            queue_processor_task,
+            return_exceptions=True,
+        )
     except asyncio.CancelledError:
         pass
     if live_crawler.running:

@@ -35,6 +35,8 @@ import logging
 from typing import Dict, List, Tuple, Optional
 from uuid import UUID
 
+from ..metrics import metrics
+
 logger = logging.getLogger(__name__)
 
 
@@ -220,6 +222,11 @@ class ConnectionHealthTracker:
             f"hourly={hourly_joins}, daily={daily_joins}, failures={failures})"
         )
 
+        # Update Prometheus metric for monitoring
+        connection_id = self._connection_id_map.get(telegram_user_id)
+        if connection_id:
+            metrics.auto_join_connection_score.set(score, (connection_id,))
+
         return score
 
     def record_join_attempt(
@@ -252,6 +259,7 @@ class ConnectionHealthTracker:
         if success:
             # Reset failure count on success
             self._failure_count[telegram_user_id] = 0
+            metrics.auto_join_attempts_total.inc(("success",))
             logger.info(
                 f"Recorded successful join: user_id={telegram_user_id}, "
                 f"connection_id={connection_id}"
@@ -261,6 +269,7 @@ class ConnectionHealthTracker:
             self._failure_count[telegram_user_id] = (
                 self._failure_count.get(telegram_user_id, 0) + 1
             )
+            metrics.auto_join_attempts_total.inc(("failed",))
             logger.warning(
                 f"Recorded failed join: user_id={telegram_user_id}, "
                 f"connection_id={connection_id}, error={error_type}, "

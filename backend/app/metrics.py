@@ -41,19 +41,40 @@ class _Counter:
 
 
 class _Gauge:
-    """Simple Prometheus Gauge."""
-    def __init__(self, name: str, description: str):
+    """Simple Prometheus Gauge with optional labels."""
+    def __init__(self, name: str, description: str, labels: list[str] | None = None):
         self.name = name
         self.description = description
-        self._value = 0
+        self.labels = labels or []
+        self._values: dict[tuple, int] = {}  # label_values -> value
+        self._value = 0  # For labelless gauges
 
-    def set(self, value: int) -> None:
-        """Set gauge value."""
-        self._value = value
+    def set(self, value: int, label_values: tuple | None = None) -> None:
+        """Set gauge value (with optional labels)."""
+        if label_values:
+            self._values[label_values] = value
+        else:
+            self._value = value
 
     def render(self) -> str:
         """Render in Prometheus exposition format."""
-        return f"# HELP {self.name} {self.description}\n# TYPE {self.name} gauge\n{self.name} {self._value}"
+        lines = [
+            f"# HELP {self.name} {self.description}",
+            f"# TYPE {self.name} gauge",
+        ]
+
+        if self.labels:
+            # Labeled gauge
+            for label_values, value in sorted(self._values.items()):
+                label_str = ",".join(
+                    f'{label}="{val}"' for label, val in zip(self.labels, label_values)
+                )
+                lines.append(f"{self.name}{{{label_str}}} {value}")
+        else:
+            # Labelless gauge
+            lines.append(f"{self.name} {self._value}")
+
+        return "\n".join(lines)
 
 
 class _Metrics:
@@ -69,6 +90,18 @@ class _Metrics:
         self.queue_size = _Gauge("queue_size", "Crawler queue size")
         self.sse_connections = _Gauge("sse_connections", "Active SSE connections")
 
+        # Auto-join metrics (Phase 2)
+        self.auto_join_attempts_total = _Counter(
+            "auto_join_attempts_total",
+            "Total auto-join attempts",
+            ["status"]  # success | failed
+        )
+        self.auto_join_connection_score = _Gauge(
+            "auto_join_connection_score",
+            "Current health score of each connection (lower is better)",
+            ["connection_id"]
+        )
+
     def render(self) -> str:
         """Render all metrics in Prometheus format."""
         return "\n\n".join([
@@ -77,6 +110,8 @@ class _Metrics:
             self.crawler_groups_active.render(),
             self.queue_size.render(),
             self.sse_connections.render(),
+            self.auto_join_attempts_total.render(),
+            self.auto_join_connection_score.render(),
         ])
 
 

@@ -15,6 +15,7 @@ import logging
 import asyncio
 from typing import Optional, Dict, List, Tuple
 from uuid import UUID
+import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from telethon import TelegramClient
@@ -63,6 +64,22 @@ class AutoJoinResponse(BaseModel):
     group_title: Optional[str] = None
     connection_id: Optional[str] = None
     estimated_wait_seconds: Optional[int] = None  # If queued
+
+
+class JoinAttempt(BaseModel):
+    """Response model for join attempt history."""
+
+    id: str
+    connection_id: str
+    telegram_user_id: int
+    group_link: Optional[str] = None
+    group_username: Optional[str] = None
+    group_id: Optional[int] = None
+    success: bool
+    error_type: Optional[str] = None
+    flood_wait_seconds: Optional[int] = None
+    attempted_at: str
+    connection_name: str  # Joined from telegram_connections
 
 
 # ============================================================================
@@ -505,7 +522,29 @@ async def attempt_join_with_fallback(
             if client:
                 await client.disconnect()
 
-    # Exhausted all attempts
+    # Exhausted all attempts - send Sentry alert
+    identifier_str = (
+        group_info.get("hash", "")
+        or group_info.get("username", "")
+        or str(group_info.get("id", ""))
+    )
+
+    sentry_sdk.capture_message(
+        f"Auto-join failed after {max_attempts} attempts",
+        level="warning",
+        extras={
+            "identifier": identifier_str,
+            "group_type": group_info["type"],
+            "attempted_connections": attempted_connections,
+            "user_id": user_id,
+        },
+    )
+
+    logger.error(
+        f"Auto-join exhausted all {max_attempts} attempts for {identifier_str}. "
+        f"Tried connections: {attempted_connections}"
+    )
+
     return AutoJoinResponse(
         success=False,
         message=f"{max_attempts}번의 시도 후에도 가입에 실패했습니다",
@@ -571,4 +610,77 @@ async def auto_join_group(
         max_attempts=3,
     )
 
+    # If all connections unhealthy and result has estimated_wait_seconds,
+    # add to queue for automatic retry
+    if not result.success and result.estimated_wait_seconds:
+        # Import here to avoid circular dependency
+        import sys
+
+        crawler_main = sys.modules.get("crawler_main")
+        if crawler_main and hasattr(crawler_main, "queue_join_request"):
+            try:
+                await crawler_main.queue_join_request(
+                    identifier=request.identifier,
+                    user_id=current_user.id,
+                    delay_seconds=result.estimated_wait_seconds,
+                )
+                logger.info(
+                    f"Added {request.identifier} to queue with "
+                    f"{result.estimated_wait_seconds}s delay"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to queue join request: {e}")
+
     return result
+
+
+@router.get("/recent", response_model=List[JoinAttempt])
+async def get_recent_join_attempts(
+    limit: int = 20,
+    current_user: UserResponse = Depends(get_current_admin_user),
+):
+    """Get recent join attempts for analytics and debugging.
+
+    Returns the most recent join attempts across all connections,
+    with success/failure status and error details.
+
+    Args:
+        limit: Maximum number of attempts to return (default 20, max 100)
+        current_user: Current admin user (dependency)
+
+    Returns:
+        List of JoinAttempt records, sorted by attempted_at DESC
+    """
+    # Validate limit
+    if limit < 1:
+        limit = 1
+    if limit > 100:
+        limit = 100
+
+    # Query join attempts with connection info
+    rows = await db.fetch(
+        """
+        SELECT
+            ja.id::text,
+            ja.connection_id::text,
+            ja.telegram_user_id,
+            ja.group_link,
+            ja.group_username,
+            ja.group_id,
+            ja.success,
+            ja.error_type,
+            ja.flood_wait_seconds,
+            ja.attempted_at::text,
+            COALESCE(
+                tc.phone_masked || ' (' || COALESCE(tc.username, 'no username') || ')',
+                'Unknown Connection'
+            ) AS connection_name
+        FROM join_attempts ja
+        LEFT JOIN telegram_connections tc ON ja.connection_id = tc.id
+        ORDER BY ja.attempted_at DESC
+        LIMIT $1
+        """,
+        limit,
+    )
+
+    return [JoinAttempt(**dict(row)) for row in rows]
