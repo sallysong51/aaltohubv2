@@ -14,7 +14,7 @@ import { toast } from 'sonner';
 import {
   Loader2, Users, AlertCircle, LogOut, Circle, Plus,
   UserCog, BarChart3, Download, LinkIcon, Settings2, RefreshCw, Brain, Activity,
-  ChevronDown, Check,
+  ChevronDown, Check, UserPlus,
 } from 'lucide-react';
 import {
   adminApi,
@@ -39,6 +39,8 @@ import ConnectionTabs from '@/components/admin/ConnectionTabs';
 import GapFillMonitor from '@/components/admin/GapFillMonitor';
 import AnalysisTab from '@/components/admin/AnalysisTab';
 import PipelineVisibilityDashboard from '@/components/admin/PipelineVisibilityDashboard';
+import { AutoJoinPanel } from '@/components/admin/AutoJoinPanel';
+import { RecentJoinAttemptsTable } from '@/components/admin/RecentJoinAttemptsTable';
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -68,7 +70,7 @@ function AdminDashboardContent() {
   const [health, setHealth] = useState<BackendHealth | null>(null);
   // realtimeConnected comes from useSSE hook below
   const [groupSearch, setGroupSearch] = useState('');
-  const [viewMode, setViewMode] = useState<'messages' | 'groups' | 'gap-fill' | 'analysis' | 'pipeline'>('messages');
+  const [viewMode, setViewMode] = useState<'messages' | 'groups' | 'gap-fill' | 'analysis' | 'pipeline' | 'auto-join'>('messages');
 
   // Telegram account tabs
   const [connections, setConnections] = useState<TelegramConnection[]>([]);
@@ -495,6 +497,15 @@ function AdminDashboardContent() {
                   <LinkIcon className="h-4 w-4" />
                   미등록 그룹
                 </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => setViewMode(viewMode === 'auto-join' ? 'messages' : 'auto-join')}
+                >
+                  <UserPlus className="h-4 w-4" />
+                  자동 가입
+                  {viewMode === 'auto-join' && (
+                    <Check className="h-4 w-4 ml-auto text-primary" />
+                  )}
+                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
 
@@ -588,6 +599,22 @@ function AdminDashboardContent() {
         <AnalysisTab groups={groups} />
       ) : viewMode === 'gap-fill' ? (
         <GapFillMonitor />
+      ) : viewMode === 'auto-join' ? (
+        <div className="p-6 space-y-6">
+          <AutoJoinPanel
+            onSuccess={() => {
+              // Refresh group list after successful join
+              loadGroups();
+              // Switch to groups tab to see the newly joined group
+              setViewMode('groups');
+            }}
+          />
+
+          <div>
+            <h2 className="text-lg font-semibold mb-4">최근 가입 시도</h2>
+            <RecentJoinAttemptsTable />
+          </div>
+        </div>
       ) : viewMode === 'groups' ? (
         <GroupManagementTable
           groups={groups}
