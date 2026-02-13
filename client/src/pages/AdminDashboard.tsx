@@ -12,9 +12,9 @@ import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
 import {
-  Loader2, Users, AlertCircle, RefreshCw, LogOut, Circle, Plus,
-  UserCog, BarChart3, ArrowLeft, Download, LinkIcon,
-  Settings2, Sun, Moon,
+  Loader2, Users, AlertCircle, LogOut, Circle, Plus,
+  UserCog, BarChart3, Download, LinkIcon, Settings2, RefreshCw, Brain, Activity,
+  ChevronDown, Check,
 } from 'lucide-react';
 import {
   adminApi,
@@ -36,12 +36,20 @@ import GroupManagementTable from '@/components/admin/GroupManagementTable';
 import AdminMessageViewer from '@/components/admin/AdminMessageViewer';
 import CrawlerStatusBadge from '@/components/admin/CrawlerStatusBadge';
 import ConnectionTabs from '@/components/admin/ConnectionTabs';
+import GapFillMonitor from '@/components/admin/GapFillMonitor';
+import AnalysisTab from '@/components/admin/AnalysisTab';
+import PipelineVisibilityDashboard from '@/components/admin/PipelineVisibilityDashboard';
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from '@/components/ui/dropdown-menu';
 
 function AdminDashboardContent() {
   const [, setLocation] = useLocation();
   const { user, logout } = useAuth();
   const { isBackendConnected } = useBackendConnectivity();
-  const { theme, setTheme } = useTheme();
 
   const [groups, setGroups] = useState<RegisteredGroup[]>([]);
   const [groupsLoadFailed, setGroupsLoadFailed] = useState(false);
@@ -60,7 +68,7 @@ function AdminDashboardContent() {
   const [health, setHealth] = useState<BackendHealth | null>(null);
   // realtimeConnected comes from useSSE hook below
   const [groupSearch, setGroupSearch] = useState('');
-  const [viewMode, setViewMode] = useState<'messages' | 'groups'>('messages');
+  const [viewMode, setViewMode] = useState<'messages' | 'groups' | 'gap-fill' | 'analysis' | 'pipeline'>('messages');
 
   // Telegram account tabs
   const [connections, setConnections] = useState<TelegramConnection[]>([]);
@@ -222,15 +230,6 @@ function AdminDashboardContent() {
     }
   };
 
-  const handleRestartCrawler = async () => {
-    try {
-      await adminApi.restartLiveCrawler();
-      toast.success('라이브 크롤러가 재시작되었습니다');
-      loadLiveCrawlerStatus();
-    } catch (error) {
-      toast.error(getApiErrorMessage(error, '크롤러 재시작에 실패했습니다'));
-    }
-  };
 
   const handleTriggerCrawl = async (groupId: string) => {
     try {
@@ -463,107 +462,117 @@ function AdminDashboardContent() {
             </div>
           </div>
 
-          {/* FIX #5: Button Row — icon + text for all buttons */}
+          {/* Admin Toolbar */}
           <div className="flex items-center gap-1 flex-wrap">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setLocation('/feed')}
-              className="h-8 px-3 text-xs"
-            >
-              <ArrowLeft className="h-3.5 w-3.5 mr-1.5" />
-              피드
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setLocation('/groups/select')}
-              className="h-8 px-3 text-xs"
-            >
-              <Plus className="h-3.5 w-3.5 mr-1.5" />
-              그룹 추가
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={handleRestartCrawler}
-              className="h-8 px-3 text-xs"
-            >
-              <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
-              크롤러 재시작
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setLocation('/admin/crawler')}
-              className="h-8 px-3 text-xs"
-            >
-              <BarChart3 className="h-3.5 w-3.5 mr-1.5" />
-              크롤러 관리
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setLocation('/admin/users')}
-              className="h-8 px-3 text-xs"
-            >
-              <UserCog className="h-3.5 w-3.5 mr-1.5" />
-              사용자 관리
-            </Button>
-            <Button
-              variant={viewMode === 'groups' ? 'default' : 'ghost'}
-              size="sm"
-              onClick={() => setViewMode(viewMode === 'groups' ? 'messages' : 'groups')}
-              className="h-8 px-3 text-xs"
-            >
-              <Settings2 className="h-3.5 w-3.5 mr-1.5" />
-              그룹 관리
-            </Button>
-            {/* FIX #4: Unmapped groups navigation */}
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setLocation('/admin/unmapped-groups')}
-              className="h-8 px-3 text-xs"
-            >
-              <LinkIcon className="h-3.5 w-3.5 mr-1.5" />
-              미등록 그룹
-            </Button>
-            {/* Phase 1: Auto-detect group-connection mappings for multi-connection admins */}
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={async () => {
-                try {
-                  const res = await adminApi.detectGroupConnections();
-                  toast.success(
-                    `✓ ${res.data.updated}개 그룹 자동 매핑됨 ` +
-                    (res.data.unlinked_remaining > 0 ? `(${res.data.unlinked_remaining}개 미연결)` : '')
-                  );
-                  loadGroups();
-                } catch (error) {
-                  toast.error(getApiErrorMessage(error, '그룹 감지에 실패했습니다'));
-                }
-              }}
-              className="h-8 px-3 text-xs"
-            >
-              <Loader2 className="h-3.5 w-3.5 mr-1.5" />
-              연결 감지
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-              className="h-8 px-3 text-xs ml-auto"
-            >
-              {theme === 'dark' ? <Sun className="h-3.5 w-3.5 mr-1.5" /> : <Moon className="h-3.5 w-3.5 mr-1.5" />}
-              {theme === 'dark' ? '라이트' : '다크'}
-            </Button>
+            {/* 그룹 Dropdown */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 px-3 text-xs"
+                >
+                  <Settings2 className="h-3.5 w-3.5 mr-1.5" />
+                  그룹
+                  <ChevronDown className="h-3.5 w-3.5 ml-1" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start">
+                <DropdownMenuItem onClick={() => setLocation('/groups/select')}>
+                  <Plus className="h-4 w-4" />
+                  그룹 추가
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => setViewMode(viewMode === 'groups' ? 'messages' : 'groups')}
+                >
+                  <Settings2 className="h-4 w-4" />
+                  그룹 관리
+                  {viewMode === 'groups' && (
+                    <Check className="h-4 w-4 ml-auto text-primary" />
+                  )}
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setLocation('/admin/unmapped-groups')}>
+                  <LinkIcon className="h-4 w-4" />
+                  미등록 그룹
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
+            {/* 크롤링 Dropdown */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 px-3 text-xs"
+                >
+                  <BarChart3 className="h-3.5 w-3.5 mr-1.5" />
+                  크롤링
+                  <ChevronDown className="h-3.5 w-3.5 ml-1" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start">
+                <DropdownMenuItem onClick={() => setLocation('/admin/crawler')}>
+                  <BarChart3 className="h-4 w-4" />
+                  크롤러 관리
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => setViewMode(viewMode === 'pipeline' ? 'messages' : 'pipeline')}
+                >
+                  <Activity className="h-4 w-4" />
+                  파이프라인
+                  {viewMode === 'pipeline' && (
+                    <Check className="h-4 w-4 ml-auto text-primary" />
+                  )}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => setViewMode(viewMode === 'gap-fill' ? 'messages' : 'gap-fill')}
+                >
+                  <RefreshCw className="h-4 w-4" />
+                  메시지 복구
+                  {viewMode === 'gap-fill' && (
+                    <Check className="h-4 w-4 ml-auto text-primary" />
+                  )}
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setLocation('/admin/users')}>
+                  <UserCog className="h-4 w-4" />
+                  관리자 권한
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
+            {/* 정보가공 Dropdown */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 px-3 text-xs"
+                >
+                  <Brain className="h-3.5 w-3.5 mr-1.5" />
+                  정보가공
+                  <ChevronDown className="h-3.5 w-3.5 ml-1" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start">
+                <DropdownMenuItem
+                  onClick={() => setViewMode(viewMode === 'analysis' ? 'messages' : 'analysis')}
+                >
+                  <Brain className="h-4 w-4" />
+                  분석
+                  {viewMode === 'analysis' && (
+                    <Check className="h-4 w-4 ml-auto text-primary" />
+                  )}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
+            {/* Logout Button */}
             <Button
               variant="ghost"
               size="sm"
               onClick={handleLogout}
-              className="h-8 px-3 text-xs"
+              className="h-8 px-3 text-xs ml-auto"
             >
               <LogOut className="h-3.5 w-3.5 mr-1.5" />
               로그아웃
@@ -573,7 +582,13 @@ function AdminDashboardContent() {
       </div>
 
       {/* Main Content */}
-      {viewMode === 'groups' ? (
+      {viewMode === 'pipeline' ? (
+        <PipelineVisibilityDashboard health={health} />
+      ) : viewMode === 'analysis' ? (
+        <AnalysisTab groups={groups} />
+      ) : viewMode === 'gap-fill' ? (
+        <GapFillMonitor />
+      ) : viewMode === 'groups' ? (
         <GroupManagementTable
           groups={groups}
           selectedGroup={selectedGroup}
