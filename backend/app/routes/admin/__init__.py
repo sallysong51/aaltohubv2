@@ -7,6 +7,7 @@ from .crawler import router as crawler_router
 from .users import router as users_router
 from .credentials import router as credentials_router
 from .system_diagnostics import router as system_diagnostics_router
+from .auto_join import router as auto_join_router
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
@@ -16,3 +17,4 @@ router.include_router(crawler_router)
 router.include_router(users_router)
 router.include_router(credentials_router)
 router.include_router(system_diagnostics_router)
+router.include_router(auto_join_router, prefix="/auto-join")

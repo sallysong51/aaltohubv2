@@ -673,6 +673,41 @@ class LiveCrawlerService:
             "last_activity": self._started_at.isoformat() if self._started_at else None,
         }
 
+    def get_flood_wait_status_for_auto_join(self) -> dict[int, float]:
+        """Get FloodWait penalties by telegram_user_id for auto-join feature.
+
+        Returns a dict mapping telegram_user_id → expiry timestamp (monotonic time).
+        This is used by ConnectionHealthTracker to avoid connections that are
+        currently under FloodWait penalty.
+
+        Note: _flood_wait_until is keyed by group_id, so we need to find which
+        telegram_user_id corresponds to each group. For simplicity, we return
+        the max expiry time across all groups for each user_id.
+
+        Returns:
+            Dict[telegram_user_id, expiry_timestamp]
+        """
+        user_flood_wait: dict[int, float] = {}
+
+        # Iterate through all active clients and check their FloodWait status
+        for user_id, client_info in self.user_id_client_map.items():
+            # Find the telegram_user_id for this user_id
+            telegram_user_id = client_info.get("telegram_user_id")
+            if not telegram_user_id:
+                continue
+
+            # Find the maximum FloodWait expiry for groups this user is listening to
+            max_expiry = 0.0
+            for group_id, expiry in self._flood_wait_until.items():
+                # Check if this group is assigned to this connection
+                if self._group_to_connection_id.get(group_id) == client_info.get("connection_id"):
+                    max_expiry = max(max_expiry, expiry)
+
+            if max_expiry > time.monotonic():
+                user_flood_wait[telegram_user_id] = max_expiry
+
+        return user_flood_wait
+
     def _get_overall_status(self) -> str:
         """Calculate overall crawler status for diagnostics."""
         if not self.running:
