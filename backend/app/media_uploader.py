@@ -10,22 +10,21 @@ import logging
 
 from telethon import TelegramClient
 
+from app.config import settings
 from app.database import db, get_storage_client
 from app.crawler.utils import select_photo_size
 
 logger = logging.getLogger(__name__)
 
+# Environment-independent constants (protocol limits, not tunable)
 MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB
-MEDIA_DOWNLOAD_TIMEOUT = 30  # seconds
-MEDIA_CONCURRENCY = 5
-MEDIA_DOWNLOAD_BATCH = 50
 
 
 class MediaUploader:
     """Handles media download from Telegram and upload to Supabase Storage."""
 
     def __init__(self) -> None:
-        self._media_semaphore = asyncio.Semaphore(MEDIA_CONCURRENCY)
+        self._media_semaphore = asyncio.Semaphore(settings.MEDIA_CONCURRENCY)
         self._storage_client = None
         self._select_photo_size = select_photo_size
 
@@ -58,12 +57,12 @@ class MediaUploader:
                 if thumb:
                     await asyncio.wait_for(
                         client.download_media(message.media, buffer, thumb=thumb),
-                        timeout=MEDIA_DOWNLOAD_TIMEOUT,
+                        timeout=settings.MEDIA_DOWNLOAD_TIMEOUT,
                     )
                 else:
                     await asyncio.wait_for(
                         client.download_media(message, buffer),
-                        timeout=MEDIA_DOWNLOAD_TIMEOUT,
+                        timeout=settings.MEDIA_DOWNLOAD_TIMEOUT,
                     )
                 content_type = "image/jpeg"
             else:
@@ -72,7 +71,7 @@ class MediaUploader:
                     if thumbs:
                         await asyncio.wait_for(
                             client.download_media(message, buffer, thumb=0),
-                            timeout=MEDIA_DOWNLOAD_TIMEOUT,
+                            timeout=settings.MEDIA_DOWNLOAD_TIMEOUT,
                         )
                         content_type = "image/jpeg"
                     else:

@@ -16,6 +16,7 @@ Supabase pooler options:
 - Session: postgresql://postgres.PROJECT_REF:PASSWORD@aws-X-region.pooler.supabase.com:5432/postgres
 - Direct:  postgresql://postgres:PASSWORD@db.PROJECT_REF.supabase.co:5432/postgres
 """
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -54,12 +55,17 @@ class Database:
         try:
             self._pool = await asyncpg.create_pool(
                 dsn=dsn,
-                min_size=5,
-                max_size=20,
+                min_size=settings.DB_POOL_MIN,
+                max_size=settings.DB_POOL_MAX,
                 command_timeout=10,
+                max_inactive_connection_lifetime=300,  # Evict stale connections after 5min idle
                 statement_cache_size=0,  # Must be 0 for pgbouncer/Supabase pooler compatibility
             )
-            logger.info("asyncpg pool created (min=5, max=20)")
+            logger.info(
+                "asyncpg pool created (min=%d, max=%d, stale_eviction=5min)",
+                settings.DB_POOL_MIN,
+                settings.DB_POOL_MAX,
+            )
         except asyncpg.InternalServerError as e:
             if "Tenant or user not found" in str(e):
                 raise RuntimeError(
@@ -117,6 +123,71 @@ class Database:
             logger.debug("[DB] Reconnection attempt failed: %s", e)
             return False
 
+    async def _reset_pool(self) -> None:
+        """Reset the connection pool (nuclear option for corrupted pool state).
+
+        Use this when the entire pool is suspected to be corrupted (e.g., all
+        connections are stale after Supabase Pooler restart). Normal transient
+        errors are handled by max_inactive_connection_lifetime and retry logic.
+        """
+        logger.warning("[DB] Resetting connection pool")
+        if self._pool is not None:
+            try:
+                await asyncio.wait_for(self._pool.close(), timeout=5)
+            except Exception as e:
+                logger.warning("[DB] Error closing old pool: %s", e)
+        self._pool = None
+        try:
+            await self.connect()
+            logger.info("[DB] Connection pool reset complete")
+        except Exception as e:
+            logger.error("[DB] Failed to recreate pool after reset: %s", e)
+            raise
+
+    async def _execute_with_retry(self, operation, *args, max_retries: int = 3, **kwargs):
+        """Execute a database operation with automatic retry on connection errors.
+
+        Args:
+            operation: Async callable (e.g., pool.fetch, pool.execute)
+            *args: Positional arguments for the operation
+            max_retries: Maximum number of retry attempts (default: 3)
+            **kwargs: Keyword arguments for the operation
+
+        Returns:
+            Result from the operation
+
+        Raises:
+            Exception: If all retry attempts are exhausted
+
+        Connection errors that trigger retry:
+            - ConnectionDoesNotExistError: Connection was closed
+            - InterfaceError: Connection is in invalid state
+            - OSError: Network-level failure (timeout, reset, etc.)
+        """
+        for attempt in range(max_retries):
+            try:
+                pool = self._ensure_pool()
+                return await operation(pool, *args, **kwargs)
+            except (
+                asyncpg.ConnectionDoesNotExistError,
+                asyncpg.InterfaceError,
+                OSError,
+            ) as e:
+                is_last_attempt = (attempt == max_retries - 1)
+                if is_last_attempt:
+                    logger.error(
+                        "[DB] Query failed after %d attempts: %s",
+                        max_retries, e
+                    )
+                    raise
+
+                backoff = 2 ** attempt  # 1s, 2s, 4s
+                logger.warning(
+                    "[DB] Connection error on attempt %d/%d: %s — retrying in %ds",
+                    attempt + 1, max_retries, e, backoff
+                )
+                await asyncio.sleep(backoff)
+
     def _ensure_pool(self) -> asyncpg.Pool:
         if self._pool is None:
             logger.error("[DB] Pool access attempted while disconnected")
@@ -124,29 +195,34 @@ class Database:
         return self._pool
 
     async def fetch(self, query: str, *args: Any) -> list[asyncpg.Record]:
-        """Execute a query and return all rows."""
-        pool = self._ensure_pool()
-        return await pool.fetch(query, *args)
+        """Execute a query and return all rows. Auto-retries on connection errors."""
+        return await self._execute_with_retry(
+            lambda pool: pool.fetch(query, *args)
+        )
 
     async def fetchrow(self, query: str, *args: Any) -> Optional[asyncpg.Record]:
-        """Execute a query and return the first row (or None)."""
-        pool = self._ensure_pool()
-        return await pool.fetchrow(query, *args)
+        """Execute a query and return the first row (or None). Auto-retries on connection errors."""
+        return await self._execute_with_retry(
+            lambda pool: pool.fetchrow(query, *args)
+        )
 
     async def fetchval(self, query: str, *args: Any) -> Any:
-        """Execute a query and return the first column of the first row."""
-        pool = self._ensure_pool()
-        return await pool.fetchval(query, *args)
+        """Execute a query and return the first column of the first row. Auto-retries on connection errors."""
+        return await self._execute_with_retry(
+            lambda pool: pool.fetchval(query, *args)
+        )
 
     async def execute(self, query: str, *args: Any) -> str:
-        """Execute a statement (INSERT/UPDATE/DELETE). Returns status string."""
-        pool = self._ensure_pool()
-        return await pool.execute(query, *args)
+        """Execute a statement (INSERT/UPDATE/DELETE). Returns status string. Auto-retries on connection errors."""
+        return await self._execute_with_retry(
+            lambda pool: pool.execute(query, *args)
+        )
 
     async def executemany(self, query: str, args: list) -> None:
-        """Execute a statement for each set of args (batch insert/update)."""
-        pool = self._ensure_pool()
-        await pool.executemany(query, args)
+        """Execute a statement for each set of args (batch insert/update). Auto-retries on connection errors."""
+        return await self._execute_with_retry(
+            lambda pool: pool.executemany(query, args)
+        )
 
     @property
     def pool(self) -> asyncpg.Pool:
