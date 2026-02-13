@@ -17,6 +17,8 @@ export default function AdminDataManagement() {
   const [retryCount, setRetryCount] = useState<number>(0);
   const [blacklistUrl, setBlacklistUrl] = useState<string>('');
   const [exportFormat, setExportFormat] = useState<string>('csv');
+  const [exportDays, setExportDays] = useState<number>(30);
+  const [isExporting, setIsExporting] = useState<boolean>(false);
   const [blacklistItems, setBlacklistItems] = useState<any[]>([]);
 
   // Load blacklist on mount
@@ -67,11 +69,30 @@ export default function AdminDataManagement() {
 
   const handleExport = async () => {
     try {
-      const result = await adminAI.exportData({ format: exportFormat as 'csv' | 'json' });
-      alert(result.data.message);
+      setIsExporting(true);
+
+      const response = await adminAI.exportData({
+        format: exportFormat as 'csv' | 'json',
+        days: exportDays,
+      });
+
+      // Create blob and trigger download
+      const blob = new Blob([response.data], { type: 'text/csv' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `messages_${exportDays}days.${exportFormat}`;
+      document.body.appendChild(a);  // Firefox requires DOM append
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+
+      alert('Export completed successfully');
     } catch (error) {
       console.error('Error exporting data:', error);
-      alert('Failed to export data');
+      alert('Failed to export data. Please try again.');
+    } finally {
+      setIsExporting(false);
     }
   };
 
@@ -166,16 +187,40 @@ export default function AdminDataManagement() {
             <CardTitle>Data Export</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="flex gap-2">
-              <select
-                value={exportFormat}
-                onChange={(e) => setExportFormat(e.target.value)}
-                className="p-2 border rounded"
-              >
-                <option value="csv">CSV</option>
-                <option value="json">JSON</option>
-              </select>
-              <Button onClick={handleExport}>Export All Data</Button>
+            <p className="text-sm text-gray-600 mb-4">
+              Export messages to CSV (gzip compressed by server)
+            </p>
+            <div className="flex flex-col gap-3">
+              <div className="flex gap-2">
+                <select
+                  value={exportFormat}
+                  onChange={(e) => setExportFormat(e.target.value)}
+                  className="p-2 border rounded"
+                  disabled={isExporting}
+                >
+                  <option value="csv">CSV</option>
+                  <option value="json">JSON (not supported yet)</option>
+                </select>
+                <select
+                  value={exportDays}
+                  onChange={(e) => setExportDays(Number(e.target.value))}
+                  className="p-2 border rounded"
+                  disabled={isExporting}
+                >
+                  <option value={7}>최근 7일</option>
+                  <option value={30}>최근 30일</option>
+                  <option value={90}>최근 90일</option>
+                  <option value={365}>최근 1년</option>
+                </select>
+                <Button onClick={handleExport} disabled={isExporting}>
+                  {isExporting ? 'Exporting...' : 'Export Data'}
+                </Button>
+              </div>
+              {isExporting && (
+                <div className="text-sm text-blue-600">
+                  Exporting... This may take a few minutes for large datasets.
+                </div>
+              )}
             </div>
           </CardContent>
         </Card>
@@ -187,12 +232,14 @@ export default function AdminDataManagement() {
           </CardHeader>
           <CardContent>
             <div className="flex flex-col gap-2">
+              {/* DISABLED: Message deletion disabled - messages kept permanently
               <Button
                 variant="outline"
                 onClick={() => handleCleanup('delete_old_messages')}
               >
                 Delete Messages Older Than 90 Days
               </Button>
+              */}
               <Button
                 variant="outline"
                 onClick={() => handleCleanup('clear_failed_queues')}

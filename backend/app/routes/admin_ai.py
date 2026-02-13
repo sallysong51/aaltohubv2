@@ -5,10 +5,13 @@ API endpoints for AI classification, prompt management, and data operations.
 """
 
 from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 from typing import Dict, List, Optional
 from datetime import datetime
 import logging
 import json
+import csv
+import io
 
 from app.database import db
 from app.auth import get_current_admin_user
@@ -424,19 +427,143 @@ async def bulk_retry_classification(
         raise HTTPException(status_code=500, detail="Failed to retry classification")
 
 
+async def generate_csv_stream(
+    columns: Optional[List[str]],
+    days: Optional[int],
+    group_ids: Optional[List[int]],
+    limit: int = 1000000
+):
+    """
+    Stream CSV rows without loading entire dataset into memory.
+
+    Args:
+        columns: List of column names to export (whitelist validated)
+        days: Filter messages from last N days
+        group_ids: Filter messages from specific groups
+        limit: Maximum rows to export (safety cap)
+
+    Yields:
+        CSV data as bytes (row by row)
+    """
+    # Column whitelist (prevent SQL injection)
+    ALLOWED_COLUMNS = {
+        'id', 'telegram_message_id', 'group_id', 'sender_id', 'sender_name',
+        'text', 'media_type', 'media_url', 'sent_at', 'created_at', 'message_source'
+    }
+
+    # Default columns if not specified
+    if not columns:
+        columns = ['id', 'telegram_message_id', 'group_id', 'sender_name',
+                   'text', 'media_type', 'sent_at', 'message_source']
+
+    # Validate columns (SQL injection prevention)
+    columns = [c for c in columns if c in ALLOWED_COLUMNS]
+    if not columns:
+        raise ValueError("No valid columns selected")
+
+    # Map column names to SQL (handle reserved words)
+    col_mapping = {'text': '"text"'}  # "text" is a SQL reserved word
+    sql_columns = [col_mapping.get(c, c) for c in columns]
+
+    # Build query
+    query = f"SELECT {', '.join(sql_columns)} FROM messages"
+    where_clauses = []
+    params = []
+
+    if days:
+        where_clauses.append(f"sent_at > NOW() - INTERVAL ${len(params)+1}")
+        params.append(f'{days} days')
+
+    if group_ids:
+        where_clauses.append(f"group_id = ANY(${len(params)+1})")
+        params.append(group_ids)
+
+    if where_clauses:
+        query += " WHERE " + " AND ".join(where_clauses)
+
+    query += f" ORDER BY sent_at DESC LIMIT {limit}"
+
+    # Generate CSV header
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(columns)
+    yield buffer.getvalue().encode('utf-8')
+
+    # Stream rows
+    async with db.pool.acquire() as conn:
+        try:
+            async for row in conn.cursor(query, *params):
+                buffer = io.StringIO()
+                writer = csv.writer(buffer, quoting=csv.QUOTE_MINIMAL)
+
+                # Convert asyncpg.Record to list, handling NULLs
+                row_data = []
+                for i, col in enumerate(columns):
+                    value = row[i]  # Access by index (faster than dict key)
+
+                    if value is None:
+                        row_data.append('')  # NULL → empty string (CSV standard)
+                    elif isinstance(value, datetime):
+                        row_data.append(value.isoformat())
+                    else:
+                        row_data.append(str(value))
+
+                writer.writerow(row_data)
+                yield buffer.getvalue().encode('utf-8')
+        except Exception as e:
+            logger.error(f"Export streaming error: {e}")
+            # Terminate stream gracefully
+            yield b''
+
+
 @router.post("/export")
 async def export_data(
     payload: Dict,
     current_user: UserResponse = Depends(get_current_admin_user)
-) -> Dict:
+):
     """
-    Export data (mock implementation).
+    Export messages to CSV with streaming response.
 
     Payload:
-        - format: csv|json
+        - format: 'csv' | 'json' (v1: only CSV supported)
+        - columns: Optional[List[str]] - column names to export
+        - days: Optional[int] - filter messages from last N days
+        - group_ids: Optional[List[int]] - filter by specific groups
+        - limit: Optional[int] - max rows (default: 1M, safety cap)
+
+    Returns:
+        StreamingResponse with CSV data
+
+    Notes:
+        - NULL values → empty strings (CSV standard)
+        - Response is auto-compressed by uvicorn/nginx (Content-Encoding: gzip)
+        - Browser auto-decompresses, user receives plain CSV
     """
-    # TODO: Implement actual export logic
-    return {"message": "Export feature not yet implemented"}
+    format = payload.get('format', 'csv')
+    columns = payload.get('columns')
+    days = payload.get('days')
+    group_ids = payload.get('group_ids')
+    limit = payload.get('limit', 1000000)
+
+    if format != 'csv':
+        raise HTTPException(status_code=400, detail="Only CSV format supported in v1")
+
+    try:
+        filename = f"messages_{days or 'all'}days.csv"
+
+        return StreamingResponse(
+            generate_csv_stream(columns, days, group_ids, limit),
+            media_type='text/csv',
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Cache-Control': 'no-cache'
+            }
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Export failed: {e}")
+        raise HTTPException(status_code=500, detail="Export failed")
 
 
 @router.post("/cleanup")
@@ -455,11 +582,12 @@ async def cleanup_data(
 
         async with db.pool.acquire() as conn:
             if action == "delete_old_messages":
-                result = await conn.execute("""
-                    DELETE FROM messages
-                    WHERE created_at < NOW() - INTERVAL '90 days'
-                """)
-                return {"action": action, "deleted": result.split()[-1]}
+                # DISABLED: Messages are kept permanently
+                return {
+                    "action": action,
+                    "error": "Message deletion is disabled. Messages are kept permanently.",
+                    "deleted": "0"
+                }
 
             elif action == "clear_failed_queues":
                 deleted_scraping = await conn.execute("""

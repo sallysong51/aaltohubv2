@@ -119,6 +119,121 @@
   --radius: 10px;
 }
 
+/* Pastel Dreams Theme */
+[data-theme="pastel-dreams"],
+[data-theme="pastel-dreams"] .light {
+  /* Primary: Soft Lavender */
+  --primary: #d4a5ff;
+  --primary-foreground: #ffffff;
+
+  /* Accent: Soft Pink */
+  --accent: #ff99cc;
+  --accent-foreground: #ffffff;
+
+  /* Base Colors */
+  --background: #fefdfb;
+  --foreground: #3d2f2f;
+
+  /* Card & Surface */
+  --card: #fff5f0;
+  --card-foreground: #3d2f2f;
+
+  /* Popover */
+  --popover: #ffffff;
+  --popover-foreground: #3d2f2f;
+
+  /* Secondary: Soft Mint */
+  --secondary: #c0e8d8;
+  --secondary-foreground: #3d2f2f;
+
+  /* Muted */
+  --muted: #d4d4d4;
+  --muted-foreground: #8b7b7b;
+
+  /* Destructive: Soft Red */
+  --destructive: #ff9999;
+  --destructive-foreground: #ffffff;
+
+  /* Borders & Inputs */
+  --border: #e8e0e0;
+  --input: #e8e0e0;
+  --ring: #d4a5ff;
+
+  /* Sidebar */
+  --sidebar: #fff5f0;
+  --sidebar-foreground: #3d2f2f;
+  --sidebar-primary: #d4a5ff;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #ff99cc;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #e8e0e0;
+  --sidebar-ring: #d4a5ff;
+
+  /* Charts */
+  --chart-1: #d4a5ff;
+  --chart-2: #ff99cc;
+  --chart-3: #c0e8d8;
+  --chart-4: #ffcc99;
+  --chart-5: #b3e5e0;
+}
+
+/* Pastel Dreams - Dark Mode */
+[data-theme="pastel-dreams"].dark {
+  /* Primary: Soft Lavender (adjusted for dark) */
+  --primary: #c47dff;
+  --primary-foreground: #ffffff;
+
+  /* Accent: Soft Pink (adjusted for dark) */
+  --accent: #ff7bb8;
+  --accent-foreground: #ffffff;
+
+  /* Base Colors */
+  --background: #2a1f26;
+  --foreground: #f5e8ed;
+
+  /* Card & Surface */
+  --card: #3d2a35;
+  --card-foreground: #f5e8ed;
+
+  /* Popover */
+  --popover: #3d2a35;
+  --popover-foreground: #f5e8ed;
+
+  /* Secondary: Soft Mint */
+  --secondary: #7fc9b3;
+  --secondary-foreground: #f5e8ed;
+
+  /* Muted */
+  --muted: #6b5b65;
+  --muted-foreground: #b8a8b8;
+
+  /* Destructive: Soft Red */
+  --destructive: #ff8080;
+  --destructive-foreground: #ffffff;
+
+  /* Borders & Inputs */
+  --border: #4d3a47;
+  --input: #4d3a47;
+  --ring: #c47dff;
+
+  /* Sidebar */
+  --sidebar: #3d2a35;
+  --sidebar-foreground: #f5e8ed;
+  --sidebar-primary: #c47dff;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #ff7bb8;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #4d3a47;
+  --sidebar-ring: #c47dff;
+
+  /* Charts */
+  --chart-1: #c47dff;
+  --chart-2: #ff7bb8;
+  --chart-3: #7fc9b3;
+  --chart-4: #ffaa66;
+  --chart-5: #99ddd8;
+}
+
 .dark {
   /* Primary: Telegram Blue (refined for dark mode) */
   --primary: #00a0e9;

@@ -23,6 +23,7 @@ from app.telegram_client import telegram_manager
 from app import crawler_client
 from app.database import db
 from app.sse import sse_manager
+from app.logging_config import setup_logging
 
 # Request correlation ID — set per-request, available via contextvars in any async code
 request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
@@ -34,26 +35,13 @@ class _RequestIdFilter(logging.Filter):
         record.request_id = request_id_var.get("-")  # type: ignore[attr-defined]
         return True
 
-_rid_filter = _RequestIdFilter()
+# Initialize centralized logging
+setup_logging(settings, service_name="api")
 
-if settings.ENVIRONMENT != "development":
-    # Structured JSON logging for production (parseable by ELK, Datadog, etc.)
-    try:
-        from pythonjsonlogger import json as jsonlogger
-        handler = logging.StreamHandler()
-        handler.setFormatter(jsonlogger.JsonFormatter(
-            fmt="%(asctime)s %(levelname)s %(name)s %(request_id)s %(message)s",
-            rename_fields={"asctime": "timestamp", "levelname": "level", "name": "logger"},
-        ))
-        handler.addFilter(_rid_filter)
-        logging.basicConfig(level=logging.INFO, handlers=[handler])
-    except ImportError:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-        logging.getLogger().handlers[0].addFilter(_rid_filter)
-else:
-    # Human-readable format for development
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s [%(request_id)s]: %(message)s")
-    logging.getLogger().handlers[0].addFilter(_rid_filter)
+# Add request_id filter to all handlers
+_rid_filter = _RequestIdFilter()
+for handler in logging.getLogger().handlers:
+    handler.addFilter(_rid_filter)
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +57,9 @@ if settings.SENTRY_DSN:
 
 AUTO_RECONNECT_INTERVAL = 30  # seconds between DB reconnection attempts
 
-MESSAGE_RETENTION_DAYS = 15  # 1-day buffer over 14-day historical crawl to prevent edge race
-CLEANUP_INTERVAL_SECONDS = 3600  # 1 hour
+# Set to None to keep all messages permanently, or a number to auto-delete after N days
+MESSAGE_RETENTION_DAYS = None  # Disabled: messages are kept permanently
+CLEANUP_INTERVAL_SECONDS = 3600  # 1 hour (for revoked tokens + dead letter monitoring)
 CLEANUP_BATCH_SIZE = 1000
 HEARTBEAT_INTERVAL_SECONDS = 300  # 5 minutes
 
@@ -139,9 +128,10 @@ async def auto_reconnect_db() -> None:
 
 
 async def cleanup_old_messages() -> None:
-    """Background task: delete messages older than 14 days (runs every hour).
-    Runs cleanup immediately on startup, then every CLEANUP_INTERVAL_SECONDS.
-    Deletes in batches of CLEANUP_BATCH_SIZE to avoid long-running transactions.
+    """Background task: cleanup system maintenance (runs every hour).
+    - Delete old messages if MESSAGE_RETENTION_DAYS is set (currently disabled)
+    - Clean up expired revoked tokens
+    - Monitor dead letter queue
     """
     while True:
         try:
@@ -149,24 +139,27 @@ async def cleanup_old_messages() -> None:
                 logger.debug("[CLEANUP] Skipping — database pool not available")
                 await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
                 continue
-            threshold = datetime.now(timezone.utc) - timedelta(days=MESSAGE_RETENTION_DAYS)
-            total_deleted = 0
-            while True:
-                result = await db.fetch(
-                    """WITH to_delete AS (
-                           SELECT id FROM messages WHERE sent_at < $1 LIMIT $2
-                       )
-                       DELETE FROM messages WHERE id IN (SELECT id FROM to_delete)
-                       RETURNING id""",
-                    threshold, CLEANUP_BATCH_SIZE,
-                )
-                batch_count = len(result)
-                total_deleted += batch_count
-                if batch_count < CLEANUP_BATCH_SIZE:
-                    break
-                await asyncio.sleep(0.1)  # yield between batches
-            if total_deleted > 0:
-                logger.info("[CLEANUP] Deleted %d messages older than %d days", total_deleted, MESSAGE_RETENTION_DAYS)
+
+            # Message cleanup (only if retention policy is enabled)
+            if MESSAGE_RETENTION_DAYS is not None:
+                threshold = datetime.now(timezone.utc) - timedelta(days=MESSAGE_RETENTION_DAYS)
+                total_deleted = 0
+                while True:
+                    result = await db.fetch(
+                        """WITH to_delete AS (
+                               SELECT id FROM messages WHERE sent_at < $1 LIMIT $2
+                           )
+                           DELETE FROM messages WHERE id IN (SELECT id FROM to_delete)
+                           RETURNING id""",
+                        threshold, CLEANUP_BATCH_SIZE,
+                    )
+                    batch_count = len(result)
+                    total_deleted += batch_count
+                    if batch_count < CLEANUP_BATCH_SIZE:
+                        break
+                    await asyncio.sleep(0.1)  # yield between batches
+                if total_deleted > 0:
+                    logger.info("[CLEANUP] Deleted %d messages older than %d days", total_deleted, MESSAGE_RETENTION_DAYS)
 
             # Also clean up expired revoked tokens
             try:

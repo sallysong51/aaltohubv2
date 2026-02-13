@@ -13,7 +13,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
 import {
   Loader2, Users, AlertCircle, LogOut, Circle, Plus,
-  UserCog, BarChart3, Download, LinkIcon, Settings2, RefreshCw, Brain, Activity,
+  UserCog, BarChart3, Download, LinkIcon, Settings2,
   ChevronDown, Check, UserPlus,
 } from 'lucide-react';
 import {
@@ -35,12 +35,11 @@ import { useSSE } from '@/hooks/useSSE';
 import GroupManagementTable from '@/components/admin/GroupManagementTable';
 import AdminMessageViewer from '@/components/admin/AdminMessageViewer';
 import CrawlerStatusBadge from '@/components/admin/CrawlerStatusBadge';
+import SessionHealthBadge from '@/components/admin/SessionHealthBadge';
 import ConnectionTabs from '@/components/admin/ConnectionTabs';
-import GapFillMonitor from '@/components/admin/GapFillMonitor';
-import AnalysisTab from '@/components/admin/AnalysisTab';
-import PipelineVisibilityDashboard from '@/components/admin/PipelineVisibilityDashboard';
 import { AutoJoinPanel } from '@/components/admin/AutoJoinPanel';
 import { RecentJoinAttemptsTable } from '@/components/admin/RecentJoinAttemptsTable';
+import { DataManagementPanel } from '@/components/admin/DataManagementPanel';
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -70,7 +69,7 @@ function AdminDashboardContent() {
   const [health, setHealth] = useState<BackendHealth | null>(null);
   // realtimeConnected comes from useSSE hook below
   const [groupSearch, setGroupSearch] = useState('');
-  const [viewMode, setViewMode] = useState<'messages' | 'groups' | 'gap-fill' | 'analysis' | 'pipeline' | 'auto-join'>('messages');
+  const [viewMode, setViewMode] = useState<'messages' | 'groups' | 'auto-join' | 'data-management'>('messages');
 
   // Telegram account tabs
   const [connections, setConnections] = useState<TelegramConnection[]>([]);
@@ -442,6 +441,9 @@ function AdminDashboardContent() {
                 health={health}
               />
 
+              {/* Session health badge */}
+              <SessionHealthBadge />
+
               {/* Helper message for development environment */}
               {health?.environment === "development" && !liveCrawlerStatus && lastCrawlerContact && (Date.now() - lastCrawlerContact) / 1000 < 30 && (
                 <span className="text-xs text-blue-600">
@@ -506,6 +508,15 @@ function AdminDashboardContent() {
                     <Check className="h-4 w-4 ml-auto text-primary" />
                   )}
                 </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => setViewMode(viewMode === 'data-management' ? 'messages' : 'data-management')}
+                >
+                  <Download className="h-4 w-4" />
+                  데이터 관리
+                  {viewMode === 'data-management' && (
+                    <Check className="h-4 w-4 ml-auto text-primary" />
+                  )}
+                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
 
@@ -527,53 +538,9 @@ function AdminDashboardContent() {
                   <BarChart3 className="h-4 w-4" />
                   크롤러 관리
                 </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={() => setViewMode(viewMode === 'pipeline' ? 'messages' : 'pipeline')}
-                >
-                  <Activity className="h-4 w-4" />
-                  파이프라인
-                  {viewMode === 'pipeline' && (
-                    <Check className="h-4 w-4 ml-auto text-primary" />
-                  )}
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={() => setViewMode(viewMode === 'gap-fill' ? 'messages' : 'gap-fill')}
-                >
-                  <RefreshCw className="h-4 w-4" />
-                  메시지 복구
-                  {viewMode === 'gap-fill' && (
-                    <Check className="h-4 w-4 ml-auto text-primary" />
-                  )}
-                </DropdownMenuItem>
                 <DropdownMenuItem onClick={() => setLocation('/admin/users')}>
                   <UserCog className="h-4 w-4" />
                   관리자 권한
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-
-            {/* 정보가공 Dropdown */}
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-8 px-3 text-xs"
-                >
-                  <Brain className="h-3.5 w-3.5 mr-1.5" />
-                  정보가공
-                  <ChevronDown className="h-3.5 w-3.5 ml-1" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="start">
-                <DropdownMenuItem
-                  onClick={() => setViewMode(viewMode === 'analysis' ? 'messages' : 'analysis')}
-                >
-                  <Brain className="h-4 w-4" />
-                  분석
-                  {viewMode === 'analysis' && (
-                    <Check className="h-4 w-4 ml-auto text-primary" />
-                  )}
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -593,12 +560,10 @@ function AdminDashboardContent() {
       </div>
 
       {/* Main Content */}
-      {viewMode === 'pipeline' ? (
-        <PipelineVisibilityDashboard health={health} />
-      ) : viewMode === 'analysis' ? (
-        <AnalysisTab groups={groups} />
-      ) : viewMode === 'gap-fill' ? (
-        <GapFillMonitor />
+      {viewMode === 'data-management' ? (
+        <div className="p-6">
+          <DataManagementPanel groups={groups} />
+        </div>
       ) : viewMode === 'auto-join' ? (
         <div className="p-6 space-y-6">
           <AutoJoinPanel

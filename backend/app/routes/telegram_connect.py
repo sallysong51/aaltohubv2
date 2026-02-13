@@ -3,10 +3,13 @@ Telegram connection management routes.
 Allows authenticated users to link/unlink multiple Telegram accounts.
 Separate from /auth — does NOT create users or issue JWTs.
 """
+import asyncio
 import logging
+import time
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Literal
 
 from app.auth import get_current_user
 from app.models import UserResponse, SendCodeRequest, SendCodeResponse, VerifyCodeRequest, Verify2FARequest
@@ -15,6 +18,10 @@ from app.database import db
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/telegram", tags=["Telegram Connections"])
+
+# Health check cache: {user_id: ({connections: [...], checked_at: ...}, timestamp)}
+_health_cache: Dict[str, tuple[dict, float]] = {}
+_HEALTH_CACHE_TTL = 600.0  # 10 minutes (increased from 5min for less frequent checks)
 
 
 class TelegramConnectionResponse(BaseModel):
@@ -31,6 +38,23 @@ class TelegramConnectionResponse(BaseModel):
 class ConnectVerifyResponse(BaseModel):
     success: bool
     connection: TelegramConnectionResponse
+
+
+class ConnectionHealthStatus(BaseModel):
+    connection_id: str
+    status: Literal["healthy", "expired", "invalid", "unreachable"]
+    telegram_user_id: int
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phone_masked: Optional[str] = None
+    last_checked_at: str
+    error_message: Optional[str] = None
+
+
+class ConnectionsHealthResponse(BaseModel):
+    connections: List[ConnectionHealthStatus]
+    checked_at: str
 
 
 @router.post("/send-code", response_model=SendCodeResponse)
@@ -190,8 +214,223 @@ async def remove_connection(
     return {"success": True, "message": "텔레그램 연결이 해제되었습니다."}
 
 
+@router.get("/connections/health", response_model=ConnectionsHealthResponse)
+async def get_connections_health(
+    current_user: UserResponse = Depends(get_current_user),
+):
+    """Check health status of all Telegram connections for current user.
+    Validates each session by calling get_me() on Telegram API.
+    Results are cached for 10 minutes to avoid excessive API calls.
+
+    Performance optimizations:
+    - 3s per-connection timeout for fast failure
+    - 2s get_me() timeout (down from 5s)
+    - 3s connect() timeout (down from 10s)
+    - Max 5 concurrent validations (up from 3)
+    """
+    user_id = str(current_user.id)
+    now = time.time()
+
+    # Check cache first
+    if user_id in _health_cache:
+        cached_data, timestamp = _health_cache[user_id]
+        if now - timestamp < _HEALTH_CACHE_TTL:
+            return ConnectionsHealthResponse(**cached_data)
+
+    try:
+        # Fetch all connections for user
+        connections = await telegram_manager.get_connections(user_id)
+
+        if not connections:
+            result = {
+                "connections": [],
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _health_cache[user_id] = (result, now)
+            return ConnectionsHealthResponse(**result)
+
+        # Validate connections in parallel with semaphore limit (max 5 concurrent, up from 3)
+        semaphore = asyncio.Semaphore(5)
+        tasks = [
+            _validate_single_connection(semaphore, connection)
+            for connection in connections
+        ]
+        health_statuses = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Handle exceptions from gather
+        validated = []
+        for i, status in enumerate(health_statuses):
+            if isinstance(status, Exception):
+                logger.exception(
+                    "Exception validating connection %s for user %s",
+                    connections[i]["id"],
+                    user_id,
+                )
+                # Fallback: mark as unreachable on unexpected error
+                validated.append(
+                    ConnectionHealthStatus(
+                        connection_id=str(connections[i]["id"]),
+                        status="unreachable",
+                        telegram_user_id=connections[i]["telegram_user_id"],
+                        username=connections[i].get("username"),
+                        first_name=connections[i].get("first_name"),
+                        last_name=connections[i].get("last_name"),
+                        phone_masked=connections[i].get("phone_masked"),
+                        last_checked_at=datetime.now(timezone.utc).isoformat(),
+                        error_message="예기치 않은 오류",
+                    )
+                )
+            else:
+                validated.append(status)
+
+        checked_at = datetime.now(timezone.utc).isoformat()
+        result = {
+            "connections": [c.model_dump() for c in validated],
+            "checked_at": checked_at,
+        }
+
+        # Cache result
+        _health_cache[user_id] = (result, now)
+
+        # Cleanup old cache entries if too many (keep max 100)
+        if len(_health_cache) > 100:
+            oldest_key = min(
+                _health_cache.keys(), key=lambda k: _health_cache[k][1]
+            )
+            del _health_cache[oldest_key]
+
+        return ConnectionsHealthResponse(**result)
+
+    except Exception as e:
+        logger.exception("get_connections_health error for user %s", user_id)
+        raise HTTPException(
+            status_code=500, detail="텔레그램 세션 상태를 확인할 수 없습니다."
+        )
+
+
 def _mask_phone(phone: str | None) -> str | None:
     """Mask phone number: +358123456789 → +358***6789"""
     if not phone or len(phone) < 8:
         return phone
     return phone[:4] + "***" + phone[-4:]
+
+
+async def _validate_single_connection(
+    semaphore: asyncio.Semaphore, connection: dict
+) -> ConnectionHealthStatus:
+    """Validate a single Telegram connection by calling get_me().
+    Returns health status: healthy, expired, invalid, or unreachable.
+
+    Performance: 3s total timeout per connection (was unlimited).
+    - Connect: 3s max (down from 10s in get_user_client_by_connection)
+    - get_me(): 2s max (down from 5s)
+    """
+    async with semaphore:
+        connection_id = str(connection["id"])
+        user_id = str(connection["user_id"])
+        telegram_user_id = connection["telegram_user_id"]
+        username = connection.get("username")
+        first_name = connection.get("first_name")
+        last_name = connection.get("last_name")
+        phone_masked = connection.get("phone_masked")
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        client = None
+        try:
+            # Entire validation wrapped in 3s timeout (fast failure)
+            async def _do_validation():
+                nonlocal client
+                # Get client via custom fast path (3s connect timeout instead of 10s)
+                client = await telegram_manager.get_user_client_by_connection_fast(
+                    connection_id, user_id
+                )
+                # Verify session is valid by calling get_me() with 2s timeout (down from 5s)
+                await asyncio.wait_for(client.get_me(), timeout=2.0)
+
+            await asyncio.wait_for(_do_validation(), timeout=3.0)
+
+            return ConnectionHealthStatus(
+                connection_id=connection_id,
+                status="healthy",
+                telegram_user_id=telegram_user_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                phone_masked=phone_masked,
+                last_checked_at=now_iso,
+                error_message=None,
+            )
+
+        except asyncio.TimeoutError:
+            return ConnectionHealthStatus(
+                connection_id=connection_id,
+                status="unreachable",
+                telegram_user_id=telegram_user_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                phone_masked=phone_masked,
+                last_checked_at=now_iso,
+                error_message="텔레그램 서버 연결 시간 초과",
+            )
+        except TelegramAuthError as e:
+            # Map TelegramAuthError to health status
+            error_str = str(e.detail).lower()
+            if "만료" in error_str or "session revoked" in error_str.lower():
+                status = "expired"
+            elif "auth" in error_str or "unauthorized" in error_str:
+                status = "expired"
+            else:
+                status = "invalid"
+
+            logger.debug(
+                "Connection %s validation failed: %s", connection_id, e.detail
+            )
+
+            return ConnectionHealthStatus(
+                connection_id=connection_id,
+                status=status,
+                telegram_user_id=telegram_user_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                phone_masked=phone_masked,
+                last_checked_at=now_iso,
+                error_message=e.detail,
+            )
+        except Exception as e:
+            error_str = str(e).lower()
+
+            # Detect expired/invalid session based on error message
+            if "auth key" in error_str or "unauthorized" in error_str:
+                status = "expired"
+                error_msg = "세션 만료됨"
+            elif "session" in error_str:
+                status = "invalid"
+                error_msg = "세션 오류"
+            else:
+                status = "unreachable"
+                error_msg = f"연결 오류: {type(e).__name__}"
+
+            logger.debug(
+                "Connection %s validation failed: %s", connection_id, error_str
+            )
+
+            return ConnectionHealthStatus(
+                connection_id=connection_id,
+                status=status,
+                telegram_user_id=telegram_user_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                phone_masked=phone_masked,
+                last_checked_at=now_iso,
+                error_message=error_msg,
+            )
+        finally:
+            # Always disconnect client
+            if client and client.is_connected():
+                try:
+                    await client.disconnect()
+                except Exception as e:
+                    logger.debug("Error disconnecting client: %s", e)

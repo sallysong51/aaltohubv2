@@ -346,6 +346,16 @@ export interface RegisteredGroup {
   last_updated_at?: string;  // ISO timestamp of last crawl
 }
 
+export interface TopicMetadata {
+  topic_id: number;
+  topic_title: string;
+  message_count: number;
+  icon_color?: number;
+  icon_emoji_id?: string;
+  is_closed?: boolean;
+  is_pinned?: boolean;
+}
+
 export interface RegisterGroupsRequest {
   groups: Array<{
     telegram_id: number;
@@ -473,6 +483,27 @@ export interface JoinAttempt {
   connection_name: string;  // From JOIN with telegram_connections
 }
 
+// ============================================================
+// Telegram Connection Health Check (Phase 33)
+// ============================================================
+
+export interface ConnectionHealthStatus {
+  connection_id: string;
+  status: 'healthy' | 'expired' | 'invalid' | 'unreachable';
+  telegram_user_id: number;
+  username?: string;
+  first_name?: string;
+  last_name?: string;
+  phone_masked?: string;
+  last_checked_at: string;
+  error_message?: string;
+}
+
+export interface ConnectionsHealthResponse {
+  connections: ConnectionHealthStatus[];
+  checked_at: string;
+}
+
 export const telegramApi = {
   getConnections: () =>
     apiClient.get<TelegramConnection[]>('/telegram/connections'),
@@ -488,6 +519,9 @@ export const telegramApi = {
 
   deleteConnection: (connectionId: string) =>
     apiClient.delete(`/telegram/connections/${connectionId}`),
+
+  getConnectionsHealth: () =>
+    apiClient.get<ConnectionsHealthResponse>('/telegram/connections/health'),
 };
 
 export const groupsApi = {
@@ -555,6 +589,9 @@ export const groupsApi = {
 
   getCrawlProgress: () =>
     apiClient.get<CrawlProgressItem[]>('/groups/crawl-progress'),
+
+  getGroupTopics: (groupId: string) =>
+    apiClient.get<TopicMetadata[]>(`/groups/${groupId}/topics`),
 };
 
 // ============================================================
@@ -921,8 +958,17 @@ export const adminAI = {
   bulkRetryClassification: (payload: { confidence_threshold?: number }) =>
     apiClient.post<{ requeued_count: number }>('/admin/bulk-retry', payload),
 
-  exportData: (payload: { format: 'csv' | 'json' }) =>
-    apiClient.post<{ message: string }>('/admin/export', payload),
+  exportData: (payload: {
+    format: 'csv' | 'json';
+    columns?: string[];
+    days?: number;
+    group_ids?: number[];
+    limit?: number;
+  }) =>
+    apiClient.post('/admin/export', payload, {
+      responseType: 'blob',  // Critical for binary data
+      timeout: 300000,       // 5-min timeout for large exports (1M+ rows)
+    }),
 
   cleanupData: (payload: {
     action: 'delete_old_messages' | 'clear_failed_queues' | 'vacuum';

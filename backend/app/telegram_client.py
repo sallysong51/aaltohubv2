@@ -709,6 +709,22 @@ class TelegramClientManager:
             raise TelegramAuthError("텔레그램 서버 연결 시간 초과.", status_code=504)
         return client
 
+    async def get_user_client_by_connection_fast(self, connection_id: str, user_id: str) -> TelegramClient:
+        """Create a Telethon client from a specific connection with aggressive timeout (3s).
+        Used for health checks where we want fast failure instead of waiting 10s.
+        """
+        session_string = await self.load_session_by_connection(connection_id, user_id)
+        if not session_string:
+            raise TelegramAuthError("텔레그램 연결을 찾을 수 없습니다.", status_code=404)
+
+        client = self._make_client(session_string)
+        try:
+            await asyncio.wait_for(client.connect(), timeout=3.0)
+        except asyncio.TimeoutError:
+            await self._safe_disconnect(client)
+            raise TelegramAuthError("텔레그램 서버 연결 시간 초과.", status_code=504)
+        return client
+
     async def get_user_groups_by_connection(self, connection_id: str, user_id: str) -> List[Dict]:
         """Get all groups/channels from a specific Telegram connection."""
         client = await self.get_user_client_by_connection(connection_id, user_id)

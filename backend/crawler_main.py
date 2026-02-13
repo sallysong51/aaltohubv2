@@ -32,6 +32,8 @@ from app.database import db
 from app.live_crawler import live_crawler, CB_RECOVERY_TIMEOUT
 from app.event_logger import event_logger
 from app.utils.connection_health_tracker import ConnectionHealthTracker
+from app.watchdog import CrawlerWatchdog
+from app.logging_config import setup_logging
 
 # Track crawler process startup time (for restart detection)
 STARTUP_TIMESTAMP = time.time()
@@ -78,20 +80,8 @@ async def queue_join_request(identifier: str, user_id: int, delay_seconds: int):
         f"with {delay_seconds}s delay"
     )
 
-# Logging setup (matches main.py pattern)
-if settings.ENVIRONMENT != "development":
-    try:
-        from pythonjsonlogger import json as jsonlogger
-        handler = logging.StreamHandler()
-        handler.setFormatter(jsonlogger.JsonFormatter(
-            fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
-            rename_fields={"asctime": "timestamp", "levelname": "level", "name": "logger"},
-        ))
-        logging.basicConfig(level=logging.INFO, handlers=[handler])
-    except ImportError:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-else:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# Initialize centralized logging
+setup_logging(settings, service_name="crawler")
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +96,47 @@ if settings.SENTRY_DSN:
 
 # Internal auth
 _security = HTTPBearer()
+
+# Global set to track background tasks (prevents GC of fire-and-forget tasks)
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _safe_create_task(coro, *, name: str | None = None) -> asyncio.Task:
+    """Create an asyncio task with automatic exception logging and Sentry reporting.
+
+    Same pattern as live_crawler.py but duplicated here to avoid circular imports.
+    """
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+
+    def _done_callback(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc:
+            task_name = name or t.get_name()
+            logger.error(
+                "[BACKGROUND-TASK] Task '%s' failed: %s",
+                task_name,
+                exc,
+                exc_info=exc,
+            )
+            if settings.SENTRY_DSN:
+                try:
+                    sentry_sdk.capture_exception(
+                        exc,
+                        extras={
+                            "task_name": task_name,
+                            "task_id": id(t),
+                            "coro_name": coro.__name__ if hasattr(coro, "__name__") else str(coro),
+                        },
+                    )
+                except Exception as sentry_err:
+                    logger.warning("[BACKGROUND-TASK] Failed to send to Sentry: %s", sentry_err)
+
+    task.add_done_callback(_done_callback)
+    return task
 
 
 def _verify_internal_token(credentials: HTTPAuthorizationCredentials = Depends(_security)):
@@ -139,7 +170,7 @@ async def _auto_reconnect_and_start_crawler() -> None:
         # DB is connected but crawler is not running — start it
         try:
             logger.info("[AUTO-RECONNECT] Starting crawler...")
-            asyncio.create_task(live_crawler.start())
+            _safe_create_task(live_crawler.start(), name="crawler-restart")
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -275,12 +306,47 @@ async def _cleanup_tracker_history():
             logger.warning(f"Failed to cleanup tracker history: {e}")
 
 
+def _handle_event_loop_exception(loop, context):
+    """Global exception handler for asyncio event loop.
+
+    Prevents unhandled exceptions in background tasks from crashing the loop.
+    Logs to both logger and Sentry for visibility.
+    """
+    exception = context.get("exception")
+    message = context.get("message", "Unknown asyncio error")
+
+    # Log with full context
+    logger.error(
+        "[EVENT-LOOP] Unhandled exception in asyncio: %s",
+        message,
+        exc_info=exception,
+        extra={"asyncio_context": context},
+    )
+
+    # Send to Sentry for alerting
+    if settings.SENTRY_DSN:
+        sentry_sdk.capture_exception(
+            exception or Exception(message),
+            extras={"asyncio_context": context},
+        )
+
+    # Only stop loop for fatal errors (not transient failures)
+    if isinstance(exception, (SystemExit, KeyboardInterrupt)):
+        logger.critical("[EVENT-LOOP] Fatal error, stopping loop")
+        loop.stop()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _health_tracker, _join_queue
 
     # Thread pool for Storage uploads + Telethon sync calls
     loop = asyncio.get_running_loop()
+
+    # Set global exception handler for the event loop
+    loop.set_exception_handler(_handle_event_loop_exception)
+    logger.info("[EVENT-LOOP] Global exception handler installed")
+
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="crawler-io")
     loop.set_default_executor(executor)
 
@@ -299,8 +365,16 @@ async def lifespan(app: FastAPI):
     await event_logger.start()
     logger.info("EventLogger started")
 
+    # Phase 34: Initialize systemd watchdog (before crawler starts)
+    watchdog = CrawlerWatchdog(live_crawler)
+    watchdog_task = _safe_create_task(watchdog.start(), name="systemd-watchdog")
+    logger.info("[WATCHDOG] Systemd watchdog initialized")
+
     if db_ok:
-        asyncio.create_task(live_crawler.start())
+        _safe_create_task(live_crawler.start(), name="crawler-start")
+        # Wait briefly for crawler to initialize before notifying systemd
+        await asyncio.sleep(1)
+        watchdog.notify_ready()
         await event_logger.log_info(
             category="system",
             title="Crawler started",
@@ -318,14 +392,14 @@ async def lifespan(app: FastAPI):
         )
 
     # Always start auto-reconnect (handles DB-down-at-startup and mid-run crashes)
-    reconnect_task = asyncio.create_task(_auto_reconnect_and_start_crawler())
+    reconnect_task = _safe_create_task(_auto_reconnect_and_start_crawler(), name="auto-reconnect")
 
     # Start background tasks for ConnectionHealthTracker
-    flood_sync_task = asyncio.create_task(_sync_flood_wait_to_tracker())
-    cleanup_task = asyncio.create_task(_cleanup_tracker_history())
+    flood_sync_task = _safe_create_task(_sync_flood_wait_to_tracker(), name="flood-sync")
+    cleanup_task = _safe_create_task(_cleanup_tracker_history(), name="tracker-cleanup")
 
     # Start queue processor for auto-join
-    queue_processor_task = asyncio.create_task(_process_join_queue())
+    queue_processor_task = _safe_create_task(_process_join_queue(), name="join-queue-processor")
 
     yield
 
@@ -334,6 +408,7 @@ async def lifespan(app: FastAPI):
     flood_sync_task.cancel()
     cleanup_task.cancel()
     queue_processor_task.cancel()
+    watchdog_task.cancel()
 
     try:
         await asyncio.gather(
@@ -341,6 +416,7 @@ async def lifespan(app: FastAPI):
             flood_sync_task,
             cleanup_task,
             queue_processor_task,
+            watchdog_task,
             return_exceptions=True,
         )
     except asyncio.CancelledError:
@@ -460,7 +536,7 @@ async def trigger_crawl(group_id: str):
         return {"success": True, "message": f"Historical crawl already running for group {group_id}"}
 
     live_crawler._crawled_groups.discard(gid)
-    task = asyncio.create_task(live_crawler._crawl_historical_for_group(gid))
+    task = _safe_create_task(live_crawler._crawl_historical_for_group(gid), name=f"manual-crawl-{group_id}")
     live_crawler._manual_crawl_tasks[group_id] = task
     # Clean up completed tasks to prevent memory accumulation
     live_crawler._manual_crawl_tasks = {
@@ -596,7 +672,7 @@ async def trigger_batch_crawl(request: BatchCrawlRequest):
 
     # Start worker if not already running
     if _batch_crawl_task is None or _batch_crawl_task.done():
-        _batch_crawl_task = asyncio.create_task(_batch_crawl_worker())
+        _batch_crawl_task = _safe_create_task(_batch_crawl_worker(), name="batch-crawl-worker")
 
     accepted_ids = [str(g) for g in int_ids if g not in set(int(s) for s in skipped)]
     result: dict = {

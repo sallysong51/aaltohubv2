@@ -271,6 +271,147 @@ sudo systemctl restart aaltohub-crawler
 sudo systemctl restart aaltohub-api aaltohub-crawler
 ```
 
+### 6.4. 자동 헬스 모니터링 및 복구 (Production 권장)
+
+**Phase 35: 시스템 안정성 강화** — 24/7 무중단 운영을 위한 자동 복구 시스템
+
+#### 개요
+`health_monitor.sh` 스크립트는 5분마다 실행되어 API와 Crawler 서비스의 상태를 체크하고, 장애 발생 시 자동으로 재시작합니다.
+
+**3계층 방어 전략:**
+1. **애플리케이션 레벨** — 내부 health check, 재연결 로직 (Phase 34)
+2. **프로세스 레벨** — systemd watchdog (기존)
+3. **외부 감시** — cron 기반 헬스 체크 (이번 Phase) ← 최종 안전망
+
+#### 1) sudoers 권한 설정
+
+ubuntu 유저가 패스워드 없이 systemctl restart를 실행할 수 있도록 설정:
+
+```bash
+# sudoers 파일 편집
+sudo visudo
+
+# 파일 끝에 다음 줄 추가:
+ubuntu ALL=(ALL) NOPASSWD: /bin/systemctl restart aaltohub-api, /bin/systemctl restart aaltohub-crawler, /bin/journalctl
+```
+
+**⚠️ 주의:** `visudo`를 사용하면 문법 오류를 자동으로 체크합니다. 직접 `/etc/sudoers` 파일을 편집하지 마세요.
+
+#### 2) 헬스 모니터링 스크립트 설정
+
+```bash
+# 스크립트 실행 권한 부여
+chmod +x /home/ubuntu/AALTOHUBv2/scripts/health_monitor.sh
+
+# 로그 디렉토리 생성 (아직 없다면)
+mkdir -p /home/ubuntu/AALTOHUBv2/logs
+```
+
+#### 3) crontab 설정 (5분마다 실행)
+
+```bash
+# crontab 편집
+crontab -e
+
+# 다음 줄 추가:
+*/5 * * * * /home/ubuntu/AALTOHUBv2/scripts/health_monitor.sh
+```
+
+**실행 주기:**
+- `*/5 * * * *` = 5분마다 (00:00, 00:05, 00:10, ...)
+- 더 빠른 감지를 원하면 `*/1 * * * *` (1분마다)로 변경 가능
+
+#### 4) 환경 변수 설정 (Optional - AWS SNS 알림)
+
+치명적인 장애 시 SNS 알림을 받으려면:
+
+```bash
+# crontab 편집 시 환경 변수 추가
+crontab -e
+
+# 맨 위에 추가:
+SNS_TOPIC_ARN=arn:aws:sns:eu-north-1:YOUR_ACCOUNT_ID:aaltohub-alerts
+*/5 * * * * /home/ubuntu/AALTOHUBv2/scripts/health_monitor.sh
+```
+
+**AWS SNS Topic 생성 (선택사항):**
+```bash
+# AWS CLI로 SNS Topic 생성
+aws sns create-topic --name aaltohub-alerts --region eu-north-1
+
+# 이메일 구독 추가
+aws sns subscribe \
+  --topic-arn arn:aws:sns:eu-north-1:YOUR_ACCOUNT_ID:aaltohub-alerts \
+  --protocol email \
+  --notification-endpoint your-email@example.com
+```
+
+#### 5) 로그 확인
+
+```bash
+# 헬스 모니터 로그
+tail -f /home/ubuntu/AALTOHUBv2/logs/monitor.log
+
+# cron 실행 로그 (시스템 레벨)
+grep CRON /var/log/syslog | tail -20
+```
+
+#### 6) 테스트
+
+의도적으로 서비스를 중지하여 자동 복구를 테스트:
+
+```bash
+# 1. Crawler 수동 중지
+sudo systemctl stop aaltohub-crawler
+
+# 2. 5분 대기 (또는 수동 실행)
+/home/ubuntu/AALTOHUBv2/scripts/health_monitor.sh
+
+# 3. 로그 확인 (자동 재시작 확인)
+tail -20 /home/ubuntu/AALTOHUBv2/logs/monitor.log
+
+# Expected output:
+# [2025-02-13 19:55:00] [ERROR] Crawler unhealthy (HTTP 000)
+# [2025-02-13 19:55:00] [WARN] Crawler unhealthy, restarting aaltohub-crawler service...
+# [2025-02-13 19:55:00] [INFO] Attempting to restart aaltohub-crawler...
+# [2025-02-13 19:55:00] [INFO] aaltohub-crawler restarted successfully
+# [2025-02-13 19:55:10] [INFO] Crawler recovered successfully after restart
+
+# 4. 서비스 상태 확인
+sudo systemctl status aaltohub-crawler
+```
+
+#### 7) 알림 흐름
+
+**장애 발생 시:**
+1. **1차 시도** — systemctl restart 자동 실행
+2. **2차 검증** — 10초 후 재시작 성공 여부 확인
+3. **성공** → Sentry에 "warning" 레벨 알림 (서비스 복구됨)
+4. **실패** → Sentry + AWS SNS에 "critical" 알림 (수동 개입 필요)
+
+**리소스 부족 시:**
+- **디스크 85% 초과** → journalctl vacuum + 오래된 로그 삭제 자동 실행
+- **메모리 256MB 미만** → Sentry "warning" 알림
+
+#### 8) 모니터링 메트릭
+
+```bash
+# 스크립트 실행 횟수 확인
+grep "Health monitor completed" /home/ubuntu/AALTOHUBv2/logs/monitor.log | wc -l
+
+# 자동 재시작 횟수 확인 (최근 24시간)
+grep -A 2 "restarting aaltohub" /home/ubuntu/AALTOHUBv2/logs/monitor.log | grep "$(date +%Y-%m-%d)"
+
+# 디스크 정리 횟수 확인
+grep "Disk usage at" /home/ubuntu/AALTOHUBv2/logs/monitor.log | tail -10
+```
+
+#### 9) 로그 정리 (자동)
+
+스크립트는 다음을 자동으로 정리합니다:
+- **journalctl 로그**: 7일 이상 된 로그 삭제 (`--vacuum-time=7d`)
+- **monitor.log 포함 모든 로그**: 7일 이상 된 `.log` 파일 삭제
+
 ---
 
 ## 트러블슈팅

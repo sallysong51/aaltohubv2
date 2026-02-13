@@ -4,7 +4,7 @@ After=network.target postgresql.service
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/AALTOHUBv2/backend
@@ -18,16 +18,22 @@ StandardError=journal
 SyslogIdentifier=aaltohub-live-crawler
 RuntimeDirectory=aaltohub
 
-# Restart limits
-StartLimitIntervalSec=3600
-StartLimitBurst=20
-TimeoutStopSec=30
+# Restart limits (10분 내 5회 재시작 시 중단)
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
-# Watchdog: systemd restarts if the process doesn't respond to sd_notify pings.
-# Requires `pip install sdnotify` and watchdog loop in crawler_main.py.
-# Uncomment when sdnotify is available:
-# Type=notify
-# WatchdogSec=300
+# Graceful shutdown configuration
+# Allow 60 seconds for queue drain and cleanup
+TimeoutStopSec=60
+# Send SIGTERM to main process first, SIGKILL to others
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Systemd watchdog (Phase 34)
+# Python watchdog (app/watchdog.py) sends WATCHDOG=1 every 30s if healthy.
+# If no heartbeat for 120s, systemd assumes process is hung and restarts it.
+# Healthiness criteria: all clients connected + message queue <90% full
+WatchdogSec=120
 
 # Security settings
 NoNewPrivileges=true
