@@ -72,24 +72,13 @@ from app.crawler.utils import normalize_chat_id, detect_media_type, select_photo
 
 logger = logging.getLogger(__name__)
 
+# ==================== Environment-Independent Constants ====================
+# (These are protocol-level or application-specific, not tunable per environment)
 GROUP_REFRESH_INTERVAL = 60  # 1 minute — reduced from 5min so newly registered groups start live listening faster
-ENABLED_CACHE_TTL = 60  # seconds
-HISTORICAL_CRAWL_DAYS = 14
-RECONNECT_DELAY = 10  # seconds
-MAX_RECONNECT_ATTEMPTS = 10
-MSG_QUEUE_MAXSIZE = 10000
-BATCH_SIZE = 50  # max messages per batch insert
-BATCH_TIMEOUT = 2.0  # seconds to wait for more messages before flushing
-GAP_FILL_INTERVAL = 900  # 15 minutes (2x frequency for 3-hour SLA)
-GAP_FILL_LOOKBACK_HOURS = 3  # re-check last 3 hours of messages (3-hour SLA guarantee)
-GAP_FILL_MAX_MESSAGES = 2000  # max messages per group during gap-fill (covers high-volume groups)
 DIALOGS_COOLDOWN = 600  # 10 minutes — minimum interval between get_dialogs() calls
 QUEUE_DRAIN_TIMEOUT = 60  # seconds — max wait for queue to drain after historical crawl
 MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB — skip media larger than this
 ENTITY_CACHE_MAX_SIZE = 5000  # max entries before LRU-style eviction
-ENABLED_CACHE_MAX_SIZE = 1000  # max entries before eviction
-MEDIA_CONCURRENCY = 5  # max concurrent media downloads during batch operations
-MEDIA_DOWNLOAD_BATCH = 50  # process media in chunks for progress tracking
 
 # Global set to track background tasks (prevents GC of fire-and-forget tasks)
 _background_tasks: set[asyncio.Task] = set()
@@ -184,7 +173,7 @@ class LiveCrawlerService:
         # loop (never from executor threads), so no lock is needed.
         self._crawled_groups: set[int] = set()
         # Queue buffer between Telethon event handlers and DB writer
-        self._msg_queue: asyncio.Queue = asyncio.Queue(maxsize=MSG_QUEUE_MAXSIZE)
+        self._msg_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.MSG_QUEUE_MAXSIZE)
         # Entity cache: telegram_id -> (access_hash, entity_type)
         # Persisted to Supabase `entity_cache` table to survive restarts
         self._entity_cache: dict[int, tuple[int, str, float]] = {}  # gid -> (access_hash, entity_type, last_access_time)
@@ -200,7 +189,7 @@ class LiveCrawlerService:
         # Semaphore to limit concurrent entity resolution (prevents FloodWaitError storms)
         self._entity_semaphore = asyncio.Semaphore(3)
         # Semaphore for concurrent media downloads (historical crawl, gap-fill)
-        self._media_semaphore = asyncio.Semaphore(MEDIA_CONCURRENCY)
+        self._media_semaphore = asyncio.Semaphore(settings.MEDIA_CONCURRENCY)
         # FloodWait penalty tracker: gid -> monotonic time when penalty expires.
         # Groups with active penalties are skipped in gap-fill/historical loops
         # instead of blocking the entire loop.
@@ -372,11 +361,11 @@ class LiveCrawlerService:
                         settings.TELEGRAM_API_ID,
                         settings.TELEGRAM_API_HASH,
                         use_ipv6=False,
-                        request_retries=5,
-                        connection_retries=10,
-                        retry_delay=2,
-                        timeout=120,
-                        flood_sleep_threshold=60,
+                        request_retries=settings.TELEGRAM_REQUEST_RETRIES,
+                        connection_retries=settings.TELEGRAM_CONNECTION_RETRIES,
+                        retry_delay=settings.TELEGRAM_RETRY_DELAY,
+                        timeout=settings.TELEGRAM_TIMEOUT,
+                        flood_sleep_threshold=settings.TELEGRAM_FLOOD_SLEEP_THRESHOLD,
                         auto_reconnect=True,
                         catch_up=True,  # ★ 재연결 시 놓친 이벤트 수신
                         device_model="AaltoHub Server",
@@ -440,11 +429,11 @@ class LiveCrawlerService:
                         settings.TELEGRAM_API_ID,
                         settings.TELEGRAM_API_HASH,
                         use_ipv6=False,
-                        request_retries=5,
-                        connection_retries=10,
-                        retry_delay=2,
-                        timeout=120,
-                        flood_sleep_threshold=60,
+                        request_retries=settings.TELEGRAM_REQUEST_RETRIES,
+                        connection_retries=settings.TELEGRAM_CONNECTION_RETRIES,
+                        retry_delay=settings.TELEGRAM_RETRY_DELAY,
+                        timeout=settings.TELEGRAM_TIMEOUT,
+                        flood_sleep_threshold=settings.TELEGRAM_FLOOD_SLEEP_THRESHOLD,
                         auto_reconnect=True,
                         catch_up=True,  # ★ 재연결 시 놓친 이벤트 수신
                         device_model="AaltoHub Server",
@@ -558,7 +547,7 @@ class LiveCrawlerService:
             logger.info("Live crawler started!")
             logger.info("  - %d admin account(s) connected", len(self.clients))
             logger.info("  - %d groups loaded", len(self.group_id_map))
-            logger.info("  - DB writer active (queue maxsize=%d, batch_size=%d)", MSG_QUEUE_MAXSIZE, BATCH_SIZE)
+            logger.info("  - DB writer active (queue maxsize=%d, batch_size=%d)", settings.MSG_QUEUE_MAXSIZE, settings.BATCH_SIZE)
             logger.info("  - Historical crawl starting...")
             logger.info("  - Real-time events active")
 
@@ -829,12 +818,12 @@ class LiveCrawlerService:
         """Background coroutine that drains the message queue and writes to DB.
 
         Adaptive batching:
-        - Waits for the first message, then collects up to BATCH_SIZE more
-          within BATCH_TIMEOUT seconds.
+        - Waits for the first message, then collects up to settings.BATCH_SIZE more
+          within settings.BATCH_TIMEOUT seconds.
         - 1 message → single insert (low-latency for real-time).
         - 2+ messages → batch insert for new messages, individual updates for edits.
         """
-        logger.info("DB writer started (batch_size=%d, timeout=%.1fs)", BATCH_SIZE, BATCH_TIMEOUT)
+        logger.info("DB writer started (batch_size=%d, timeout=%.1fs)", settings.BATCH_SIZE, settings.BATCH_TIMEOUT)
 
         while self.running or not self._msg_queue.empty():
             batch: list[dict] = []
@@ -843,10 +832,10 @@ class LiveCrawlerService:
                 item = await asyncio.wait_for(self._msg_queue.get(), timeout=5.0)
                 batch.append(item)
 
-                # Collect more items up to BATCH_SIZE within BATCH_TIMEOUT
+                # Collect more items up to settings.BATCH_SIZE within settings.BATCH_TIMEOUT
                 loop = asyncio.get_running_loop()
-                deadline = loop.time() + BATCH_TIMEOUT
-                while len(batch) < BATCH_SIZE:
+                deadline = loop.time() + settings.BATCH_TIMEOUT
+                while len(batch) < settings.BATCH_SIZE:
                     remaining = deadline - loop.time()
                     if remaining <= 0:
                         break
@@ -1280,7 +1269,7 @@ class LiveCrawlerService:
             try:
                 self._msg_queue.put_nowait(queue_item)
             except asyncio.QueueFull:
-                logger.warning("Message queue full (size=%d), sending msg %d to dead letter", MSG_QUEUE_MAXSIZE, message.id)
+                logger.warning("Message queue full (size=%d), sending msg %d to dead letter", settings.MSG_QUEUE_MAXSIZE, message.id)
                 _safe_create_task(
                     self._write_to_dead_letter(message_data, "queue_full"),
                     name=f"dead-letter-{message.id}",
@@ -2038,7 +2027,7 @@ class LiveCrawlerService:
         """Every 30 minutes, re-fetch recent messages per group.
 
         Uses dynamic lookback: normally 1 hour, but if the last gap-fill was
-        more than GAP_FILL_LOOKBACK_HOURS ago (e.g. after a long outage or
+        more than settings.GAP_FILL_LOOKBACK_HOURS ago (e.g. after a long outage or
         restart), it looks back to the gap-fill interval or 24 hours max.
 
         This catches any messages missed during brief disconnects that
@@ -2049,7 +2038,7 @@ class LiveCrawlerService:
         until their penalty expires, so remaining groups still get gap-filled.
         """
         while self.running:
-            await asyncio.sleep(GAP_FILL_INTERVAL)
+            await asyncio.sleep(settings.GAP_FILL_INTERVAL)
             if not self.running:
                 break
 
@@ -2057,9 +2046,9 @@ class LiveCrawlerService:
             now_mono = time.monotonic()
             if self._last_gap_fill_at > 0:
                 hours_since_last = (now_mono - self._last_gap_fill_at) / 3600
-                lookback_hours = min(max(hours_since_last + 0.5, GAP_FILL_LOOKBACK_HOURS), 24)
+                lookback_hours = min(max(hours_since_last + 0.5, settings.GAP_FILL_LOOKBACK_HOURS), 24)
             else:
-                lookback_hours = GAP_FILL_LOOKBACK_HOURS
+                lookback_hours = settings.GAP_FILL_LOOKBACK_HOURS
 
             logger.info("[GAP-FILL] Starting gap-fill re-check (%d groups, lookback=%.1fh)...",
                         len(self.group_id_map), lookback_hours)
@@ -2076,7 +2065,7 @@ class LiveCrawlerService:
             # Phase 2A: Cleanup get_me() cache and circuit breaker state
             await self._error_recovery.cleanup()
 
-            # Phase 34: Memory monitoring and maintenance
+            # Phase 35: Memory monitoring and maintenance
             process = psutil.Process()
             mem_mb = process.memory_info().rss / 1024 / 1024
             logger.info(
@@ -2142,7 +2131,7 @@ class LiveCrawlerService:
                                 broadcast=False, message_source="gap_fill",
                             )
                             count += 1
-                        if count >= GAP_FILL_MAX_MESSAGES:
+                        if count >= settings.GAP_FILL_MAX_MESSAGES:
                             break
                         if iterated % 200 == 0:
                             await asyncio.sleep(1.5)
@@ -2323,7 +2312,7 @@ class LiveCrawlerService:
                 except Exception as e:
                     logger.error("Failed to fetch topics for group %s: %s", title, e)
 
-            date_threshold = datetime.now(timezone.utc) - timedelta(days=HISTORICAL_CRAWL_DAYS)
+            date_threshold = datetime.now(timezone.utc) - timedelta(days=settings.HISTORICAL_CRAWL_DAYS)
 
             enqueued_count = 0
             iterated_count = 0  # Count ALL messages (including empty) for accurate rate limiting
@@ -2395,7 +2384,7 @@ class LiveCrawlerService:
             media_downloaded = 0
             if drained and media_pending and self.running:
                 logger.info("  [%s] Starting parallel media download: %d items (concurrency=%d)",
-                            title, len(media_pending), MEDIA_CONCURRENCY)
+                            title, len(media_pending), settings.MEDIA_CONCURRENCY)
                 try:
                     media_downloaded = await asyncio.wait_for(
                         self._download_media_parallel(media_pending, group_uuid, working_client),
@@ -2516,7 +2505,7 @@ class LiveCrawlerService:
         """Check if group crawling is enabled (cached, async via asyncpg)."""
         now = time.monotonic()
         cached = self._enabled_cache.get(group_uuid)
-        if cached and (now - cached[1]) < ENABLED_CACHE_TTL:
+        if cached and (now - cached[1]) < settings.ENABLED_CACHE_TTL:
             return cached[0]
         try:
             val = await db.fetchval(
@@ -2526,9 +2515,9 @@ class LiveCrawlerService:
         except Exception:
             enabled = True
         # Evict oldest entries if cache exceeds max size
-        if len(self._enabled_cache) >= ENABLED_CACHE_MAX_SIZE:
+        if len(self._enabled_cache) >= settings.ENABLED_CACHE_MAX_SIZE:
             oldest = sorted(self._enabled_cache, key=lambda k: self._enabled_cache[k][1])
-            for k in oldest[:len(self._enabled_cache) - ENABLED_CACHE_MAX_SIZE + 1]:
+            for k in oldest[:len(self._enabled_cache) - settings.ENABLED_CACHE_MAX_SIZE + 1]:
                 del self._enabled_cache[k]
         self._enabled_cache[group_uuid] = (enabled, now)
         return enabled
@@ -3009,7 +2998,7 @@ class LiveCrawlerService:
                 # Fetch messages since lookback
                 count = 0
                 async for message in working_client.iter_messages(entity, offset_date=lookback, reverse=True):
-                    if count >= GAP_FILL_MAX_MESSAGES:
+                    if count >= settings.GAP_FILL_MAX_MESSAGES:
                         break
 
                     if message.text or message.media:
@@ -3107,12 +3096,12 @@ class LiveCrawlerService:
 
             if not self.running:
                 break
-            if attempts > MAX_RECONNECT_ATTEMPTS:
+            if attempts > settings.MAX_RECONNECT_ATTEMPTS:
                 logger.error("Live crawler [user_id=%s]: Max reconnect attempts reached.", user_id)
                 break
 
-            logger.info("Live crawler [user_id=%s]: Reconnecting in %ds (attempt %d/%d)...", user_id, RECONNECT_DELAY, attempts, MAX_RECONNECT_ATTEMPTS)
-            await asyncio.sleep(RECONNECT_DELAY)
+            logger.info("Live crawler [user_id=%s]: Reconnecting in %ds (attempt %d/%d)...", user_id, settings.RECONNECT_DELAY, attempts, settings.MAX_RECONNECT_ATTEMPTS)
+            await asyncio.sleep(settings.RECONNECT_DELAY)
 
             try:
                 if client and not client.is_connected():
